@@ -114,6 +114,18 @@ type cancelParams struct {
 	ID json.RawMessage `json:"id"`
 }
 
+type sessionPromptParams struct {
+	// ID is the caller-assigned request identifier for matching chunk notifications.
+	ID          json.RawMessage  `json:"id"`
+	SessionID   string           `json:"sessionId"`
+	Model       string           `json:"model"`
+	Prompt      string           `json:"prompt"`
+	System      string           `json:"system,omitempty"`
+	MaxTokens   int              `json:"maxTokens,omitempty"`
+	Temperature *float64         `json:"temperature,omitempty"`
+	Tools       []model.ToolDefinition `json:"tools,omitempty"`
+}
+
 type sessionNewResult struct {
 	SessionID string `json:"sessionId"`
 }
@@ -177,6 +189,8 @@ func (s *Server) Serve(ctx context.Context) error {
 		switch req.Method {
 		case "complete":
 			go s.handleComplete(ctx, &req)
+		case "session/prompt":
+			go s.handleSessionPrompt(ctx, &req)
 		default:
 			s.dispatch(ctx, &req)
 		}
@@ -319,6 +333,89 @@ func (s *Server) handleCancel(req *request) {
 		return // cancel is best-effort, swallow parse errors
 	}
 	s.cancelRequest(string(p.ID))
+}
+
+func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
+	var p sessionPromptParams
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.sendError(rawID(req.ID), -32602, "invalid params: "+err.Error())
+		return
+	}
+	if p.Prompt == "" {
+		s.sendError(rawID(req.ID), -32602, "prompt is required")
+		return
+	}
+
+	callID := string(p.ID)
+	cctx, cancel := context.WithCancel(ctx)
+	s.registerCancel(callID, cancel)
+	defer s.unregisterCancel(callID)
+	defer cancel()
+
+	msgs := []model.Message{model.NewTextMessage(model.RoleUser, p.Prompt)}
+
+	maxTokens := p.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = s.cfg.MaxTokens
+	}
+	if maxTokens == 0 {
+		maxTokens = 8096
+	}
+
+	modelID := p.Model
+	if modelID == "" {
+		modelID = s.cfg.Model
+	}
+
+	req2 := &provider.Request{
+		Model:     modelID,
+		Messages:  msgs,
+		System:    p.System,
+		Tools:     p.Tools,
+		MaxTokens: maxTokens,
+		Temperature: p.Temperature,
+	}
+
+	events, err := s.provider.Stream(cctx, req2)
+	if err != nil {
+		s.sendError(rawID(req.ID), -32000, "provider error: "+err.Error())
+		return
+	}
+
+	var (
+		usage      model.Usage
+		stopReason = model.StopReasonEndTurn
+		callIDany  any
+	)
+	_ = json.Unmarshal(p.ID, &callIDany)
+
+	for ev := range events {
+		switch ev.Type {
+		case provider.EventTextDelta:
+			if ev.Text != "" {
+				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Text})
+			}
+		case provider.EventMessageStop:
+			stopReason = ev.StopReason
+			usage = ev.Usage
+		case provider.EventError:
+			if ev.Err != nil && cctx.Err() == nil {
+				slog.Warn("acp session/prompt stream error", "err", ev.Err)
+				s.sendError(rawID(req.ID), -32000, "stream error: "+ev.Err.Error())
+				return
+			}
+		}
+	}
+
+	if cctx.Err() != nil {
+		s.sendError(rawID(req.ID), -32800, "request cancelled")
+		return
+	}
+
+	s.sendResult(rawID(req.ID), completeResult{
+		StopReason: stopReason,
+		Usage:      &usage,
+	})
 }
 
 // ── Cancel registry ───────────────────────────────────────────────────────────
