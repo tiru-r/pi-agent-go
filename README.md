@@ -60,8 +60,12 @@ curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.s
 ## Quick start
 
 ```bash
-# Set your API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# Set your API key (pick one provider)
+pi auth set anthropic  sk-ant-...
+pi auth set openrouter sk-or-...    # 200+ models via openrouter.ai
+
+# Set default provider (optional — defaults to anthropic)
+pi config set provider openrouter
 
 # Start the interactive TUI
 pi
@@ -258,11 +262,12 @@ pi session delete <id> --force  # Delete without confirmation
 #### `pi auth` — API key management
 
 ```bash
-pi auth set anthropic sk-ant-...     # Store Anthropic key
-pi auth set openai sk-...
-pi auth set gemini AIza...
-pi auth set cohere ...
-pi auth set azure ...
+pi auth set anthropic  sk-ant-...    # Store Anthropic key
+pi auth set openrouter sk-or-...     # Store OpenRouter key
+pi auth set openai     sk-...
+pi auth set gemini     AIza...
+pi auth set cohere     ...
+pi auth set azure      ...
 pi auth status                       # Show which providers have keys (masked)
 pi auth check                        # Validate all configured keys
 ```
@@ -293,7 +298,7 @@ pi config set system_prompt "You are an expert Go developer"
 pi doctor
 ```
 
-Checks: config file, session directory, `ANTHROPIC_API_KEY` presence, and model registry lookup.
+Checks: config file, session directory, configured provider API key presence, and model registry lookup.
 
 #### `pi acp` — Zed language model server
 

@@ -118,6 +118,15 @@ func merge(base, override *Config) {
 	if override.CohereAPIKey != "" {
 		base.CohereAPIKey = override.CohereAPIKey
 	}
+	if override.OpenRouterAPIKey != "" {
+		base.OpenRouterAPIKey = override.OpenRouterAPIKey
+	}
+	if override.OpenRouterSiteURL != "" {
+		base.OpenRouterSiteURL = override.OpenRouterSiteURL
+	}
+	if override.OpenRouterAppName != "" {
+		base.OpenRouterAppName = override.OpenRouterAppName
+	}
 	if override.AzureEndpoint != "" {
 		base.AzureEndpoint = override.AzureEndpoint
 	}
