@@ -26,10 +26,10 @@ import (
 	"os"
 	"sync"
 
-	"github.com/pi-agent/pi/internal/config"
-	"github.com/pi-agent/pi/internal/model"
-	"github.com/pi-agent/pi/internal/provider"
-	"github.com/pi-agent/pi/internal/provider/factory"
+	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 )
 
 const protocolVersion = "0.1.0"

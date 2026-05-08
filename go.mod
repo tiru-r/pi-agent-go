@@ -1,4 +1,4 @@
-module github.com/pi-agent/pi
+module github.com/tiru-r/pi-agent-go
 
 go 1.23.0
 

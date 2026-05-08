@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 
-	"github.com/pi-agent/pi/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 // Provider is the interface every LLM backend must implement.

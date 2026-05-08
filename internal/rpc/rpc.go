@@ -9,10 +9,10 @@ import (
 	"io"
 	"os"
 
-	"github.com/pi-agent/pi/internal/agent"
-	"github.com/pi-agent/pi/internal/config"
-	"github.com/pi-agent/pi/internal/model"
-	"github.com/pi-agent/pi/internal/session"
+	"github.com/tiru-r/pi-agent-go/internal/agent"
+	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/session"
 )
 
 // ── JSON-RPC types ─────────────────────────────────────────────────────────────

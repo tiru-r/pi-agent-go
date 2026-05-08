@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pi-agent/pi/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/config"
 	_ "modernc.org/sqlite"
 )
 

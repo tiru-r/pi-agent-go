@@ -24,7 +24,7 @@ $ pi
 ### One-liner (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pi-agent/pi/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/install.sh | bash
 ```
 
 Requires Go 1.23+. Builds from source, installs to `~/.local/bin/pi`, and updates your shell PATH.
@@ -40,16 +40,16 @@ Options:
 ### Manual build
 
 ```bash
-git clone https://github.com/pi-agent/pi
-cd pi
-go build -ldflags "-s -w -X github.com/pi-agent/pi/internal/cli.Version=$(git describe --tags --always)" -o pi ./cmd/pi/
+git clone https://github.com/tiru-r/pi-agent-go
+cd pi-agent-go
+go build -ldflags "-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=$(git describe --tags --always)" -o pi ./cmd/pi/
 mv pi ~/.local/bin/
 ```
 
 ### Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pi-agent/pi/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.sh | bash
 
 # Also delete config and session data:
 ./uninstall.sh --purge
@@ -639,7 +639,7 @@ internal/
 
 ```bash
 VERSION=$(git describe --tags --always --dirty)
-LDFLAG="-s -w -X github.com/pi-agent/pi/internal/cli.Version=${VERSION}"
+LDFLAG="-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=${VERSION}"
 
 go build -ldflags "$LDFLAG" -o pi ./cmd/pi/
 

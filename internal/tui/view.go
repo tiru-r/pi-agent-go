@@ -8,7 +8,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wrap"
-	"github.com/pi-agent/pi/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 const (

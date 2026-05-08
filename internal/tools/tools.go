@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pi-agent/pi/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 // Tool is the interface every built-in (and extension) tool must satisfy.

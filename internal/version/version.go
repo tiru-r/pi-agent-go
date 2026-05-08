@@ -15,11 +15,11 @@ import (
 )
 
 // Version is the current binary version, injected at build time via
-// -ldflags="-X github.com/pi-agent/pi/internal/version.Version=x.y.z"
+// -ldflags="-X github.com/tiru-r/pi-agent-go/internal/version.Version=x.y.z"
 var Version = "dev"
 
 const (
-	releasesURL = "https://api.github.com/repos/pi-agent/pi/releases/latest"
+	releasesURL = "https://api.github.com/repos/tiru-r/pi-agent-go/releases/latest"
 	cacheTTL    = 24 * time.Hour
 	httpTimeout = 10 * time.Second
 )

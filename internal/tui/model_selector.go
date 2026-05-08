@@ -6,7 +6,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/pi-agent/pi/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 // ModelSelector is a searchable model-picker overlay.

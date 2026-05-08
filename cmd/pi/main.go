@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/pi-agent/pi/internal/cli"
+	"github.com/tiru-r/pi-agent-go/internal/cli"
 )
 
 // Version is the application version. Overridden at build time via:

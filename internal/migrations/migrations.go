@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/pi-agent/pi/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/config"
 )
 
 const migrationsFile = ".migrations"

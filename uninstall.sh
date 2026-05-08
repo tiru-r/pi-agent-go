@@ -3,7 +3,7 @@
 # pi uninstaller — removes the pi binary and optional config/session data.
 #
 # One-liner uninstall:
-#   curl -fsSL https://raw.githubusercontent.com/pi-agent/pi/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.sh | bash
 #
 # Usage:
 #   ./uninstall.sh [options]

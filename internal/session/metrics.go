@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pi-agent/pi/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 // Metrics holds aggregated statistics for a session.

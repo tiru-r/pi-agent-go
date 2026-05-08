@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/pi-agent/pi/internal/model"
-	"github.com/pi-agent/pi/internal/provider"
-	"github.com/pi-agent/pi/internal/tools"
+	"github.com/tiru-r/pi-agent-go/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
 // Options controls a single agent run.

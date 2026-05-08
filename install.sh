@@ -3,7 +3,7 @@
 # pi installer — builds from source and installs the pi binary.
 #
 # One-liner install:
-#   curl -fsSL https://raw.githubusercontent.com/pi-agent/pi/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/install.sh | bash
 #
 # Usage:
 #   ./install.sh [options]
@@ -26,7 +26,7 @@ YES=0
 QUIET=0
 
 BINARY_NAME="pi"
-REPO_URL="https://github.com/pi-agent/pi"
+REPO_URL="https://github.com/tiru-r/pi-agent-go"
 MIN_GO_MAJOR=1
 MIN_GO_MINOR=23
 
@@ -139,7 +139,7 @@ build_binary() {
   src_dir="$(cd "$(dirname "$0")" && pwd)"
 
   go build \
-    -ldflags "-s -w -X github.com/pi-agent/pi/internal/cli.Version=${version}" \
+    -ldflags "-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=${version}" \
     -o "${src_dir}/pi" \
     "${src_dir}/cmd/pi/"
 

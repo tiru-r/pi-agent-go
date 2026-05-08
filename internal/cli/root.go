@@ -11,13 +11,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/pi-agent/pi/internal/acp"
-	"github.com/pi-agent/pi/internal/agent"
-	"github.com/pi-agent/pi/internal/config"
-	"github.com/pi-agent/pi/internal/model"
-	"github.com/pi-agent/pi/internal/provider/anthropic"
-	"github.com/pi-agent/pi/internal/session"
-	"github.com/pi-agent/pi/internal/tui"
+	"github.com/tiru-r/pi-agent-go/internal/acp"
+	"github.com/tiru-r/pi-agent-go/internal/agent"
+	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/model"
+	"github.com/tiru-r/pi-agent-go/internal/provider/anthropic"
+	"github.com/tiru-r/pi-agent-go/internal/session"
+	"github.com/tiru-r/pi-agent-go/internal/tui"
 )
 
 // Version is injected at build time via -ldflags.

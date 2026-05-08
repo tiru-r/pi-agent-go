@@ -9,18 +9,18 @@ package factory
 import (
 	"fmt"
 
-	"github.com/pi-agent/pi/internal/config"
-	"github.com/pi-agent/pi/internal/provider"
-	"github.com/pi-agent/pi/internal/provider/anthropic"
-	"github.com/pi-agent/pi/internal/provider/azure"
-	"github.com/pi-agent/pi/internal/provider/bedrock"
-	"github.com/pi-agent/pi/internal/provider/cohere"
-	"github.com/pi-agent/pi/internal/provider/copilot"
-	"github.com/pi-agent/pi/internal/provider/gemini"
-	"github.com/pi-agent/pi/internal/provider/gitlab"
-	"github.com/pi-agent/pi/internal/provider/openai"
-	"github.com/pi-agent/pi/internal/provider/openrouter"
-	"github.com/pi-agent/pi/internal/provider/vertex"
+	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/provider/anthropic"
+	"github.com/tiru-r/pi-agent-go/internal/provider/azure"
+	"github.com/tiru-r/pi-agent-go/internal/provider/bedrock"
+	"github.com/tiru-r/pi-agent-go/internal/provider/cohere"
+	"github.com/tiru-r/pi-agent-go/internal/provider/copilot"
+	"github.com/tiru-r/pi-agent-go/internal/provider/gemini"
+	"github.com/tiru-r/pi-agent-go/internal/provider/gitlab"
+	"github.com/tiru-r/pi-agent-go/internal/provider/openai"
+	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
+	"github.com/tiru-r/pi-agent-go/internal/provider/vertex"
 )
 
 // New constructs the appropriate Provider based on cfg.Provider.
