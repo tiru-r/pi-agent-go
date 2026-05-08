@@ -15,7 +15,8 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/agent"
 	"github.com/tiru-r/pi-agent-go/internal/config"
 	"github.com/tiru-r/pi-agent-go/internal/model"
-	"github.com/tiru-r/pi-agent-go/internal/provider/anthropic"
+	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 	"github.com/tiru-r/pi-agent-go/internal/session"
 	"github.com/tiru-r/pi-agent-go/internal/tui"
 )
@@ -119,16 +120,11 @@ func buildAgent(cfg *config.Config) (*agent.Agent, error) {
 }
 
 // buildProvider constructs the provider from config.
-func buildProvider(cfg *config.Config) (*anthropic.Provider, error) {
-	switch cfg.Provider {
-	case "anthropic", "":
-		if cfg.AnthropicAPIKey == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY is not set; run: pi auth set anthropic <key>")
-		}
-		return anthropic.New(cfg.AnthropicAPIKey), nil
-	default:
-		return nil, fmt.Errorf("unsupported provider %q — only 'anthropic' is built in; set ANTHROPIC_API_KEY", cfg.Provider)
+func buildProvider(cfg *config.Config) (provider.Provider, error) {
+	if cfg.Provider == "" {
+		cfg.Provider = "anthropic"
 	}
+	return factory.New(cfg)
 }
 
 // openOrNewSession returns a session, or nil when no-session is set.
@@ -399,6 +395,8 @@ func newAuthCmd(_ *globalFlags) *cobra.Command {
 					cfg.CohereAPIKey = key
 				case "azure":
 					cfg.AzureAPIKey = key
+				case "openrouter":
+					cfg.OpenRouterAPIKey = key
 				default:
 					return fmt.Errorf("unknown provider %q", prov)
 				}
@@ -427,6 +425,7 @@ func newAuthCmd(_ *globalFlags) *cobra.Command {
 					{"gemini", cfg.GeminiAPIKey},
 					{"cohere", cfg.CohereAPIKey},
 					{"azure", cfg.AzureAPIKey},
+					{"openrouter", cfg.OpenRouterAPIKey},
 				}
 				for _, c := range checks {
 					if c.key != "" {
@@ -461,6 +460,7 @@ func newAuthCmd(_ *globalFlags) *cobra.Command {
 				printKeyStatus("gemini", cfg.GeminiAPIKey)
 				printKeyStatus("cohere", cfg.CohereAPIKey)
 				printKeyStatus("azure", cfg.AzureAPIKey)
+				printKeyStatus("openrouter", cfg.OpenRouterAPIKey)
 				return nil
 			},
 		},
