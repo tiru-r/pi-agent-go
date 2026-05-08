@@ -122,21 +122,50 @@ check_dest_writable() {
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
-detect_version() {
-  if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
-    git describe --tags --always --dirty 2>/dev/null || echo "dev"
-  else
-    echo "dev"
+# Temporary clone directory; cleaned up on exit.
+_TMP_CLONE=""
+
+cleanup() {
+  [ -n "$_TMP_CLONE" ] && rm -rf "$_TMP_CLONE"
+}
+trap cleanup EXIT
+
+# Returns the source directory to build from.
+# If running via curl pipe (no local source), clones the repo to a temp dir.
+resolve_src_dir() {
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || script_dir=""
+
+  if [ -f "${script_dir}/cmd/pi/main.go" ]; then
+    echo "$script_dir"
+    return
   fi
+
+  # Running via curl pipe — no local source available.
+  if ! command -v git >/dev/null 2>&1; then
+    err "git is required to install via one-liner. Install git and re-run."
+    exit 1
+  fi
+
+  _TMP_CLONE=$(mktemp -d)
+  info "Cloning ${REPO_URL}…"
+  git clone --depth=1 "$REPO_URL" "$_TMP_CLONE" >/dev/null 2>&1
+  ok "Clone complete"
+  echo "$_TMP_CLONE"
 }
 
 build_binary() {
-  local version
-  version=$(detect_version)
-  info "Building pi ${version}…"
-
   local src_dir
-  src_dir="$(cd "$(dirname "$0")" && pwd)"
+  src_dir=$(resolve_src_dir)
+
+  local version
+  if command -v git >/dev/null 2>&1 && git -C "$src_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    version=$(git -C "$src_dir" describe --tags --always --dirty 2>/dev/null || echo "dev")
+  else
+    version="dev"
+  fi
+
+  info "Building pi ${version}…"
 
   go build \
     -ldflags "-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=${version}" \
