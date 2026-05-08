@@ -1,0 +1,135 @@
+package provider
+
+import (
+	"context"
+
+	"github.com/pi-agent/pi/internal/model"
+)
+
+// Provider is the interface every LLM backend must implement.
+type Provider interface {
+	// Name returns the canonical provider identifier (e.g. "anthropic").
+	Name() string
+	// Stream sends a request and returns a channel of events.
+	// The channel is closed when the response is complete or an error occurs.
+	Stream(ctx context.Context, req *Request) (<-chan Event, error)
+}
+
+// Request is a normalised LLM request understood by all providers.
+type Request struct {
+	Model         string
+	Messages      []model.Message
+	System        string
+	Tools         []model.ToolDefinition
+	MaxTokens     int
+	Temperature   *float64
+	ThinkingLevel model.ThinkingLevel
+	StopSequences []string
+	// Extra provider-specific fields passed through verbatim.
+	Extra map[string]any
+}
+
+// EventType tags each event from a streaming response.
+type EventType string
+
+const (
+	EventTextDelta     EventType = "text_delta"
+	EventThinkingDelta EventType = "thinking_delta"
+	EventToolCallStart EventType = "tool_call_start"
+	EventToolCallDelta EventType = "tool_call_delta"
+	EventToolCallDone  EventType = "tool_call_done"
+	EventMessageStop   EventType = "message_stop"
+	EventError         EventType = "error"
+)
+
+// Event carries streaming data from the provider.
+// Only fields relevant to the EventType are populated.
+type Event struct {
+	Type EventType
+
+	// EventTextDelta / EventThinkingDelta
+	Text string
+
+	// EventToolCallStart
+	ToolID   string
+	ToolName string
+
+	// EventToolCallDelta — partial JSON accumulation
+	ToolIndex   int
+	PartialJSON string
+
+	// EventMessageStop
+	StopReason model.StopReason
+	Usage      model.Usage
+
+	// EventError
+	Err error
+}
+
+// Response is the fully assembled response after draining a stream.
+type Response struct {
+	Message    model.Message
+	StopReason model.StopReason
+	Usage      model.Usage
+}
+
+// Collect drains the event channel and assembles a complete Response.
+func Collect(events <-chan Event) (*Response, error) {
+	var (
+		blocks      []model.ContentBlock
+		textIdx     = -1
+		thinkingIdx = -1
+		toolBlocks  = map[int]*model.ContentBlock{}
+		usage       model.Usage
+		stop        model.StopReason
+	)
+
+	for ev := range events {
+		switch ev.Type {
+		case EventError:
+			return nil, ev.Err
+
+		case EventTextDelta:
+			if textIdx < 0 {
+				blocks = append(blocks, model.ContentBlock{Type: model.ContentTypeText})
+				textIdx = len(blocks) - 1
+			}
+			blocks[textIdx].Text += ev.Text
+
+		case EventThinkingDelta:
+			if thinkingIdx < 0 {
+				blocks = append(blocks, model.ContentBlock{Type: model.ContentTypeThinking})
+				thinkingIdx = len(blocks) - 1
+			}
+			blocks[thinkingIdx].Thinking += ev.Text
+
+		case EventToolCallStart:
+			tb := &model.ContentBlock{
+				Type: model.ContentTypeToolUse,
+				ID:   ev.ToolID,
+				Name: ev.ToolName,
+			}
+			toolBlocks[ev.ToolIndex] = tb
+
+		case EventToolCallDelta:
+			if tb, ok := toolBlocks[ev.ToolIndex]; ok {
+				tb.Input = append(tb.Input, []byte(ev.PartialJSON)...)
+			}
+
+		case EventToolCallDone:
+			if tb, ok := toolBlocks[ev.ToolIndex]; ok {
+				blocks = append(blocks, *tb)
+			}
+
+		case EventMessageStop:
+			stop = ev.StopReason
+			usage = ev.Usage
+		}
+	}
+
+	return &Response{
+		Message:    model.Message{Role: model.RoleAssistant, Content: blocks},
+		StopReason: stop,
+		Usage:      usage,
+	}, nil
+}
