@@ -255,7 +255,7 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
 ```json
 {
   "openrouter_api_key": "sk-or-...",
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "tencent/hy3-preview:free",
   "max_tokens": 8096,
   "thinking_level": "off",
   "system_prompt": "",

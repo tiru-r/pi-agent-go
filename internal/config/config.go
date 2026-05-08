@@ -14,7 +14,7 @@ type Config struct {
 	OpenRouterSiteURL string `json:"openrouter_site_url,omitempty"`
 	OpenRouterAppName string `json:"openrouter_app_name,omitempty"`
 
-	// Model selection — OpenRouter model ID, e.g. "anthropic/claude-sonnet-4-6"
+	// Model selection — any OpenRouter model ID, e.g. "tencent/hy3-preview:free"
 	Model string `json:"model,omitempty"`
 
 	// Behaviour
@@ -29,7 +29,7 @@ type Config struct {
 }
 
 var defaultCfg = Config{
-	Model:     "anthropic/claude-sonnet-4-6",
+	Model:     "tencent/hy3-preview:free",
 	MaxTokens: 8096,
 	SQLite:    true,
 }
