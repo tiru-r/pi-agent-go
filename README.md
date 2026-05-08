@@ -1,40 +1,33 @@
 # pi
 
-A high-performance AI coding agent CLI written in Go. Pi provides an interactive terminal interface for AI-assisted coding with streaming responses, tool execution, and session persistence — supporting 11 LLM providers and 39 models out of the box.
+A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi runs as a native language model provider inside Zed via the Agent Client Protocol (ACP) — giving Zed access to every model OpenRouter offers (500+), with a full agentic loop and built-in tools.
 
-```
-$ pi
-```
+---
 
 ## Features
 
-- **11 LLM providers** — Anthropic, OpenAI, Gemini, Azure OpenAI, Cohere, AWS Bedrock, Google Vertex AI, GitHub Copilot, GitLab Duo, OpenRouter
+- **Every OpenRouter model** — model list fetched live from the API; no hardcoded registry
 - **8 built-in tools** — read, write, edit, bash, grep, find, ls, hashline_edit
-- **Interactive TUI** — Bubbletea-powered chat interface with streaming, syntax highlighting, and markdown rendering
-- **Session persistence** — JSONL format with optional SQLite index; branch/replay support
-- **Zed ACP** — Native language model provider for the Zed editor
-- **RPC server** — JSON-RPC 2.0 over stdio for SDK embedding
-- **Context compaction** — Automatic summarisation when context grows too large
-- **Extended thinking** — First-class support for Anthropic and DeepSeek thinking models
+- **Full agentic loop** — LLM → tools → LLM cycles inside Zed's chat panel
+- **Session memory** — multi-turn conversation history maintained per Zed session
+- **One API key** — `OPENROUTER_API_KEY` is all you need
+- **Tiny binary** — 3 direct dependencies (cobra, uuid, sqlite)
 
 ---
 
 ## Installation
 
-### One-liner (recommended)
+### One-liner
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/install.sh | bash
 ```
 
-Requires Go 1.23+. Builds from source, installs to `~/.local/bin/pi`, and updates your shell PATH.
-
-Options:
+Requires Go 1.23+. Installs to `~/.local/bin/pi`.
 
 ```bash
-./install.sh --system          # install to /usr/local/bin (needs sudo)
-./install.sh --dest ~/bin      # custom install directory
-./install.sh --yes --quiet     # non-interactive
+./install.sh --system        # /usr/local/bin (needs sudo)
+./install.sh --dest ~/bin    # custom directory
 ```
 
 ### Manual build
@@ -50,9 +43,7 @@ mv pi ~/.local/bin/
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.sh | bash
-
-# Also delete config and session data:
-./uninstall.sh --purge
+./uninstall.sh --purge   # also removes config and session data
 ```
 
 ---
@@ -60,446 +51,29 @@ curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.s
 ## Quick start
 
 ```bash
-# Set your API key (pick one provider)
-pi auth set anthropic  sk-ant-...
-pi auth set openrouter sk-or-...    # 200+ models via openrouter.ai
-
-# Set default provider (optional — defaults to anthropic)
-pi config set provider openrouter
-
-# Start the interactive TUI
-pi
-
-# One-shot prompt
-pi run "Explain this codebase"
-
-# Use a specific provider and model
-pi --provider openrouter --model deepseek/deepseek-r1 run "Solve this bug"
-```
-
----
-
-## Providers
-
-Configure a provider by setting the appropriate environment variable or running `pi auth set`.
-
-### Anthropic
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-pi --provider anthropic --model claude-sonnet-4-6
-```
-
-| Model ID | Display Name | Max Tokens | Capabilities |
-|---|---|---|---|
-| `claude-opus-4-7` | Claude Opus 4.7 | 32,000 | tools, vision, thinking |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 16,000 | tools, vision, thinking |
-| `claude-haiku-4-5-20251001` | Claude Haiku 4.5 | 8,096 | tools, vision |
-
-### OpenAI
-```bash
-export OPENAI_API_KEY=sk-...
-pi --provider openai --model gpt-4o
-```
-
-| Model ID | Max Tokens | Capabilities |
-|---|---|---|
-| `gpt-4o` | 16,384 | tools, vision |
-| `gpt-4o-mini` | 16,384 | tools, vision |
-| `o3` | 100,000 | tools |
-| `o4-mini` | 100,000 | tools |
-
-### Google Gemini
-```bash
-export GEMINI_API_KEY=...    # or GOOGLE_API_KEY
-pi --provider gemini --model gemini-2.0-flash
-```
-
-| Model ID | Max Tokens | Capabilities |
-|---|---|---|
-| `gemini-2.0-flash` | 8,192 | tools, vision |
-| `gemini-1.5-pro` | 8,192 | tools, vision |
-| `gemini-1.5-flash` | 8,192 | tools, vision |
-
-### Azure OpenAI
-```bash
-export AZURE_OPENAI_API_KEY=...
-export AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
-pi --provider azure --model azure/gpt-4o
-```
-
-Requires `AZURE_OPENAI_DEPLOYMENT` or set `azure_deployment` in settings.json.
-Default API version: `2024-08-01-preview`.
-
-### Cohere
-```bash
-export COHERE_API_KEY=...
-pi --provider cohere --model command-r-plus
-```
-
-| Model ID | Max Tokens | Capabilities |
-|---|---|---|
-| `command-r-plus` | 4,096 | tools |
-| `command-r` | 4,096 | tools |
-
-### AWS Bedrock
-```bash
-# Uses standard AWS credential chain (~/.aws/, environment, EC2 instance profile)
-export AWS_REGION=us-east-1
-pi --provider bedrock --model bedrock/claude-sonnet-4-6
-```
-
-| Model ID | Notes |
-|---|---|
-| `bedrock/claude-opus-4-7` | Maps to `us.anthropic.claude-opus-4-7-20250514-v1:0` |
-| `bedrock/claude-sonnet-4-6` | Maps to `us.anthropic.claude-sonnet-4-6-20241022-v2:0` |
-
-### Google Vertex AI
-```bash
-# Uses Application Default Credentials (gcloud auth application-default login)
-export GOOGLE_CLOUD_PROJECT=my-project
-pi --provider vertex --model vertex/gemini-1.5-pro
-```
-
-### GitHub Copilot
-```bash
-export GITHUB_TOKEN=ghp_...    # or GITHUB_OAUTH_TOKEN
-pi --provider copilot --model copilot/gpt-4o
-```
-
-Token is also auto-discovered from `~/.config/gh/hosts.yml` (gh CLI config).
-
-### GitLab Duo
-```bash
-export GITLAB_TOKEN=glpat-...
-export GITLAB_URL=https://gitlab.com    # optional, defaults to gitlab.com
-pi --provider gitlab --model gitlab/claude-3-5-sonnet
-```
-
-Token is also auto-discovered from `~/.config/glab-cli/config.yml`.
-
-### OpenRouter
-```bash
+# Set your OpenRouter key
 export OPENROUTER_API_KEY=sk-or-...
-pi --provider openrouter --model anthropic/claude-opus-4-7
-```
+# or persist it:
+pi auth set sk-or-...
 
-OpenRouter gives access to 200+ models from all major providers through a single API key. Provider routing and fallbacks can be configured via `Request.Extra`:
+# One-shot agent run
+pi run "Explain this codebase"
+pi run --model deepseek/deepseek-r1 "Solve this bug"
 
-```go
-req.Extra = map[string]any{
-    "provider": map[string]any{
-        "order":           []string{"Anthropic", "Together"},
-        "data_collection": "deny",
-        "allow_fallbacks": true,
-    },
-    "models": []string{"anthropic/claude-opus-4-7", "openai/gpt-4o"},
-}
-```
+# List every model OpenRouter offers
+pi models
 
-Popular OpenRouter models:
-
-| Model ID | Provider | Capabilities |
-|---|---|---|
-| `anthropic/claude-opus-4-7` | Anthropic | tools, vision, thinking |
-| `anthropic/claude-sonnet-4-6` | Anthropic | tools, vision, thinking |
-| `openai/gpt-4o` | OpenAI | tools, vision |
-| `openai/o3` | OpenAI | tools |
-| `google/gemini-2.0-flash-001` | Google | tools, vision |
-| `meta-llama/llama-3.3-70b-instruct` | Meta | tools |
-| `deepseek/deepseek-r1` | DeepSeek | thinking |
-| `deepseek/deepseek-chat-v3-0324` | DeepSeek | tools |
-| `mistralai/codestral-2501` | Mistral | tools |
-| `qwen/qwen-2.5-coder-32b-instruct` | Qwen | tools |
-| `x-ai/grok-3-beta` | xAI | tools, vision |
-
----
-
-## CLI reference
-
-### Global flags
-
-| Flag | Short | Description |
-|---|---|---|
-| `--model` | `-m` | Override LLM model |
-| `--provider` | `-p` | Override provider |
-| `--system` | | Override system prompt |
-| `--session` | `-s` | Session ID to continue |
-| `--no-session` | | Disable session persistence |
-| `--think` | | Enable extended thinking |
-| `--debug` | | Enable debug logging |
-| `--acp` | | Run as Zed ACP server (stdio) |
-
-### Commands
-
-#### `pi` — Interactive TUI
-
-```bash
-pi                              # Start with default provider/model
-pi -p openrouter -m deepseek/deepseek-r1
-pi --think                      # Enable extended thinking
-pi -s abc123                    # Resume session abc123
-```
-
-#### `pi run` — One-shot agent
-
-```bash
-pi run "Refactor this module to use interfaces"
-pi run --think "Solve this algorithmic problem"
-```
-
-Streams the agent's response to stdout and exits.
-
-#### `pi session` — Session management
-
-```bash
-pi session list                 # List all sessions (most recent first)
-pi session open <id>            # Open session in interactive TUI
-pi session show <id>            # Print session messages to stdout
-pi session delete <id>          # Delete session (prompts for confirmation)
-pi session delete <id> --force  # Delete without confirmation
-```
-
-#### `pi auth` — API key management
-
-```bash
-pi auth set anthropic  sk-ant-...    # Store Anthropic key
-pi auth set openrouter sk-or-...     # Store OpenRouter key
-pi auth set openai     sk-...
-pi auth set gemini     AIza...
-pi auth set cohere     ...
-pi auth set azure      ...
-pi auth status                       # Show which providers have keys (masked)
-pi auth check                        # Validate all configured keys
-```
-
-Keys are stored in `~/.pi/agent/settings.json` (mode 0600).
-
-#### `pi models` — List available models
-
-```bash
-pi models                       # All 39 models with provider, max tokens, capabilities
-pi models | grep openrouter     # Filter by provider
-```
-
-#### `pi config` — Configuration
-
-```bash
-pi config show                  # Print current effective config
-pi config set provider openrouter
-pi config set model deepseek/deepseek-r1
-pi config set theme light
-pi config set thinking_level auto
-pi config set system_prompt "You are an expert Go developer"
-```
-
-#### `pi doctor` — Health checks
-
-```bash
-pi doctor
-```
-
-Checks: config file, session directory, configured provider API key presence, and model registry lookup.
-
-#### `pi acp` — Zed language model server
-
-```bash
-pi acp                          # Explicitly run ACP server
-pi --acp                        # Same via root flag
-```
-
-#### `pi version`
-
-```bash
-pi version                      # pi version 0.1.0
+# Run the Zed ACP server directly (Zed calls this automatically)
+pi acp
 ```
 
 ---
 
-## Built-in tools
+## Zed integration
 
-The agent has access to 8 built-in tools for interacting with the filesystem and shell.
+Pi advertises itself as a native language model provider. Zed invokes `pi acp` as a subprocess and communicates over stdin/stdout via JSON-RPC 2.0.
 
-### `read` — Read file with line numbers
-
-```json
-{ "path": "src/main.go", "offset": 50, "limit": 100 }
-```
-
-- `path` (required) — File path to read
-- `offset` — Start line (1-indexed, default 1)
-- `limit` — Max lines to return (default 2000)
-- Detects images by extension (jpg, png, gif, webp, svg) and returns them as image content blocks
-
-### `write` — Write or create a file
-
-```json
-{ "path": "src/utils.go", "content": "package main\n..." }
-```
-
-Creates parent directories as needed.
-
-### `edit` — String replacement
-
-```json
-{ "path": "main.go", "old_string": "fmt.Println", "new_string": "log.Println" }
-```
-
-- `replace_all` (bool, default `false`) — Replace all occurrences; without it, fails if `old_string` appears more than once
-
-### `bash` — Execute shell command
-
-```json
-{ "command": "go test ./...", "timeout": 60000 }
-```
-
-- `timeout` — Milliseconds (default 120,000 ms / 2 min)
-- Output capped at 100 KB
-- Captures combined stdout + stderr
-
-### `grep` — Search file contents
-
-```json
-{ "pattern": "func.*Handler", "path": ".", "context": 3, "recursive": true }
-```
-
-- `context` — Lines of context around each match
-- `case_sensitive` (bool, default `true`)
-- `recursive` (bool, default `true`) — Walk subdirectories
-- Skips `.git/`, `node_modules/`, `target/`; max 100 matches
-
-### `find` — Find files by pattern
-
-```json
-{ "path": ".", "pattern": "*.go", "type": "f", "max_depth": 3 }
-```
-
-- `type` — `f` (file), `d` (directory), `l` (symlink)
-- Skips `.git/`, `node_modules/`, `target/`; max 1000 results
-
-### `ls` — List directory
-
-```json
-{ "path": "internal/provider" }
-```
-
-Returns entries with type, size, and permissions. Max 500 entries.
-
-### `hashline_edit` — Precise line editing
-
-```json
-{
-  "path": "main.go",
-  "edits": [{ "line_hash": "42#a3f91c", "new_content": "    return nil" }]
-}
-```
-
-Line hash format is `LINE#HASH` where `HASH` is the first 6 characters of SHA-256 of the line content. Read a file with `read` to obtain hashes, then use them for surgical edits that survive minor file changes.
-
----
-
-## Sessions
-
-Sessions are stored in `~/.pi/agent/sessions/` by default.
-
-### JSONL format (version 3)
-
-Each session is a `.jsonl` file — one JSON object per line. The first line is always `{"version":3}`.
-
-Entry types:
-
-| Type | Purpose |
-|---|---|
-| `metadata` | Session creation info (ID, model, provider, timestamps) |
-| `message` | A conversation turn (role, content blocks, usage) |
-| `model_change` | Model switch mid-session |
-| `thinking_level` | Thinking level change |
-| `compaction` | Context compaction summary |
-
-### SQLite index
-
-When `sqlite: true` (default), an `index.db` is maintained alongside sessions for fast listing and search. Schema:
-
-```sql
-sessions (id, title, model, provider, created_at, updated_at, message_count, token_count, path)
-session_entries (id, session_id, parent_id, type, timestamp, data)
-```
-
-### Context compaction
-
-When the estimated token count exceeds the configured threshold, pi automatically:
-1. Keeps the last 10 messages intact
-2. Sends the older messages to the LLM for summarisation
-3. Prepends a `[Previous conversation summary]` stub
-4. Continues the session from the trimmed context
-
----
-
-## Configuration
-
-Settings are loaded from `~/.pi/agent/settings.json` (or `$PI_CONFIG`), with environment variables taking precedence.
-
-### Settings file
-
-```json
-{
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-6",
-  "max_tokens": 8096,
-  "temperature": 0,
-  "thinking_level": "off",
-  "system_prompt": "",
-  "theme": "dark",
-  "syntax_theme": "monokai",
-  "session_dir": "~/.pi/agent/sessions",
-  "sqlite": true
-}
-```
-
-### Environment variables
-
-| Variable | Config key | Notes |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | `anthropic_api_key` | |
-| `OPENAI_API_KEY` | `openai_api_key` | |
-| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `gemini_api_key` | Either works |
-| `COHERE_API_KEY` | `cohere_api_key` | |
-| `OPENROUTER_API_KEY` | `openrouter_api_key` | |
-| `AZURE_OPENAI_API_KEY` | `azure_api_key` | |
-| `AZURE_OPENAI_ENDPOINT` | `azure_endpoint` | |
-| `GOOGLE_CLOUD_PROJECT` | `vertex_project` | |
-| `PI_MODEL` | `model` | Override model |
-| `PI_PROVIDER` | `provider` | Override provider |
-| `PI_CONFIG` | — | Custom config file path |
-
----
-
-## Zed integration (ACP)
-
-Pi can serve as a native language model provider for the [Zed](https://zed.dev) editor via the Agent Client Protocol (ACP).
-
-### Protocol
-
-JSON-RPC 2.0 over line-delimited JSON on stdio. Protocol version: `0.1.0`.
-
-**Zed → pi:**
-
-```json
-{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
-{"jsonrpc":"2.0","id":1,"method":"complete","params":{"id":1,"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}]}}
-{"jsonrpc":"2.0","method":"cancel","params":{"id":1}}
-```
-
-**pi → Zed:**
-
-```json
-{"jsonrpc":"2.0","id":0,"result":{"protocol_version":"0.1.0","name":"pi","models":[...]}}
-{"jsonrpc":"2.0","method":"chunk","params":{"id":1,"text":"Hello! "}}
-{"jsonrpc":"2.0","id":1,"result":{"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":10}}}
-```
-
-### Zed config
-
-In your Zed `settings.json`:
+### Zed `settings.json`
 
 ```json
 {
@@ -509,134 +83,245 @@ In your Zed `settings.json`:
       "command": "pi",
       "args": ["acp"],
       "env": {
-        "ANTHROPIC_API_KEY": "sk-ant-..."
+        "OPENROUTER_API_KEY": "sk-or-..."
       }
     }
   }
 }
 ```
 
-All 39 registered models are advertised to Zed on `initialize`, with full capability flags for tools, vision, and thinking.
+On `initialize`, pi fetches the live model list from OpenRouter and returns it to Zed. All models appear in Zed's model picker immediately.
 
----
+### Session flow
 
-## RPC server
+When Zed uses `session/prompt`, pi:
+1. Loads conversation history for the session ID
+2. Runs the full agentic loop — LLM calls tools (read, write, bash, …), feeds results back, repeats
+3. Streams text and tool notifications back to Zed as `chunk` events
+4. Saves updated history for the next turn
 
-Pi exposes a JSON-RPC 2.0 server over stdin/stdout for programmatic embedding:
+### Debug logging
 
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"chat","params":{"message":"Hello"}}' | pi --provider anthropic
+PI_DEBUG=1 pi acp    # writes verbose logs to ~/.pi/agent/acp.log
 ```
 
-### Methods
+### Protocol summary
 
-| Method | Params | Returns |
-|---|---|---|
-| `chat` | `{message, model?, system?}` | Streams `{"event":"text","text":"..."}` notifications; final `{"event":"done","usage":{...}}` |
-| `session/new` | `{}` | `{session_id}` |
-| `session/list` | `{}` | `{sessions:[...]}` |
-| `session/open` | `{session_id}` | Session metadata |
-| `model/list` | `{}` | `{models:[...]}` |
+```
+Zed → pi:  initialize, complete, session/new, session/prompt, cancel
+pi → Zed:  initialize result (model list), chunk notifications, complete result
+```
 
 ---
 
-## TUI keyboard shortcuts
+## CLI reference
 
-| Key | Action |
+### Global flags
+
+| Flag | Short | Description |
+|---|---|---|
+| `--model` | `-m` | OpenRouter model ID override |
+| `--system` | | Override system prompt |
+| `--session` | `-s` | Session ID to continue |
+| `--no-session` | | Disable session persistence |
+| `--think` | | Enable extended thinking |
+| `--debug` | | Enable debug logging |
+
+### Commands
+
+#### `pi run` — One-shot agent
+
+```bash
+pi run "Refactor this module to use interfaces"
+pi run --model qwen/qwq-32b "Solve this algorithmic problem"
+```
+
+Streams the full agentic response (including tool output) to stdout.
+
+#### `pi session` — Session management
+
+```bash
+pi session list                  # List all sessions
+pi session show <id>             # Print session messages to stdout
+pi session delete <id>           # Delete (prompts for confirmation)
+pi session delete <id> --force   # Delete without confirmation
+```
+
+#### `pi auth` — API key
+
+```bash
+pi auth set sk-or-...    # Store OpenRouter key in settings.json
+pi auth status           # Show key (masked)
+```
+
+#### `pi models` — Live model list
+
+```bash
+pi models                # Fetches from OpenRouter and prints all available models
+```
+
+#### `pi config` — Configuration
+
+```bash
+pi config show
+pi config set model      anthropic/claude-sonnet-4-6
+pi config set model      deepseek/deepseek-r1
+pi config set thinking_level auto
+pi config set system_prompt "You are an expert Go developer"
+```
+
+#### `pi doctor` — Health check
+
+```bash
+pi doctor    # Checks config, session dir, and OPENROUTER_API_KEY
+```
+
+#### `pi acp` — Zed ACP server
+
+```bash
+pi acp    # Start the ACP server (Zed calls this automatically)
+```
+
+#### `pi version`
+
+```bash
+pi version
+```
+
+---
+
+## Built-in tools
+
+The agent has 8 tools for interacting with the filesystem and shell.
+
+### `read`
+```json
+{ "path": "src/main.go", "offset": 50, "limit": 100 }
+```
+Returns file contents with line numbers. Detects images by extension and returns base64.
+
+### `write`
+```json
+{ "path": "src/utils.go", "content": "package main\n..." }
+```
+Creates parent directories as needed.
+
+### `edit`
+```json
+{ "path": "main.go", "old_string": "fmt.Println", "new_string": "log.Println", "replace_all": false }
+```
+Fails if `old_string` is not found or appears more than once (when `replace_all` is false).
+
+### `bash`
+```json
+{ "command": "go test ./...", "timeout": 60000 }
+```
+Timeout in ms (default 120,000). Output capped at 100 KB. Combined stdout + stderr.
+
+### `grep`
+```json
+{ "pattern": "func.*Handler", "path": ".", "context": 3 }
+```
+Skips `.git/`, `node_modules/`, `target/`. Max 100 matches.
+
+### `find`
+```json
+{ "path": ".", "pattern": "*.go", "type": "f", "max_depth": 3 }
+```
+`type`: `f` (file), `d` (dir), `l` (symlink). Max 1000 results.
+
+### `ls`
+```json
+{ "path": "internal/provider" }
+```
+Returns entries with type and size. Max 500 entries.
+
+### `hashline_edit`
+```json
+{
+  "path": "main.go",
+  "edits": [{ "line_hash": "42#a3f91c", "new_content": "    return nil" }]
+}
+```
+`line_hash` format: `LINE#HASH` where HASH is the first 6 hex chars of SHA-256 of the line. More precise than string matching — survives surrounding edits.
+
+---
+
+## Configuration
+
+Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
+
+```json
+{
+  "openrouter_api_key": "sk-or-...",
+  "model": "anthropic/claude-sonnet-4-6",
+  "max_tokens": 8096,
+  "thinking_level": "off",
+  "system_prompt": "",
+  "session_dir": "~/.pi/agent/sessions",
+  "sqlite": true
+}
+```
+
+### Environment variables
+
+| Variable | Description |
 |---|---|
-| `Enter` | Submit message |
-| `Shift+Enter` | Insert newline |
-| `Esc` | Abort current generation |
-| `Ctrl+C` / `Ctrl+Q` | Quit |
-| `PgUp` / `PgDn` | Scroll conversation |
-| `Ctrl+U` / `Ctrl+F` | Scroll up / down |
-| `Ctrl+Home` / `Ctrl+End` | Jump to top / bottom |
-| `↑` / `↓` | Navigate input history |
-| `Ctrl+Y` | Copy last response |
-| `Ctrl+N` | New session |
-| `Ctrl+O` | Open session picker |
-| `Ctrl+T` | Toggle extended thinking |
-| `Ctrl+L` | Clear screen |
-| `?` | Show help |
+| `OPENROUTER_API_KEY` | OpenRouter API key |
+| `PI_MODEL` | Override model |
+| `PI_CONFIG` | Custom config file path |
+| `PI_DEBUG` | Set to any value to enable debug logging to `~/.pi/agent/acp.log` |
 
-### Slash commands
+---
 
-| Command | Description |
-|---|---|
-| `/help` (or `/h`) | Show available commands |
-| `/clear` | Clear conversation history |
-| `/model <id>` (or `/m`) | Switch model |
-| `/session new\|list\|open <id>` | Session management |
-| `/think on\|off\|auto` | Toggle thinking level |
-| `/system <prompt>` | Set system prompt |
-| `/copy` | Copy last response to clipboard |
-| `/exit` (or `/quit`, `/q`) | Exit pi |
+## Sessions
+
+Sessions live in `~/.pi/agent/sessions/` as `.jsonl` files (one JSON object per line, version 3 format). A SQLite index (`index.db`) is maintained alongside for fast listing.
+
+### Context compaction
+
+When conversation history grows large, pi automatically summarises older messages and continues from the trimmed context.
 
 ---
 
 ## Architecture
 
 ```
-cmd/pi/main.go                  Binary entry point
+cmd/pi/main.go
 internal/
-├── cli/root.go                 Cobra command tree (all subcommands + flags)
-├── config/config.go            Settings loading (file + env precedence)
+├── cli/root.go              Cobra command tree
+├── config/config.go         Settings (file + env)
 ├── model/
-│   ├── message.go              Message/ContentBlock/Usage types
-│   └── registry.go             45-model registry with capability flags
+│   ├── message.go           Message / ContentBlock / Usage types
+│   └── registry.go          ModelInfo struct (populated from OpenRouter API)
 ├── provider/
-│   ├── provider.go             Provider interface + Request/Event types
-│   ├── factory/factory.go      Provider constructor dispatcher
-│   ├── anthropic/              Anthropic Messages API (SSE streaming)
-│   ├── openai/                 OpenAI Chat Completions (SSE streaming)
-│   ├── gemini/                 Google Gemini (SSE streaming)
-│   ├── azure/                  Azure OpenAI (SSE streaming)
-│   ├── cohere/                 Cohere Chat v2 (SSE streaming)
-│   ├── bedrock/                AWS Bedrock Converse Stream (SDK)
-│   ├── vertex/                 Google Vertex AI (OAuth2 + SSE)
-│   ├── copilot/                GitHub Copilot (token exchange + SSE)
-│   ├── gitlab/                 GitLab Duo (OpenAI-compatible SSE)
-│   └── openrouter/             OpenRouter (OpenAI-compatible + routing)
-├── tools/tools.go              8 built-in tools + registry
+│   ├── provider.go          Provider interface + Request / Event types
+│   ├── factory/factory.go   Builds the OpenRouter provider from config
+│   └── openrouter/
+│       ├── openrouter.go    OpenRouter streaming (OpenAI-compatible SSE)
+│       └── models.go        Live model list from /api/v1/models
 ├── agent/
-│   ├── agent.go                Core agent loop (stream → tool → loop)
-│   ├── session_agent.go        Session-aware wrapper
-│   └── compaction.go           Context compaction
-├── session/
-│   ├── session.go              JSONL persistence (version 3)
-│   ├── sqlite.go               SQLite index + search
-│   ├── index.go                In-memory session index
-│   ├── metrics.go              Session statistics
-│   └── picker.go               Bubbletea session picker
-├── tui/
-│   ├── app.go                  Main Bubbletea TUI model
-│   ├── view.go                 Conversation rendering
-│   ├── commands.go             Slash command handlers
-│   ├── theme.go                Color themes (dark/light)
-│   ├── keybindings.go          Key binding definitions
-│   └── model_selector.go       Searchable model picker overlay
-├── acp/acp.go                  Zed ACP server (JSON-RPC 2.0 over stdio)
-├── rpc/rpc.go                  SDK RPC server (JSON-RPC 2.0 over stdio)
-├── auth/auth.go                Credential storage + validation
-├── httpclient/client.go        HTTP client (streaming + non-streaming)
-├── sse/sse.go                  SSE stream parser
-├── doctor/doctor.go            Environment health checks
-├── migrations/migrations.go    Startup migration from legacy layouts
-├── platform/platform.go        OS/arch detection
-└── version/version.go          Background update checker
+│   ├── agent.go             Core agentic loop (stream → tools → stream)
+│   ├── session_agent.go     Session-aware wrapper
+│   └── compaction.go        Context compaction
+├── acp/acp.go               Zed ACP server (JSON-RPC 2.0 over stdio)
+├── session/                 JSONL + SQLite persistence
+├── tools/tools.go           8 built-in tools
+├── httpclient/client.go     HTTP client (streaming + non-streaming)
+├── sse/sse.go               SSE parser
+└── doctor/doctor.go         Health checks
 ```
 
-### Key design decisions
+### Design notes
 
-**Provider interface is minimal:** `Name()` and `Stream()` only. Every provider returns a `<-chan Event` channel — the agent loop is identical for all 11 providers.
+**Single provider.** Everything routes through OpenRouter. One interface, one streaming implementation, one API key.
 
-**SSE parsing is per-provider:** Each provider speaks a slightly different wire format. Sharing SSE parsing across providers would require abstraction that costs clarity. Each provider file is self-contained.
+**Live model list.** `FetchModels()` calls `GET /api/v1/models` on startup. No hardcoded model IDs anywhere. New models on OpenRouter appear in Zed automatically.
 
-**`Request.Extra map[string]any`:** Provider-specific parameters (OpenRouter routing, Azure deployment config) flow through this escape hatch without polluting the shared interface.
+**Minimal dependencies.** 3 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index). The rest is stdlib.
 
-**Tool execution is parallel:** The agent executes all tool calls from a single assistant turn concurrently (capped at 4 goroutines), then feeds all results back in one user turn.
-
-**Session compaction is provider-agnostic:** The compactor calls the same `provider.Stream()` interface to generate summaries, so any configured provider handles compaction.
+**Tool execution is parallel.** All tool calls from a single assistant turn run concurrently (capped at 4 goroutines), results fed back in one user turn.
 
 ---
 
@@ -649,30 +334,20 @@ LDFLAG="-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=${VERSION}"
 go build -ldflags "$LDFLAG" -o pi ./cmd/pi/
 
 # Cross-compile
-GOOS=linux  GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-linux-amd64   ./cmd/pi/
-GOOS=linux  GOARCH=arm64 go build -ldflags "$LDFLAG" -o pi-linux-arm64   ./cmd/pi/
-GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAG" -o pi-darwin-arm64  ./cmd/pi/
+GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-linux-amd64    ./cmd/pi/
+GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAG" -o pi-linux-arm64    ./cmd/pi/
+GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAG" -o pi-darwin-arm64   ./cmd/pi/
 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./cmd/pi/
-```
-
-## Running tests
-
-```bash
-go test ./...
-go test ./internal/provider/... -v
-go test ./internal/session/... -v
 ```
 
 ---
 
-## Stats
-
-| Metric | Value |
+| | |
 |---|---|
-| Go files | 41 |
-| Lines of code | ~12,000 |
-| Providers | 11 |
-| Models | 39 |
+| Go files | 21 |
+| Lines of code | ~5,100 |
+| Providers | 1 (OpenRouter) |
+| Models | 500+ (live from API) |
 | Built-in tools | 8 |
-| Go version | 1.23.0 |
-| Binary size (release) | ~18 MB |
+| Direct dependencies | 3 |
+| Go version | 1.23+ |

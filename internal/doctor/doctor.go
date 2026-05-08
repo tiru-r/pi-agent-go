@@ -129,32 +129,12 @@ func checkAPIKeys(_ context.Context, cfg *config.Config) Check {
 		c.Detail = "config unavailable"
 		return c
 	}
-
-	type kv struct{ name, val string }
-	keys := []kv{
-		{"anthropic", cfg.AnthropicAPIKey},
-		{"openai", cfg.OpenAIAPIKey},
-		{"gemini", cfg.GeminiAPIKey},
-		{"cohere", cfg.CohereAPIKey},
-	}
-
-	var missing []string
-	for _, k := range keys {
-		if k.val == "" {
-			missing = append(missing, k.name)
-		}
-	}
-
-	switch {
-	case len(missing) == len(keys):
+	if cfg.OpenRouterAPIKey == "" {
 		c.Status = "error"
-		c.Detail = "no API keys configured"
-	case len(missing) > 0:
-		c.Status = "warning"
-		c.Detail = "missing keys for: " + strings.Join(missing, ", ")
-	default:
+		c.Detail = "OPENROUTER_API_KEY not set"
+	} else {
 		c.Status = "ok"
-		c.Detail = "all provider keys present"
+		c.Detail = "OPENROUTER_API_KEY configured"
 	}
 	return c
 }

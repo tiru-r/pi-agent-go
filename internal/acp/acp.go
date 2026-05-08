@@ -5,15 +5,20 @@
 // Wire format: one JSON object per line (no framing headers).
 //
 // Zed → pi  (requests)
-//   initialize  {}
-//   complete    {id, model, messages, system?, max_tokens?, temperature?, tools?}
-//   cancel      {id}
+//   initialize     {}
+//   complete       {id, model, messages, system?, max_tokens?, temperature?, tools?}
+//   session/new    {}
+//   session/prompt {id, sessionId, model, prompt, system?, max_tokens?, tools?}
+//   cancel         {id}
 //
 // pi → Zed  (responses + notifications)
 //   initialize response  {protocolVersion, name, models:[{id, displayName, maxTokens}]}
 //   chunk notification   {method:"chunk", params:{id, text}}
 //   complete response    {stopReason, usage?}
 //   error response       {code, message}
+//
+// Session history is maintained in-memory per sessionId.  Set PI_DEBUG=1 to
+// write verbose logs to ~/.pi/agent/acp.log.
 package acp
 
 import (
@@ -26,13 +31,17 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/tiru-r/pi-agent-go/internal/agent"
 	"github.com/tiru-r/pi-agent-go/internal/config"
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
+	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
 )
 
 const protocolVersion = 1
@@ -97,8 +106,8 @@ type completeParams struct {
 }
 
 type acpMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string     `json:"role"`
+	Content flexString `json:"content"`
 }
 
 type completeResult struct {
@@ -115,18 +124,17 @@ type cancelParams struct {
 	ID json.RawMessage `json:"id"`
 }
 
-// flexPrompt unmarshals a prompt that may arrive as a plain string or as an
-// array of content blocks (e.g. [{type:"text",text:"…"}]).
-type flexPrompt string
+// flexString unmarshals JSON that may arrive as a plain string or as an array
+// of content blocks (e.g. [{type:"text",text:"…"}]).  Used for both message
+// content fields and the session/prompt prompt field.
+type flexString string
 
-func (f *flexPrompt) UnmarshalJSON(b []byte) error {
-	// Try plain string first.
+func (f *flexString) UnmarshalJSON(b []byte) error {
 	var s string
 	if err := json.Unmarshal(b, &s); err == nil {
-		*f = flexPrompt(s)
+		*f = flexString(s)
 		return nil
 	}
-	// Fall back to array of content blocks.
 	var blocks []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
@@ -138,19 +146,19 @@ func (f *flexPrompt) UnmarshalJSON(b []byte) error {
 	for _, blk := range blocks {
 		sb.WriteString(blk.Text)
 	}
-	*f = flexPrompt(sb.String())
+	*f = flexString(sb.String())
 	return nil
 }
 
 type sessionPromptParams struct {
 	// ID is the caller-assigned request identifier for matching chunk notifications.
-	ID          json.RawMessage       `json:"id"`
-	SessionID   string                `json:"sessionId"`
-	Model       string                `json:"model"`
-	Prompt      flexPrompt            `json:"prompt"`
-	System      string                `json:"system,omitempty"`
-	MaxTokens   int                   `json:"maxTokens,omitempty"`
-	Temperature *float64              `json:"temperature,omitempty"`
+	ID          json.RawMessage        `json:"id"`
+	SessionID   string                 `json:"sessionId"`
+	Model       string                 `json:"model"`
+	Prompt      flexString             `json:"prompt"`
+	System      string                 `json:"system,omitempty"`
+	MaxTokens   int                    `json:"maxTokens,omitempty"`
+	Temperature *float64               `json:"temperature,omitempty"`
 	Tools       []model.ToolDefinition `json:"tools,omitempty"`
 }
 
@@ -170,24 +178,74 @@ type Server struct {
 	out   *bufio.Writer
 
 	// cancels maps a normalised request-ID string to the cancel function for the
-	// in-flight complete call.
+	// in-flight complete or session/prompt call.
 	cancelsMu sync.Mutex
 	cancels   map[string]context.CancelFunc
+
+	// sessions holds per-sessionId message history (in-memory, lives until the
+	// server exits / Zed closes the subprocess).
+	sessionsMu sync.RWMutex
+	sessions   map[string][]model.Message
+
+	// models is populated in the background on startup by fetching OpenRouter's
+	// /api/v1/models endpoint.  modelsReady is closed when the fetch completes.
+	modelsReady chan struct{}
+	modelsMu    sync.RWMutex
+	models      []acpModel
 }
 
 // New builds a Server.  It resolves the provider from cfg immediately so that
 // startup errors surface before Zed sends the first request.
+// Set PI_DEBUG=1 to write verbose logs to ~/.pi/agent/acp.log.
 func New(cfg *config.Config) (*Server, error) {
 	p, err := factory.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("acp: init provider: %w", err)
 	}
-	return &Server{
-		cfg:     cfg,
-		provider: p,
-		out:     bufio.NewWriter(os.Stdout),
-		cancels: make(map[string]context.CancelFunc),
-	}, nil
+	if os.Getenv("PI_DEBUG") != "" {
+		setupDebugLog(cfg)
+	}
+	s := &Server{
+		cfg:         cfg,
+		provider:    p,
+		out:         bufio.NewWriter(os.Stdout),
+		cancels:     make(map[string]context.CancelFunc),
+		sessions:    make(map[string][]model.Message),
+		modelsReady: make(chan struct{}),
+	}
+	go s.prefetchModels()
+	return s, nil
+}
+
+// prefetchModels fetches the OpenRouter model list in the background.
+// Closes s.modelsReady when done (whether successful or not).
+func (s *Server) prefetchModels() {
+	defer close(s.modelsReady)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	infos, err := openrouter.FetchModels(ctx, s.cfg.OpenRouterAPIKey)
+	if err != nil {
+		slog.Warn("model prefetch failed", "err", err)
+		return
+	}
+	s.modelsMu.Lock()
+	s.models = toACPModels(infos)
+	s.modelsMu.Unlock()
+	slog.Debug("models loaded", "count", len(infos))
+}
+
+// setupDebugLog redirects slog output to ~/.pi/agent/acp.log.
+func setupDebugLog(cfg *config.Config) {
+	logDir := filepath.Dir(cfg.SessionDir)
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(logDir, "acp.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})))
 }
 
 // Serve reads line-delimited JSON from stdin and dispatches each message.
@@ -244,7 +302,15 @@ func (s *Server) dispatch(ctx context.Context, req *request) {
 // ── Method handlers ───────────────────────────────────────────────────────────
 
 func (s *Server) handleInitialize(req *request) {
-	models := buildModelList()
+	// Wait up to 5 s for the background model fetch; proceed with whatever is ready.
+	select {
+	case <-s.modelsReady:
+	case <-time.After(5 * time.Second):
+		slog.Warn("model fetch timed out during initialize")
+	}
+	s.modelsMu.RLock()
+	models := s.models
+	s.modelsMu.RUnlock()
 	s.sendResult(rawID(req.ID), initializeResult{
 		ProtocolVersion: protocolVersion,
 		Name:            "pi",
@@ -279,7 +345,7 @@ func (s *Server) handleComplete(ctx context.Context, req *request) {
 	msgs := make([]model.Message, 0, len(p.Messages))
 	for _, m := range p.Messages {
 		role := model.Role(m.Role)
-		msgs = append(msgs, model.NewTextMessage(role, m.Content))
+		msgs = append(msgs, model.NewTextMessage(role, string(m.Content)))
 	}
 
 	maxTokens := p.MaxTokens
@@ -380,7 +446,8 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	defer s.unregisterCancel(callID)
 	defer cancel()
 
-	msgs := []model.Message{model.NewTextMessage(model.RoleUser, string(p.Prompt))}
+	var callIDany any
+	_ = json.Unmarshal(p.ID, &callIDany)
 
 	maxTokens := p.MaxTokens
 	if maxTokens == 0 {
@@ -389,61 +456,80 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	if maxTokens == 0 {
 		maxTokens = 8096
 	}
-
 	modelID := p.Model
 	if modelID == "" {
 		modelID = s.cfg.Model
 	}
-
-	req2 := &provider.Request{
-		Model:     modelID,
-		Messages:  msgs,
-		System:    p.System,
-		Tools:     p.Tools,
-		MaxTokens: maxTokens,
-		Temperature: p.Temperature,
+	system := p.System
+	if system == "" {
+		system = s.cfg.SystemPrompt
 	}
 
-	events, err := s.provider.Stream(cctx, req2)
-	if err != nil {
-		s.sendError(rawID(req.ID), -32000, "provider error: "+err.Error())
-		return
-	}
+	history := s.loadSession(p.SessionID)
+	ag := agent.New(s.provider, modelID, system, maxTokens)
 
-	var (
-		usage      model.Usage
-		stopReason = model.StopReasonEndTurn
-		callIDany  any
-	)
-	_ = json.Unmarshal(p.ID, &callIDany)
+	var finalStop model.StopReason = model.StopReasonEndTurn
+	var finalUsage model.Usage
 
-	for ev := range events {
-		switch ev.Type {
-		case provider.EventTextDelta:
-			if ev.Text != "" {
-				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Text})
+	slog.Debug("session/prompt start", "session", p.SessionID, "model", modelID, "history_len", len(history))
+
+	updatedMsgs, err := ag.Run(cctx, string(p.Prompt), history, agent.Options{}, func(ev agent.AgentEvent) {
+		switch ev.Kind {
+		case agent.EventKindText:
+			if ev.Delta != "" {
+				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Delta})
 			}
-		case provider.EventMessageStop:
-			stopReason = ev.StopReason
-			usage = ev.Usage
-		case provider.EventError:
-			if ev.Err != nil && cctx.Err() == nil {
-				slog.Warn("acp session/prompt stream error", "err", ev.Err)
-				s.sendError(rawID(req.ID), -32000, "stream error: "+ev.Err.Error())
-				return
-			}
+		case agent.EventKindToolStart:
+			s.sendNotification("chunk", chunkParams{ID: callIDany, Text: fmt.Sprintf("\n[tool: %s]\n", ev.ToolName)})
+			slog.Debug("tool start", "name", ev.ToolName)
+		case agent.EventKindToolDone:
+			slog.Debug("tool done", "name", ev.ToolResult.Name)
+		case agent.EventKindDone:
+			finalStop = ev.StopReason
+			finalUsage = ev.Usage
 		}
-	}
+	})
 
 	if cctx.Err() != nil {
 		s.sendError(rawID(req.ID), -32800, "request cancelled")
 		return
 	}
+	if err != nil {
+		slog.Warn("session/prompt agent error", "err", err)
+		s.sendError(rawID(req.ID), -32000, "agent error: "+err.Error())
+		return
+	}
+
+	s.saveSession(p.SessionID, updatedMsgs)
+	slog.Debug("session/prompt done", "session", p.SessionID, "msgs", len(updatedMsgs))
 
 	s.sendResult(rawID(req.ID), completeResult{
-		StopReason: stopReason,
-		Usage:      &usage,
+		StopReason: finalStop,
+		Usage:      &finalUsage,
 	})
+}
+
+// ── Session history store ─────────────────────────────────────────────────────
+
+func (s *Server) loadSession(id string) []model.Message {
+	if id == "" {
+		return nil
+	}
+	s.sessionsMu.RLock()
+	msgs := s.sessions[id]
+	s.sessionsMu.RUnlock()
+	out := make([]model.Message, len(msgs))
+	copy(out, msgs)
+	return out
+}
+
+func (s *Server) saveSession(id string, msgs []model.Message) {
+	if id == "" {
+		return
+	}
+	s.sessionsMu.Lock()
+	s.sessions[id] = msgs
+	s.sessionsMu.Unlock()
 }
 
 // ── Cancel registry ───────────────────────────────────────────────────────────
@@ -509,11 +595,10 @@ func rawID(raw json.RawMessage) any {
 	return v
 }
 
-// buildModelList returns all registered models as ACP model descriptors.
-func buildModelList() []acpModel {
-	all := model.Registry
-	out := make([]acpModel, 0, len(all))
-	for _, m := range all {
+// toACPModels converts ModelInfo slice to ACP model descriptors.
+func toACPModels(infos []model.ModelInfo) []acpModel {
+	out := make([]acpModel, 0, len(infos))
+	for _, m := range infos {
 		out = append(out, acpModel{
 			ID:               m.ID,
 			DisplayName:      m.DisplayName,
