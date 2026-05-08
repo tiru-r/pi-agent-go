@@ -397,6 +397,10 @@ func (s *Server) handleComplete(ctx context.Context, req *request) {
 			if ev.Text != "" {
 				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Text})
 			}
+		case provider.EventThinkingDelta:
+			if ev.Text != "" {
+				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Text})
+			}
 		case provider.EventMessageStop:
 			stopReason = ev.StopReason
 			usage = ev.Usage
@@ -476,6 +480,10 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	updatedMsgs, err := ag.Run(cctx, string(p.Prompt), history, agent.Options{}, func(ev agent.AgentEvent) {
 		switch ev.Kind {
 		case agent.EventKindText:
+			if ev.Delta != "" {
+				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Delta})
+			}
+		case agent.EventKindThinking:
 			if ev.Delta != "" {
 				s.sendNotification("chunk", chunkParams{ID: callIDany, Text: ev.Delta})
 			}

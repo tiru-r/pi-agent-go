@@ -136,6 +136,7 @@ type orChoice struct {
 type orDelta struct {
 	Role      string       `json:"role,omitempty"`
 	Content   *string      `json:"content"`
+	Reasoning *string      `json:"reasoning,omitempty"`
 	ToolCalls []orToolCall `json:"tool_calls,omitempty"`
 }
 
@@ -239,6 +240,11 @@ func (p *Provider) parseStream(ctx context.Context, r io.Reader, ch chan<- provi
 			// Text delta
 			if d.Content != nil && *d.Content != "" {
 				ch <- provider.Event{Type: provider.EventTextDelta, Text: *d.Content}
+			}
+
+			// Reasoning delta (thinking models like hy3)
+			if d.Reasoning != nil && *d.Reasoning != "" {
+				ch <- provider.Event{Type: provider.EventThinkingDelta, Text: *d.Reasoning}
 			}
 
 			// Tool-call deltas
