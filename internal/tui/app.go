@@ -319,16 +319,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tick())
 	}
 
-	// Always update viewport and input.
+	// Always update viewport; only forward non-key messages to input
+	// (key events are routed through the switch above to avoid double processing).
 	if m.ready {
 		var vpCmd tea.Cmd
 		m.viewport, vpCmd = m.viewport.Update(msg)
 		cmds = append(cmds, vpCmd)
 
 		if !m.streaming {
-			var inpCmd tea.Cmd
-			m.input, inpCmd = m.input.Update(msg)
-			cmds = append(cmds, inpCmd)
+			if _, isKey := msg.(tea.KeyMsg); !isKey {
+				var inpCmd tea.Cmd
+				m.input, inpCmd = m.input.Update(msg)
+				cmds = append(cmds, inpCmd)
+			}
 		}
 	}
 

@@ -191,6 +191,13 @@ func (p *Provider) parseStream(ctx context.Context, r io.Reader, ch chan<- provi
 		}
 		ev, err := parser.Next()
 		if err != nil {
+			// Stream closed without [DONE] — emit a clean stop so the agent
+			// doesn't hang waiting for EventMessageStop.
+			ch <- provider.Event{
+				Type:       provider.EventMessageStop,
+				StopReason: stopReason,
+				Usage:      usage,
+			}
 			return
 		}
 		if ev.Data == "[DONE]" {
