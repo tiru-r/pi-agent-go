@@ -212,7 +212,10 @@ func (s *Server) handleInitialize(req *request) {
 
 func (s *Server) handleSessionNew(req *request) {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		s.sendError(rawID(req.ID), -32000, "session/new: "+err.Error())
+		return
+	}
 	s.sendResult(rawID(req.ID), sessionNewResult{SessionID: hex.EncodeToString(b)})
 }
 
