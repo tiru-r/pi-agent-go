@@ -32,7 +32,7 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 )
 
-const protocolVersion = "0.1.0"
+const protocolVersion = 1
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ type rpcError struct {
 // ── ACP-specific parameter / result shapes ────────────────────────────────────
 
 type initializeResult struct {
-	ProtocolVersion string     `json:"protocolVersion"`
+	ProtocolVersion int        `json:"protocolVersion"`
 	Name            string     `json:"name"`
 	Models          []acpModel `json:"models"`
 }
