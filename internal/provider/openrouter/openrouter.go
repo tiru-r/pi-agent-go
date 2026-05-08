@@ -306,7 +306,7 @@ func (p *Provider) buildRequest(req *provider.Request) (*orRequest, error) {
 	}
 
 	out := &orRequest{
-		Model:     req.Model,
+		Model:     strings.TrimPrefix(req.Model, "openrouter/"),
 		Messages:  msgs,
 		MaxTokens: req.MaxTokens,
 		Temperature: req.Temperature,
