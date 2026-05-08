@@ -68,10 +68,10 @@ done
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
 
-log()  { [ "$QUIET" -eq 1 ] && return; echo -e "$*"; }
-info() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;34m→\033[0m $*"; }
-ok()   { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;32m✓\033[0m $*"; }
-warn() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[1;33m⚠\033[0m $*"; }
+log()  { [ "$QUIET" -eq 1 ] && return; echo -e "$*" >&2; }
+info() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;34m→\033[0m $*" >&2; }
+ok()   { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;32m✓\033[0m $*" >&2; }
+warn() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[1;33m⚠\033[0m $*" >&2; }
 err()  { echo -e "\033[0;31m✗\033[0m $*" >&2; }
 
 prompt_confirm() {
