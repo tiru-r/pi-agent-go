@@ -10,9 +10,9 @@
 //   cancel      {id}
 //
 // pi → Zed  (responses + notifications)
-//   initialize response  {protocol_version, name, models:[{id, display_name, max_tokens}]}
+//   initialize response  {protocolVersion, name, models:[{id, displayName, maxTokens}]}
 //   chunk notification   {method:"chunk", params:{id, text}}
-//   complete response    {stop_reason, usage?}
+//   complete response    {stopReason, usage?}
 //   error response       {code, message}
 package acp
 
@@ -64,19 +64,19 @@ type rpcError struct {
 // ── ACP-specific parameter / result shapes ────────────────────────────────────
 
 type initializeResult struct {
-	ProtocolVersion string     `json:"protocol_version"`
+	ProtocolVersion string     `json:"protocolVersion"`
 	Name            string     `json:"name"`
 	Models          []acpModel `json:"models"`
 }
 
 type acpModel struct {
 	ID               string `json:"id"`
-	DisplayName      string `json:"display_name"`
-	MaxTokens        int    `json:"max_tokens"`
+	DisplayName      string `json:"displayName"`
+	MaxTokens        int    `json:"maxTokens"`
 	Provider         string `json:"provider"`
-	SupportsTools    bool   `json:"supports_tools,omitempty"`
-	SupportsVision   bool   `json:"supports_vision,omitempty"`
-	SupportsThinking bool   `json:"supports_thinking,omitempty"`
+	SupportsTools    bool   `json:"supportsTools,omitempty"`
+	SupportsVision   bool   `json:"supportsVision,omitempty"`
+	SupportsThinking bool   `json:"supportsThinking,omitempty"`
 }
 
 type completeParams struct {
@@ -86,11 +86,11 @@ type completeParams struct {
 	Model         string                 `json:"model"`
 	Messages      []acpMessage           `json:"messages"`
 	System        string                 `json:"system,omitempty"`
-	MaxTokens     int                    `json:"max_tokens,omitempty"`
+	MaxTokens     int                    `json:"maxTokens,omitempty"`
 	Temperature   *float64               `json:"temperature,omitempty"`
-	StopSequences []string               `json:"stop_sequences,omitempty"`
+	StopSequences []string               `json:"stopSequences,omitempty"`
 	Tools         []model.ToolDefinition `json:"tools,omitempty"`
-	ThinkingLevel string                 `json:"thinking_level,omitempty"`
+	ThinkingLevel string                 `json:"thinkingLevel,omitempty"`
 }
 
 type acpMessage struct {
@@ -99,7 +99,7 @@ type acpMessage struct {
 }
 
 type completeResult struct {
-	StopReason model.StopReason `json:"stop_reason"`
+	StopReason model.StopReason `json:"stopReason"`
 	Usage      *model.Usage     `json:"usage,omitempty"`
 }
 
