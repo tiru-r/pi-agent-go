@@ -167,13 +167,14 @@ build_binary() {
 
   info "Building pi ${version}…"
 
+  cd "$src_dir"
   go build \
     -ldflags "-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=${version}" \
-    -o "${src_dir}/pi" \
-    "${src_dir}/cmd/pi/"
+    -o "$src_dir/pi" \
+    ./cmd/pi/
 
   ok "Build complete"
-  echo "${src_dir}/pi"
+  echo "$src_dir/pi"
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
