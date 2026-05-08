@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/tiru-r/pi-agent-go/internal/config"
@@ -114,15 +115,42 @@ type cancelParams struct {
 	ID json.RawMessage `json:"id"`
 }
 
+// flexPrompt unmarshals a prompt that may arrive as a plain string or as an
+// array of content blocks (e.g. [{type:"text",text:"…"}]).
+type flexPrompt string
+
+func (f *flexPrompt) UnmarshalJSON(b []byte) error {
+	// Try plain string first.
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*f = flexPrompt(s)
+		return nil
+	}
+	// Fall back to array of content blocks.
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(b, &blocks); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	for _, blk := range blocks {
+		sb.WriteString(blk.Text)
+	}
+	*f = flexPrompt(sb.String())
+	return nil
+}
+
 type sessionPromptParams struct {
 	// ID is the caller-assigned request identifier for matching chunk notifications.
-	ID          json.RawMessage  `json:"id"`
-	SessionID   string           `json:"sessionId"`
-	Model       string           `json:"model"`
-	Prompt      string           `json:"prompt"`
-	System      string           `json:"system,omitempty"`
-	MaxTokens   int              `json:"maxTokens,omitempty"`
-	Temperature *float64         `json:"temperature,omitempty"`
+	ID          json.RawMessage       `json:"id"`
+	SessionID   string                `json:"sessionId"`
+	Model       string                `json:"model"`
+	Prompt      flexPrompt            `json:"prompt"`
+	System      string                `json:"system,omitempty"`
+	MaxTokens   int                   `json:"maxTokens,omitempty"`
+	Temperature *float64              `json:"temperature,omitempty"`
 	Tools       []model.ToolDefinition `json:"tools,omitempty"`
 }
 
@@ -352,7 +380,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	defer s.unregisterCancel(callID)
 	defer cancel()
 
-	msgs := []model.Message{model.NewTextMessage(model.RoleUser, p.Prompt)}
+	msgs := []model.Message{model.NewTextMessage(model.RoleUser, string(p.Prompt))}
 
 	maxTokens := p.MaxTokens
 	if maxTokens == 0 {
