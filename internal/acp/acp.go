@@ -19,6 +19,8 @@ package acp
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,6 +114,10 @@ type cancelParams struct {
 	ID json.RawMessage `json:"id"`
 }
 
+type sessionNewResult struct {
+	SessionID string `json:"sessionId"`
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 // Server speaks the Zed ACP protocol over stdin/stdout.
@@ -182,6 +188,8 @@ func (s *Server) dispatch(ctx context.Context, req *request) {
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
+	case "session/new":
+		s.handleSessionNew(req)
 	case "cancel":
 		s.handleCancel(req)
 	default:
@@ -200,6 +208,12 @@ func (s *Server) handleInitialize(req *request) {
 		Name:            "pi",
 		Models:          models,
 	})
+}
+
+func (s *Server) handleSessionNew(req *request) {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	s.sendResult(rawID(req.ID), sessionNewResult{SessionID: hex.EncodeToString(b)})
 }
 
 func (s *Server) handleComplete(ctx context.Context, req *request) {
