@@ -45,6 +45,7 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/provider"
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
+	"github.com/tiru-r/pi-agent-go/internal/runtime"
 )
 
 const protocolVersion = 1
@@ -229,6 +230,9 @@ type Server struct {
 	modelsReady chan struct{}
 	modelsMu    sync.RWMutex
 	models      []acpModel
+
+	// monitor provides runtime intelligence across all sessions.
+	monitor *runtime.Monitor
 }
 
 // New builds a Server.
@@ -247,6 +251,7 @@ func New(cfg *config.Config) (*Server, error) {
 		cancels:     make(map[string]context.CancelFunc),
 		sessions:    make(map[string]*sessionState),
 		modelsReady: make(chan struct{}),
+		monitor:     runtime.NewMonitor(),
 	}
 	go s.prefetchModels()
 	return s, nil
@@ -324,6 +329,8 @@ func (s *Server) dispatch(_ context.Context, req *request) {
 		s.handleSessionSetModel(req)
 	case "session/close":
 		s.handleSessionClose(req)
+	case "runtime/report":
+		s.handleRuntimeReport(req)
 	default:
 		if req.ID != nil {
 			s.sendError(rawID(req.ID), -32601, "method not found: "+req.Method)
@@ -332,6 +339,11 @@ func (s *Server) dispatch(_ context.Context, req *request) {
 }
 
 // ── Method handlers ───────────────────────────────────────────────────────────
+
+func (s *Server) handleRuntimeReport(req *request) {
+	report := s.monitor.Report()
+	s.sendResult(rawID(req.ID), report)
+}
 
 func (s *Server) handleInitialize(req *request) {
 	s.sendResult(rawID(req.ID), acpInitResult{
@@ -524,6 +536,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	}
 
 	ag := agent.New(s.provider, modelID, system, maxTokens)
+	ag.Monitor = s.monitor
 
 	var finalStop model.StopReason = model.StopReasonEndTurn
 	var finalUsage model.Usage

@@ -3,10 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/config"
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/runtime"
 	"github.com/tiru-r/pi-agent-go/internal/session"
 	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
@@ -24,6 +26,9 @@ type SessionAgent struct {
 	Session  *session.Session
 	Config   *config.Config
 	MaxIter  int // default 20, prevents infinite loops
+
+	// Monitor is optional; attach one to enable runtime intelligence.
+	Monitor *runtime.Monitor
 }
 
 // SessionRunOptions configures a single SessionAgent.Run call.
@@ -102,14 +107,33 @@ func (a *SessionAgent) Run(
 			ThinkingLevel: thinking,
 		}
 
+		t0 := time.Now()
 		events, err := a.Provider.Stream(ctx, req)
 		if err != nil {
+			if a.Monitor != nil {
+				a.Monitor.Observe(runtime.Observation{
+					Time:    t0,
+					Stage:   "llm",
+					Latency: time.Since(t0),
+					Weight:  float64(len(msgs)),
+					Success: false,
+				})
+			}
 			return fmt.Errorf("session_agent: stream: %w", err)
 		}
 
 		// Tee events to caller while collecting.
 		fanned := teeEvents(events, onEvent)
 		resp, err := provider.Collect(fanned)
+		if a.Monitor != nil {
+			a.Monitor.Observe(runtime.Observation{
+				Time:    t0,
+				Stage:   "llm",
+				Latency: time.Since(t0),
+				Weight:  float64(len(msgs)),
+				Success: err == nil,
+			})
+		}
 		if err != nil {
 			return fmt.Errorf("session_agent: collect: %w", err)
 		}
@@ -151,7 +175,6 @@ func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) 
 
 	done := make(chan struct{})
 	for i, use := range uses {
-		i, use := i, use
 		go func() {
 			sem <- struct{}{}
 			defer func() { <-sem; done <- struct{}{} }()
@@ -198,14 +221,36 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock) mo
 		params = []byte("{}")
 	}
 
+	t0tool := time.Now()
 	res, err := t.Execute(ctx, params)
+	toolLatency := time.Since(t0tool)
+
 	if err != nil {
+		if a.Monitor != nil {
+			a.Monitor.Observe(runtime.Observation{
+				Time:    t0tool,
+				Stage:   "tool:" + block.Name,
+				Latency: toolLatency,
+				Weight:  float64(len(a.Session.Messages())),
+				Success: false,
+			})
+		}
 		result.IsError = true
 		result.Content = []model.ContentBlock{{
 			Type: model.ContentTypeText,
 			Text: "tool execution error: " + err.Error(),
 		}}
 		return result
+	}
+
+	if a.Monitor != nil {
+		a.Monitor.Observe(runtime.Observation{
+			Time:    t0tool,
+			Stage:   "tool:" + block.Name,
+			Latency: toolLatency,
+			Weight:  float64(len(a.Session.Messages())),
+			Success: !res.IsError,
+		})
 	}
 
 	result.IsError = res.IsError

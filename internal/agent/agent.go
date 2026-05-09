@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/runtime"
 	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
@@ -64,6 +66,9 @@ type Agent struct {
 	model  string
 	system string
 	maxTok int
+
+	// Monitor is optional; attach one to enable runtime intelligence.
+	Monitor *runtime.Monitor
 }
 
 // New constructs an Agent backed by the given provider.
@@ -124,8 +129,18 @@ func (a *Agent) Run(
 			ThinkingLevel: thinkLevel,
 		}
 
+		t0 := time.Now()
 		eventCh, err := a.prov.Stream(ctx, req)
 		if err != nil {
+			if a.Monitor != nil {
+				a.Monitor.Observe(runtime.Observation{
+					Time:    t0,
+					Stage:   "llm",
+					Latency: time.Since(t0),
+					Weight:  float64(len(msgs)),
+					Success: false,
+				})
+			}
 			onEvent(AgentEvent{Kind: EventKindError, Err: err})
 			return msgs, err
 		}
@@ -133,6 +148,15 @@ func (a *Agent) Run(
 		// Drain the stream, collecting a complete response message while
 		// forwarding incremental events to the caller.
 		resp, err := drainStream(ctx, eventCh, onEvent)
+		if a.Monitor != nil {
+			a.Monitor.Observe(runtime.Observation{
+				Time:    t0,
+				Stage:   "llm",
+				Latency: time.Since(t0),
+				Weight:  float64(len(msgs)),
+				Success: err == nil,
+			})
+		}
 		if err != nil {
 			return msgs, err
 		}
@@ -151,7 +175,7 @@ func (a *Agent) Run(
 		}
 
 		// Execute tool calls and collect results.
-		toolResults, err := executeTools(ctx, resp.Message.Content, onEvent)
+		toolResults, err := executeTools(ctx, resp.Message.Content, onEvent, a.Monitor, len(msgs))
 		if err != nil {
 			return msgs, err
 		}
@@ -255,6 +279,8 @@ func executeTools(
 	ctx context.Context,
 	blocks []model.ContentBlock,
 	onEvent func(AgentEvent),
+	mon *runtime.Monitor,
+	msgCount int,
 ) ([]model.ContentBlock, error) {
 	var results []model.ContentBlock
 
@@ -275,6 +301,15 @@ func executeTools(
 				},
 				IsError: true,
 			}
+			if mon != nil {
+				mon.Observe(runtime.Observation{
+					Time:    time.Now(),
+					Stage:   "tool:" + block.Name,
+					Latency: 0,
+					Weight:  float64(msgCount),
+					Success: false,
+				})
+			}
 			onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 			results = append(results, result)
 			continue
@@ -285,7 +320,9 @@ func executeTools(
 			params = json.RawMessage("{}")
 		}
 
+		t0tool := time.Now()
 		toolResult, err := t.Execute(ctx, params)
+		toolLatency := time.Since(t0tool)
 
 		var resultContent []model.ContentBlock
 		isError := false
@@ -297,6 +334,16 @@ func executeTools(
 		} else if toolResult != nil {
 			isError = toolResult.IsError
 			resultContent = toolResult.Content
+		}
+
+		if mon != nil {
+			mon.Observe(runtime.Observation{
+				Time:    t0tool,
+				Stage:   "tool:" + block.Name,
+				Latency: toolLatency,
+				Weight:  float64(msgCount),
+				Success: !isError,
+			})
 		}
 
 		result := model.ContentBlock{

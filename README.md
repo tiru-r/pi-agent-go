@@ -10,6 +10,7 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 - **8 built-in tools** — read, write, edit, bash, grep, find, ls, hashline_edit
 - **Full agentic loop** — LLM → tools → LLM cycles inside Zed's chat panel
 - **Session memory** — multi-turn conversation history maintained per Zed session
+- **Runtime intelligence** — CUSUM+BOCPD regime detection, conformal anomaly gating, PAC-Bayes safety bounds, off-policy evaluation, VOI experiment scheduling, weighted attribution, and OCO control (see [Runtime Intelligence](#runtime-intelligence))
 - **One API key** — `OPENROUTER_API_KEY` is all you need
 - **Tiny binary** — 3 direct dependencies (cobra, uuid, sqlite)
 
@@ -121,7 +122,105 @@ Zed → pi:  initialize, session/new, session/prompt, session/cancel,
 pi → Zed:  initialize result (agentInfo), session/new result (configOptions + models),
            session/update notifications (agent_message_chunk, agent_thought_chunk),
            session/prompt result (stopReason, usage)
+
+Internal:  runtime/report  →  RuntimeReport JSON (regime, anomaly, OPE, attribution, …)
 ```
+
+---
+
+## Runtime Intelligence
+
+Pi's `internal/runtime` package implements seven math-driven decision systems that run continuously alongside every agent session. The goal is safer policy decisions, faster recovery from workload shifts, and more trustworthy performance attribution — not formulas in docs.
+
+### Regime-Shift Detection — CUSUM + BOCPD
+
+Two complementary detectors run on every LLM and tool latency sample:
+
+- **CUSUM** (two-sided, k=0.5, h=5.0) catches *persistent drift* — a slow mean shift that accumulates over time.
+- **BOCPD** (Adams & MacKay 2007, λ=50) catches *sudden regime changes* — a spike in P(r=0|x₁:t) without brittle fixed thresholds. Uses a Normal-Gamma conjugate prior with log-space run-length posteriors pruned to 500 hypotheses.
+
+`RegimeDetector` fires when either detector alarms and exposes the BOCPD posterior mode as the estimated change point.
+
+### Conformal Prediction Envelope
+
+A sliding window (n=200) of nonconformity scores |xₜ − μₜ| provides an *adaptive* anomaly threshold:
+
+```
+q = score[⌈(n+1)·0.95⌉−1]     anomaly if |xₜ − μₜ| > q
+```
+
+The threshold tightens automatically when behavior stabilises and widens when variance is high — no static latency cutoff.
+
+### PAC-Bayes Safety Bound
+
+Before allowing aggressive policy moves, the safety envelope computes a PAC-Bayes-kl upper bound on the true error rate:
+
+```
+kl(q̂, q_bound) ≤ (KL(Q‖P) + ln(2√n/δ)) / n
+```
+
+Solved via bisection. `PACBayesSafety.Veto(maxErr)` returns true — failing closed — when the upper bound exceeds `maxErr`.
+
+### Off-Policy Evaluation — IPS / WIS / DR + ESS + Regret Gate
+
+Candidate policy changes are evaluated from trace data before being applied:
+
+```
+wᵢ = π(aᵢ|xᵢ) / μ(aᵢ|xᵢ)          (clipped to [0, 20])
+V̂_IPS = (1/n) Σ wᵢrᵢ
+V̂_WIS = Σ wᵢrᵢ / Σ wᵢ
+V̂_DR  = (1/n) Σ (r̂ᵢ + wᵢ(rᵢ − r̂ᵢ))
+N_eff  = (Σ wᵢ)² / Σ wᵢ²
+Δ_regret = r̄_baseline − V̂_DR
+```
+
+`ShouldVeto` returns true if N_eff < 5 (insufficient support) or regret exceeds threshold.
+
+### VOI-Driven Experiment Selection
+
+The VOI planner schedules diagnostic probes by highest expected value per unit cost:
+
+```
+priorityᵢ ∝ utilityᵢ / overheadᵢ
+```
+
+Only stale probes (TTL expired) within the overhead budget are considered. `Next(budget)` returns the best candidate or nil.
+
+### Weighted Bottleneck Attribution
+
+Per-stage latency is weighted by session message count to reflect realistic workload distribution:
+
+```
+weighted_contribution_s = (Σ wᵢ·mᵢ,s) / (Σ wᵢ·tᵢ) · 100     wᵢ = session_messages
+n_eff = (Σ wᵢ)² / Σ wᵢ²
+CI₉₅  = μ ± 1.96 · √(σ²_w / n_eff)
+```
+
+`AttributionTracker.Report()` returns per-stage shares with 95% confidence intervals — ranking optimisation work by actual end-to-end impact.
+
+### Online Convex Control + Regret Rollback
+
+A continuous parameter tuner (controlling e.g. concurrency or timeout scaling) adapts via projected gradient descent:
+
+```
+τₜ₊₁ = clip(τₜ − η·∇L, τ_min, τ_max)
+```
+
+If instantaneous loss exceeds the rollback threshold, `τ` reverts immediately to the last known safe value. Default: τ ∈ [0.1, 10], η=0.05, rollback at loss > 2.0.
+
+### Summary
+
+| Subsystem | File | Trigger |
+|---|---|---|
+| CUSUM + BOCPD | `runtime/detector.go` | Every LLM/tool latency sample |
+| Conformal envelope | `runtime/conformal.go` | Every latency sample |
+| PAC-Bayes safety | `runtime/safety.go` | Every success/error event |
+| IPS/WIS/DR + ESS | `runtime/ope.go` | Every logged policy trace |
+| VOI planner | `runtime/voi.go` | On-demand probe selection |
+| Weighted attribution | `runtime/attribution.go` | Rolled up on `Report()` |
+| OCO controller | `runtime/controller.go` | Every latency sample |
+
+All subsystems are wired through `runtime.Monitor`, attached to the ACP server, and fed from `session_agent.go`. The full report is available via the `runtime/report` internal ACP method.
 
 ---
 
@@ -313,9 +412,19 @@ internal/
 │       └── models.go        Live model list from /api/v1/models
 ├── agent/
 │   ├── agent.go             Core agentic loop (stream → tools → stream)
-│   ├── session_agent.go     Session-aware wrapper
+│   ├── session_agent.go     Session-aware wrapper (feeds runtime.Monitor)
 │   └── compaction.go        Context compaction
 ├── acp/acp.go               Zed ACP server (JSON-RPC 2.0 over stdio)
+├── runtime/
+│   ├── metrics.go           Shared types (Observation, PolicyTrace, RuntimeReport)
+│   ├── detector.go          CUSUM + BOCPD regime-shift detection
+│   ├── conformal.go         Conformal prediction anomaly envelope
+│   ├── safety.go            PAC-Bayes-kl safety bound + veto
+│   ├── ope.go               Off-policy evaluator (IPS/WIS/DR + ESS + regret gate)
+│   ├── voi.go               VOI-driven experiment scheduler
+│   ├── attribution.go       Weighted bottleneck attribution + CI₉₅
+│   ├── controller.go        OCO online controller with rollback
+│   └── monitor.go           Top-level Monitor wiring all subsystems
 ├── session/                 JSONL + SQLite persistence
 ├── tools/tools.go           8 built-in tools
 ├── httpclient/client.go     HTTP client (streaming + non-streaming)
@@ -331,7 +440,7 @@ internal/
 
 **New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model and thinking level per conversation; Zed's UI controls drive both via `session/set_config_option` and `session/set_model`.
 
-**Minimal dependencies.** 3 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index). The rest is stdlib.
+**Minimal dependencies.** 3 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index). The runtime intelligence package uses only stdlib (`math`, `sort`, `sync`).
 
 **Tool execution is parallel.** All tool calls from a single assistant turn run concurrently (capped at 4 goroutines), results fed back in one user turn.
 
@@ -356,10 +465,11 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 
 | | |
 |---|---|
-| Go files | 21 |
-| Lines of code | ~5,100 |
+| Go files | 30 |
+| Lines of code | ~6,400 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |
+| Runtime subsystems | 7 |
 | Direct dependencies | 3 |
 | Go version | 1.23+ |
