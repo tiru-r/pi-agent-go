@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -140,7 +141,6 @@ var imageExtensions = map[string]string{
 	".png":  "image/png",
 	".gif":  "image/gif",
 	".webp": "image/webp",
-	".svg":  "image/svg+xml",
 }
 
 func (r *readTool) Execute(_ context.Context, params json.RawMessage) (*Result, error) {
@@ -211,7 +211,11 @@ func (r *readTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 			len(lines), start+1, end)
 	}
 
-	return textResult(sb.String()), nil
+	result := sb.String()
+	if len(result) > bashMaxBytes {
+		result = result[:bashMaxBytes] + fmt.Sprintf("\n... (truncated at %d bytes)", bashMaxBytes)
+	}
+	return textResult(result), nil
 }
 
 // ============================================================================
@@ -247,7 +251,11 @@ func (w *writeTool) Execute(_ context.Context, params json.RawMessage) (*Result,
 	if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
 		return errorResult("cannot create parent directories: " + err.Error()), nil
 	}
-	if err := os.WriteFile(p.Path, []byte(p.Content), 0o644); err != nil {
+	perm := fs.FileMode(0o644)
+	if info, err := os.Stat(p.Path); err == nil {
+		perm = info.Mode().Perm()
+	}
+	if err := os.WriteFile(p.Path, []byte(p.Content), perm); err != nil {
 		return errorResult("cannot write file: " + err.Error()), nil
 	}
 	return textResult(fmt.Sprintf("Successfully wrote %d bytes to %s", len(p.Content), p.Path)), nil
@@ -289,10 +297,18 @@ func (e *editTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 	if p.Path == "" {
 		return errorResult("path is required"), nil
 	}
+	if p.OldString == "" {
+		return errorResult("old_string cannot be empty"), nil
+	}
 
 	data, err := os.ReadFile(p.Path)
 	if err != nil {
 		return errorResult("cannot read file: " + err.Error()), nil
+	}
+
+	perm := fs.FileMode(0o644)
+	if info, statErr := os.Stat(p.Path); statErr == nil {
+		perm = info.Mode().Perm()
 	}
 
 	content := string(data)
@@ -313,7 +329,7 @@ func (e *editTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 		updated = strings.Replace(content, p.OldString, p.NewString, 1)
 	}
 
-	if err := os.WriteFile(p.Path, []byte(updated), 0o644); err != nil {
+	if err := os.WriteFile(p.Path, []byte(updated), perm); err != nil {
 		return errorResult("cannot write file: " + err.Error()), nil
 	}
 	return textResult(fmt.Sprintf("Successfully edited %s", p.Path)), nil
@@ -517,17 +533,21 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	}
 
 	var results []string
-	const maxResults = 100
+	matchCount := 0
+	const maxMatches = 100
 
 	searchFile := func(filePath string) {
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return
 		}
+		if bytes.IndexByte(data, 0) != -1 {
+			return // skip binary files
+		}
 		lines := strings.Split(string(data), "\n")
 		lastPrintedEnd := -1 // tracks the next unprinted line to avoid overlap
 		for i, line := range lines {
-			if len(results) >= maxResults {
+			if matchCount >= maxMatches {
 				return
 			}
 			select {
@@ -536,6 +556,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			default:
 			}
 			if re.MatchString(line) {
+				matchCount++
 				start := max(i-p.Context, 0)
 				end := min(i+p.Context+1, len(lines))
 				// Emit separator only when there is an actual gap between match
@@ -569,7 +590,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 	if info.IsDir() && recursive {
 		_ = filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || len(results) >= maxResults {
+			if err != nil || matchCount >= maxMatches {
 				return nil
 			}
 			if d.IsDir() {
@@ -591,7 +612,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	}
 
 	output := strings.Join(results, "\n")
-	if len(results) >= maxResults {
+	if matchCount >= maxMatches {
 		output += "\n... (result limit reached)"
 	}
 	return textResult(truncateHeadTail(output)), nil
@@ -624,6 +645,11 @@ var excludedFindDirs = map[string]bool{
 	"target":       true,
 }
 
+type findEntry struct {
+	path    string
+	modTime time.Time
+}
+
 func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
 	var p struct {
 		Path     string `json:"path"`
@@ -650,7 +676,7 @@ func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	}
 
 	const maxResults = 1000
-	var matches []string
+	var matches []findEntry
 	rootDepth := strings.Count(filepath.Clean(p.Path), string(os.PathSeparator))
 
 	_ = filepath.WalkDir(p.Path, func(path string, d fs.DirEntry, err error) error {
@@ -699,7 +725,11 @@ func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			return nil
 		}
 		if matched {
-			matches = append(matches, path)
+			entry := findEntry{path: path}
+			if info, infoErr := d.Info(); infoErr == nil {
+				entry.modTime = info.ModTime()
+			}
+			matches = append(matches, entry)
 		}
 		return nil
 	})
@@ -708,7 +738,15 @@ func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 		return textResult("No matches found."), nil
 	}
 
-	output := strings.Join(matches, "\n")
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].modTime.After(matches[j].modTime)
+	})
+
+	paths := make([]string, len(matches))
+	for i, m := range matches {
+		paths[i] = m.path
+	}
+	output := strings.Join(paths, "\n")
 	if len(matches) >= maxResults {
 		output += "\n... (result limit reached)"
 	}
