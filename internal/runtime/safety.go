@@ -13,6 +13,7 @@ type PACBayesSafety struct {
 	errors int
 	klQP  float64 // KL(Q||P), set externally
 	delta float64 // confidence parameter
+	minN  int     // minimum observations before Veto makes a decision
 }
 
 // NewPACBayesSafety constructs a PACBayesSafety with default parameters.
@@ -20,6 +21,7 @@ func NewPACBayesSafety() *PACBayesSafety {
 	return &PACBayesSafety{
 		klQP:  1.0,
 		delta: 0.05,
+		minN:  10,
 	}
 }
 
@@ -101,8 +103,17 @@ func (p *PACBayesSafety) Bound() (empiricalErr, upperBound float64) {
 }
 
 // Veto returns true if the PAC-Bayes upper bound exceeds maxErrRate.
-// Fails closed: returns true if n == 0.
+// Abstains (returns false) when fewer than minN observations have been recorded,
+// since the bound is not meaningful with too little data.
 func (p *PACBayesSafety) Veto(maxErrRate float64) bool {
+	p.mu.Lock()
+	n := p.n
+	minN := p.minN
+	p.mu.Unlock()
+
+	if n < minN {
+		return false
+	}
 	_, upper := p.Bound()
 	return upper > maxErrRate
 }

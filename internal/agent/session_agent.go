@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/config"
@@ -30,6 +31,10 @@ type SessionAgent struct {
 
 	// Monitor is optional; attach one to enable runtime intelligence.
 	Monitor *runtime.Monitor
+
+	// Hooks is optional; wire an extensions.Manager to broadcast tool lifecycle
+	// events to JS extensions that define before_tool / after_tool.
+	Hooks HookRunner
 }
 
 // SessionRunOptions configures a single SessionAgent.Run call.
@@ -238,6 +243,10 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock) mo
 		params = []byte("{}")
 	}
 
+	if a.Hooks != nil {
+		a.Hooks.RunBeforeTool(ctx, block.Name, params)
+	}
+
 	t0tool := time.Now()
 	res, err := t.Execute(ctx, params)
 	toolLatency := time.Since(t0tool)
@@ -251,6 +260,9 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock) mo
 				Weight:  float64(len(a.Session.Messages())),
 				Success: false,
 			})
+		}
+		if a.Hooks != nil {
+			a.Hooks.RunAfterTool(ctx, block.Name, "tool execution error: "+err.Error(), true)
 		}
 		result.IsError = true
 		result.Content = []model.ContentBlock{{
@@ -268,6 +280,16 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock) mo
 			Weight:  float64(len(a.Session.Messages())),
 			Success: !res.IsError,
 		})
+	}
+
+	if a.Hooks != nil {
+		var sb strings.Builder
+		for _, rc := range res.Content {
+			if rc.Type == model.ContentTypeText {
+				sb.WriteString(rc.Text)
+			}
+		}
+		a.Hooks.RunAfterTool(ctx, block.Name, sb.String(), res.IsError)
 	}
 
 	result.IsError = res.IsError

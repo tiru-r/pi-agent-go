@@ -16,16 +16,28 @@ import (
 //
 // The subprocess receives tool parameters as JSON on stdin and must write
 // {"content":"...","is_error":false} as JSON to stdout, or plain text on stdout.
+//
+// Capability enforcement: native subprocesses inherit the process environment and
+// filesystem access from the host OS. The capabilities and allow_paths fields are
+// advisory — they document intent and are surfaced in health checks, but cannot be
+// enforced without OS-level sandboxing (namespaces, seccomp, pledge, etc.), which
+// is left to the deployment environment.
 type nativeDescriptor struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Schema      json.RawMessage `json:"schema"`
 	Command     []string        `json:"command"`
+
+	// Advisory capability declaration (see note above).
+	Capabilities []Capability `json:"capabilities,omitempty"`
+	AllowPaths   []string     `json:"allow_paths,omitempty"`
 }
 
 type nativeExtension struct {
-	info Info
-	cmd  []string
+	info         Info
+	cmd          []string
+	capabilities []Capability
+	allowPaths   []string
 }
 
 func loadNative(path string) (*nativeExtension, error) {
@@ -48,8 +60,10 @@ func loadNative(path string) (*nativeExtension, error) {
 		schema = json.RawMessage(`{"type":"object","properties":{}}`)
 	}
 	return &nativeExtension{
-		info: Info{Name: desc.Name, Description: desc.Description, Schema: schema},
-		cmd:  desc.Command,
+		info:         Info{Name: desc.Name, Description: desc.Description, Schema: schema},
+		cmd:          desc.Command,
+		capabilities: desc.Capabilities,
+		allowPaths:   desc.AllowPaths,
 	}, nil
 }
 

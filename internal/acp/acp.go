@@ -42,12 +42,14 @@ import (
 
 	"github.com/tiru-r/pi-agent-go/internal/agent"
 	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/extensions"
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
 	"github.com/tiru-r/pi-agent-go/internal/runtime"
 	"github.com/tiru-r/pi-agent-go/internal/session"
+	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
 const protocolVersion = 1
@@ -238,6 +240,9 @@ type Server struct {
 	// monitor provides runtime intelligence across all sessions.
 	monitor *runtime.Monitor
 
+	// extMgr manages loaded extensions and provides hook broadcasting.
+	extMgr *extensions.Manager
+
 	// sqliteStore is the session index; nil when SQLite is disabled or unavailable.
 	sqliteStore *session.SQLiteStore
 }
@@ -260,6 +265,17 @@ func New(cfg *config.Config) (*Server, error) {
 		modelsReady: make(chan struct{}),
 		monitor:     runtime.NewMonitor(),
 	}
+	// Initialize extension manager. Failure is non-fatal.
+	extMgr, err := extensions.New(context.Background(), cfg.ExtensionsDir)
+	if err != nil {
+		slog.Warn("acp: extensions init failed", "err", err)
+		extMgr, _ = extensions.New(context.Background(), "") // empty = no extensions
+	}
+	s.extMgr = extMgr
+	for _, t := range extensions.WrapAsTools(extMgr) {
+		tools.Register(t)
+	}
+
 	// Open SQLite session index if enabled. Failure is non-fatal.
 	if cfg.SQLite {
 		if err := os.MkdirAll(cfg.SessionDir, 0o700); err == nil {
@@ -588,6 +604,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 
 	ag := agent.New(s.provider, modelID, system, maxTokens)
 	ag.Monitor = s.monitor
+	ag.Hooks = s.extMgr
 
 	var finalStop model.StopReason = model.StopReasonEndTurn
 	var finalUsage model.Usage

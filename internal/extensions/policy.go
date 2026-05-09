@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
@@ -17,7 +18,7 @@ type Capability string
 const (
 	CapFSRead  Capability = "fs_read"  // read-only filesystem access
 	CapFSWrite Capability = "fs_write" // read-write filesystem access
-	CapNetwork Capability = "network"  // outbound network (WASM only; node always has it)
+	CapNetwork Capability = "network"  // reserved for future use; not currently enforced
 	CapEnv     Capability = "env"      // read environment variables
 )
 
@@ -44,12 +45,7 @@ func loadManifest(extensionPath string) Manifest {
 }
 
 func (m Manifest) has(cap Capability) bool {
-	for _, c := range m.Capabilities {
-		if c == cap {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(m.Capabilities, cap)
 }
 
 func (m Manifest) allowedPaths() []string {
