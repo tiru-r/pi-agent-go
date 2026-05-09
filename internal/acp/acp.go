@@ -606,11 +606,21 @@ func (s *Server) sendSessionUpdate(sessionID, updateType, text string) {
 	})
 }
 
-func (s *Server) makeConfigOptions(modelID string, thinkLevel model.ThinkingLevel, models []acpModel) []acpConfigOpt {
-	thinkStr := string(thinkLevel)
-	if thinkStr == "" {
-		thinkStr = "off"
+// normalizeThinkingLevel maps legacy aliases to the canonical 6-level set so
+// that the ACP config option always shows a valid current selection.
+func normalizeThinkingLevel(level model.ThinkingLevel) model.ThinkingLevel {
+	switch level {
+	case model.ThinkingLevelOff, model.ThinkingLevelMinimal,
+		model.ThinkingLevelLow, model.ThinkingLevelMedium,
+		model.ThinkingLevelHigh, model.ThinkingLevelXHigh:
+		return level
+	default:
+		return model.ThinkingLevelOff
 	}
+}
+
+func (s *Server) makeConfigOptions(modelID string, thinkLevel model.ThinkingLevel, models []acpModel) []acpConfigOpt {
+	thinkStr := string(normalizeThinkingLevel(thinkLevel))
 
 	// Build model options list.
 	var modelOpts []acpSelectOpt
@@ -646,8 +656,11 @@ func (s *Server) makeConfigOptions(modelID string, thinkLevel model.ThinkingLeve
 			CurrentValue: thinkStr,
 			Options: []acpSelectOpt{
 				{Value: "off", Name: "Off"},
-				{Value: "auto", Name: "Auto"},
-				{Value: "full", Name: "Full"},
+				{Value: "minimal", Name: "Minimal"},
+				{Value: "low", Name: "Low"},
+				{Value: "medium", Name: "Medium"},
+				{Value: "high", Name: "High"},
+				{Value: "xhigh", Name: "Max"},
 			},
 		},
 	}

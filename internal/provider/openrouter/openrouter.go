@@ -40,14 +40,22 @@ func (p *Provider) Name() string { return "openrouter" }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
+// orThinking enables extended thinking (Claude models via Anthropic upstream).
+// OpenRouter passes it through directly to the Anthropic Messages API.
+type orThinking struct {
+	Type         string `json:"type"`          // always "enabled"
+	BudgetTokens int    `json:"budget_tokens"` // token budget for the thinking block
+}
+
 type orRequest struct {
-	Model       string     `json:"model"`
-	Messages    []orMsg    `json:"messages"`
-	Tools       []orTool   `json:"tools,omitempty"`
-	MaxTokens   int        `json:"max_tokens,omitempty"`
-	Temperature *float64   `json:"temperature,omitempty"`
-	Stop        []string   `json:"stop,omitempty"`
-	Stream      bool       `json:"stream"`
+	Model       string      `json:"model"`
+	Messages    []orMsg     `json:"messages"`
+	Tools       []orTool    `json:"tools,omitempty"`
+	MaxTokens   int         `json:"max_tokens,omitempty"`
+	Temperature *float64    `json:"temperature,omitempty"`
+	Stop        []string    `json:"stop,omitempty"`
+	Stream      bool        `json:"stream"`
+	Thinking    *orThinking `json:"thinking,omitempty"`
 
 	// OpenRouter-specific extensions — populated from Request.Extra.
 	// See: https://openrouter.ai/docs/provider-routing
@@ -298,6 +306,25 @@ func (p *Provider) parseStream(ctx context.Context, r io.Reader, ch chan<- provi
 	}
 }
 
+// thinkingBudget maps a ThinkingLevel to the Anthropic budget_tokens value.
+// Returns 0 for ThinkingLevelOff (thinking disabled).
+func thinkingBudget(level model.ThinkingLevel) int {
+	switch level {
+	case model.ThinkingLevelMinimal:
+		return 1024
+	case model.ThinkingLevelLow:
+		return 2048
+	case model.ThinkingLevelMedium:
+		return 8192
+	case model.ThinkingLevelHigh:
+		return 16384
+	case model.ThinkingLevelXHigh:
+		return 32768
+	default:
+		return 0
+	}
+}
+
 // ── Request builder ───────────────────────────────────────────────────────────
 
 func (p *Provider) buildRequest(req *provider.Request) (*orRequest, error) {
@@ -312,16 +339,23 @@ func (p *Provider) buildRequest(req *provider.Request) (*orRequest, error) {
 	}
 
 	out := &orRequest{
-		Model:     strings.TrimPrefix(req.Model, "openrouter/"),
-		Messages:  msgs,
-		MaxTokens: req.MaxTokens,
+		Model:       strings.TrimPrefix(req.Model, "openrouter/"),
+		Messages:    msgs,
+		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
-		Stop:      req.StopSequences,
-		Stream:    true,
+		Stop:        req.StopSequences,
+		Stream:      true,
 	}
 
 	if len(req.Tools) > 0 {
 		out.Tools = convertTools(req.Tools)
+	}
+
+	// Extended thinking: inject budget and force temperature=1 (Anthropic requirement).
+	if budget := thinkingBudget(req.ThinkingLevel); budget > 0 {
+		out.Thinking = &orThinking{Type: "enabled", BudgetTokens: budget}
+		one := 1.0
+		out.Temperature = &one
 	}
 
 	// OpenRouter extensions from Request.Extra

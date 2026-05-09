@@ -83,7 +83,7 @@ func loadConfig(gf *globalFlags) (*config.Config, error) {
 		cfg.SystemPrompt = gf.system
 	}
 	if gf.think {
-		cfg.ThinkingLevel = string(model.ThinkingLevelFull)
+		cfg.ThinkingLevel = string(model.ThinkingLevelXHigh)
 	}
 	return cfg, nil
 }

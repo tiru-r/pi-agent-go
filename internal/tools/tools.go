@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
@@ -313,7 +314,8 @@ func (e *editTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 // ============================================================================
 
 const defaultBashTimeoutMS = 120_000
-const maxBashOutputBytes = 100 * 1024 // 100 KB
+const bashMaxLines = 2000    // head+tail window
+const bashMaxBytes = 1 << 20 // 1 MB hard cap after line truncation
 
 type bashTool struct{}
 
@@ -332,6 +334,57 @@ func (b *bashTool) Schema() json.RawMessage {
 }`)
 }
 
+// truncateHeadTail applies the Rust-style head+tail truncation:
+//  1. If lines > bashMaxLines: keep first half + last half, insert omission marker.
+//  2. If bytes > bashMaxBytes after step 1: hard-cut at the byte limit.
+func truncateHeadTail(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > bashMaxLines {
+		half := bashMaxLines / 2
+		omitted := len(lines) - bashMaxLines
+		head := lines[:half]
+		tail := lines[len(lines)-half:]
+		s = strings.Join(head, "\n") +
+			fmt.Sprintf("\n... (%d lines omitted) ...\n", omitted) +
+			strings.Join(tail, "\n")
+	}
+	if len(s) > bashMaxBytes {
+		s = s[:bashMaxBytes] + fmt.Sprintf("\n... (truncated at %d bytes)", bashMaxBytes)
+	}
+	return s
+}
+
+// killProcessGroup sends SIGTERM to the process group, waits up to 5 s for a
+// clean exit, then sends SIGKILL if the process is still alive.  This matches
+// the Rust timeout escalation path and prevents orphaned child processes.
+func killProcessGroup(cmd *exec.Cmd, done <-chan error) {
+	if cmd.Process == nil {
+		return
+	}
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		// Fallback: kill just the shell process.
+		_ = cmd.Process.Kill()
+		<-done
+		return
+	}
+	// SIGTERM to the entire process group.
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	grace := time.NewTimer(5 * time.Second)
+	defer grace.Stop()
+	select {
+	case <-done:
+		return
+	case <-grace.C:
+		// Grace period elapsed — escalate to SIGKILL.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		<-done
+	}
+}
+
 func (b *bashTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
 	var p struct {
 		Command string `json:"command"`
@@ -348,34 +401,45 @@ func (b *bashTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 		timeoutMS = defaultBashTimeoutMS
 	}
 
-	deadline := time.Duration(timeoutMS) * time.Millisecond
-	ctx, cancel := context.WithTimeout(ctx, deadline)
-	defer cancel()
+	// Child context combines the caller's cancellation with our own timeout.
+	tctx, tcancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	defer tcancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", p.Command)
+	cmd := exec.Command("bash", "-c", p.Command)
+	// Put the process in its own group so we can SIGTERM/SIGKILL the whole tree.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
-	err := cmd.Run()
-
-	output := buf.String()
-	if len(output) > maxBashOutputBytes {
-		output = output[:maxBashOutputBytes] + fmt.Sprintf("\n... (output truncated at %d bytes)", maxBashOutputBytes)
+	if err := cmd.Start(); err != nil {
+		return errorResult("failed to start command: " + err.Error()), nil
 	}
 
-	if err != nil {
-		exitCode := -1
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if ctx.Err() != nil {
-			return errorResult(fmt.Sprintf("command timed out after %dms\n%s", timeoutMS, output)), nil
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		output := truncateHeadTail(buf.String())
+		if err != nil {
+			exitCode := -1
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			}
+			return errorResult(fmt.Sprintf("exit code %d\n%s", exitCode, output)), nil
 		}
-		return errorResult(fmt.Sprintf("exit code %d\n%s", exitCode, output)), nil
-	}
+		return textResult(output), nil
 
-	return textResult(output), nil
+	case <-tctx.Done():
+		killProcessGroup(cmd, done)
+		output := truncateHeadTail(buf.String())
+		if ctx.Err() != nil {
+			return errorResult(fmt.Sprintf("command cancelled\n%s", output)), nil
+		}
+		return errorResult(fmt.Sprintf("command timed out after %dms\n%s", timeoutMS, output)), nil
+	}
 }
 
 // ============================================================================

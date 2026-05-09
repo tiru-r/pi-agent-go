@@ -127,7 +127,10 @@ type ToolDefinition struct {
 type ThinkingLevel string
 
 const (
-	ThinkingLevelOff  ThinkingLevel = "off"
-	ThinkingLevelAuto ThinkingLevel = "auto"
-	ThinkingLevelFull ThinkingLevel = "full"
+	ThinkingLevelOff     ThinkingLevel = "off"
+	ThinkingLevelMinimal ThinkingLevel = "minimal"
+	ThinkingLevelLow     ThinkingLevel = "low"
+	ThinkingLevelMedium  ThinkingLevel = "medium"
+	ThinkingLevelHigh    ThinkingLevel = "high"
+	ThinkingLevelXHigh   ThinkingLevel = "xhigh"
 )

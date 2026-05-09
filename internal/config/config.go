@@ -21,7 +21,7 @@ type Config struct {
 	MaxTokens     int     `json:"max_tokens,omitempty"`
 	Temperature   float64 `json:"temperature,omitempty"`
 	SystemPrompt  string  `json:"system_prompt,omitempty"`
-	ThinkingLevel string  `json:"thinking_level,omitempty"` // "off"|"auto"|"full"
+	ThinkingLevel string  `json:"thinking_level,omitempty"` // "off"|"minimal"|"low"|"medium"|"high"|"xhigh"
 
 	// Session
 	SessionDir string `json:"session_dir,omitempty"`
