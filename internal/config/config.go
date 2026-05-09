@@ -26,6 +26,9 @@ type Config struct {
 	// Session
 	SessionDir string `json:"session_dir,omitempty"`
 	SQLite     bool   `json:"sqlite,omitempty"`
+
+	// Extensions
+	ExtensionsDir string `json:"extensions_dir,omitempty"`
 }
 
 var defaultCfg = Config{
@@ -99,6 +102,9 @@ func merge(base, override *Config) {
 	if override.SessionDir != "" {
 		base.SessionDir = override.SessionDir
 	}
+	if override.ExtensionsDir != "" {
+		base.ExtensionsDir = override.ExtensionsDir
+	}
 	base.SQLite = override.SQLite
 }
 
@@ -109,11 +115,17 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("PI_MODEL"); v != "" {
 		cfg.Model = v
 	}
+	if v := os.Getenv("PI_EXTENSIONS_DIR"); v != "" {
+		cfg.ExtensionsDir = v
+	}
 }
 
 func setDefaults(cfg *Config) {
+	home, _ := os.UserHomeDir()
 	if cfg.SessionDir == "" {
-		home, _ := os.UserHomeDir()
 		cfg.SessionDir = filepath.Join(home, ".pi", "agent", "sessions")
+	}
+	if cfg.ExtensionsDir == "" {
+		cfg.ExtensionsDir = filepath.Join(home, ".pi", "extensions")
 	}
 }

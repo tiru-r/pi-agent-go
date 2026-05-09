@@ -35,6 +35,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,7 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
 	"github.com/tiru-r/pi-agent-go/internal/runtime"
+	"github.com/tiru-r/pi-agent-go/internal/session"
 )
 
 const protocolVersion = 1
@@ -201,7 +203,9 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 // ── Session state ─────────────────────────────────────────────────────────────
 
 type sessionState struct {
-	msgs       []model.Message
+	// sess persists conversation history to JSONL; nil if file creation failed.
+	sess       *session.Session
+	msgs       []model.Message // in-memory cache, always the authoritative view
 	modelID    string
 	thinkLevel model.ThinkingLevel
 }
@@ -233,6 +237,9 @@ type Server struct {
 
 	// monitor provides runtime intelligence across all sessions.
 	monitor *runtime.Monitor
+
+	// sqliteStore is the session index; nil when SQLite is disabled or unavailable.
+	sqliteStore *session.SQLiteStore
 }
 
 // New builds a Server.
@@ -252,6 +259,16 @@ func New(cfg *config.Config) (*Server, error) {
 		sessions:    make(map[string]*sessionState),
 		modelsReady: make(chan struct{}),
 		monitor:     runtime.NewMonitor(),
+	}
+	// Open SQLite session index if enabled. Failure is non-fatal.
+	if cfg.SQLite {
+		if err := os.MkdirAll(cfg.SessionDir, 0o700); err == nil {
+			if store, err := session.NewSQLiteStore(filepath.Join(cfg.SessionDir, "index.db")); err == nil {
+				s.sqliteStore = store
+			} else {
+				slog.Warn("acp: sqlite store unavailable", "err", err)
+			}
+		}
 	}
 	go s.prefetchModels()
 	return s, nil
@@ -370,12 +387,30 @@ func (s *Server) handleSessionNew(req *request) {
 		thinkLevel = model.ThinkingLevelOff
 	}
 
+	// Create a persistent JSONL session for this ACP session.
+	var sess *session.Session
+	if err := os.MkdirAll(s.cfg.SessionDir, 0o700); err == nil {
+		if newSess, err := session.New(s.cfg.SessionDir); err == nil {
+			sess = newSess
+		} else {
+			slog.Warn("acp: create session file", "err", err)
+		}
+	}
+
 	s.sessionsMu.Lock()
 	s.sessions[id] = &sessionState{
+		sess:       sess,
 		modelID:    modelID,
 		thinkLevel: thinkLevel,
 	}
 	s.sessionsMu.Unlock()
+
+	// Register in SQLite index so `pi session list` shows it immediately.
+	if s.sqliteStore != nil && sess != nil {
+		if err := s.sqliteStore.SaveSession(sess); err == nil {
+			_ = s.sqliteStore.UpdateSessionMeta(sess.ID, modelID, "openrouter")
+		}
+	}
 
 	s.modelsMu.RLock()
 	models := s.models
@@ -480,8 +515,13 @@ func (s *Server) handleSessionClose(req *request) {
 	s.cancelsMu.Unlock()
 
 	s.sessionsMu.Lock()
+	ss := s.sessions[p.SessionID]
 	delete(s.sessions, p.SessionID)
 	s.sessionsMu.Unlock()
+
+	if ss != nil && ss.sess != nil {
+		_ = ss.sess.Close()
+	}
 
 	if req.ID != nil {
 		s.sendResult(rawID(req.ID), map[string]any{})
@@ -499,6 +539,9 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 		return
 	}
 
+	// Expand @file tokens so Zed users can reference local files.
+	prompt := expandAtFilesACP(string(p.Prompt))
+
 	cctx, cancel := context.WithCancel(ctx)
 	s.cancelsMu.Lock()
 	s.cancels[p.SessionID] = cancel
@@ -510,24 +553,32 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 		cancel()
 	}()
 
-	sess := s.getSession(p.SessionID)
-	if sess == nil {
+	ss := s.getSession(p.SessionID)
+	if ss == nil {
 		// Auto-create session with defaults if not found.
-		sess = &sessionState{
+		var newSess *session.Session
+		if err := os.MkdirAll(s.cfg.SessionDir, 0o700); err == nil {
+			newSess, _ = session.New(s.cfg.SessionDir)
+		}
+		ss = &sessionState{
+			sess:       newSess,
 			modelID:    strings.TrimPrefix(s.cfg.Model, "openrouter/"),
 			thinkLevel: model.ThinkingLevel(s.cfg.ThinkingLevel),
 		}
 		s.sessionsMu.Lock()
-		s.sessions[p.SessionID] = sess
+		s.sessions[p.SessionID] = ss
 		s.sessionsMu.Unlock()
 	}
 
 	s.sessionsMu.RLock()
-	modelID := sess.modelID
-	thinkLevel := sess.thinkLevel
-	history := make([]model.Message, len(sess.msgs))
-	copy(history, sess.msgs)
+	modelID := ss.modelID
+	thinkLevel := ss.thinkLevel
+	fileSess := ss.sess
+	history := make([]model.Message, len(ss.msgs))
+	copy(history, ss.msgs)
 	s.sessionsMu.RUnlock()
+
+	historyLen := len(history)
 
 	system := s.cfg.SystemPrompt
 	maxTokens := s.cfg.MaxTokens
@@ -543,7 +594,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 
 	slog.Debug("session/prompt", "session", p.SessionID, "model", modelID, "thinking", thinkLevel)
 
-	updatedMsgs, err := ag.Run(cctx, string(p.Prompt), history, agent.Options{
+	updatedMsgs, err := ag.Run(cctx, prompt, history, agent.Options{
 		ThinkingLevel: thinkLevel,
 	}, func(ev agent.AgentEvent) {
 		switch ev.Kind {
@@ -577,9 +628,23 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 		return
 	}
 
+	// Persist new messages to the JSONL session file.
+	if fileSess != nil {
+		for _, msg := range updatedMsgs[historyLen:] {
+			_ = fileSess.AppendMessage(msg, nil)
+		}
+		// Keep SQLite index in sync.
+		if s.sqliteStore != nil {
+			if err := s.sqliteStore.SaveSession(fileSess); err == nil {
+				_ = s.sqliteStore.UpdateSessionMeta(fileSess.ID, modelID, "openrouter")
+			}
+		}
+	}
+
+	// Update in-memory cache.
 	s.sessionsMu.Lock()
-	if ss := s.sessions[p.SessionID]; ss != nil {
-		ss.msgs = updatedMsgs
+	if ss2 := s.sessions[p.SessionID]; ss2 != nil {
+		ss2.msgs = updatedMsgs
 	}
 	s.sessionsMu.Unlock()
 
@@ -713,6 +778,21 @@ func rawID(raw json.RawMessage) any {
 	var v any
 	_ = json.Unmarshal(raw, &v)
 	return v
+}
+
+// atFileRe matches @<non-whitespace> tokens used for file expansion.
+var atFileRe = regexp.MustCompile(`@(\S+)`)
+
+// expandAtFilesACP replaces @filepath tokens in s with the file's contents.
+// Unreadable paths are left unchanged.
+func expandAtFilesACP(s string) string {
+	return atFileRe.ReplaceAllStringFunc(s, func(match string) string {
+		data, err := os.ReadFile(match[1:]) // strip leading @
+		if err != nil {
+			return match
+		}
+		return string(data)
+	})
 }
 
 func toACPModels(infos []model.ModelInfo) []acpModel {

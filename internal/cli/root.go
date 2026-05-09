@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"text/tabwriter"
 
@@ -14,11 +15,13 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/acp"
 	"github.com/tiru-r/pi-agent-go/internal/agent"
 	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/extensions"
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
 	"github.com/tiru-r/pi-agent-go/internal/session"
+	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
 // Version is injected at build time via -ldflags.
@@ -111,11 +114,29 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 		Short: "Run agent with a single prompt, stream to stdout",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			prompt := strings.Join(args, " ")
+			ctx := cmd.Context()
+
 			cfg, err := loadConfig(gf)
 			if err != nil {
 				return err
 			}
+
+			// Load extensions and register their tools.
+			extMgr, err := loadExtensions(ctx, cfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[warn] extensions: %v\n", err)
+			}
+			if extMgr != nil {
+				defer extMgr.Close()
+			}
+
+			// Expand @file tokens in the prompt.
+			raw := strings.Join(args, " ")
+			prompt, expandedFiles := expandAtFiles(raw)
+			for _, f := range expandedFiles {
+				fmt.Fprintf(os.Stderr, "[expanded: %s]\n", f)
+			}
+
 			prov, err := buildProvider(cfg)
 			if err != nil {
 				return err
@@ -129,13 +150,14 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 			if sess != nil {
 				history = sess.Messages()
 			}
+			historyLen := len(history)
 
 			ag := agent.New(prov, cfg.Model, cfg.SystemPrompt, cfg.MaxTokens)
 			opts := agent.Options{
 				System:        cfg.SystemPrompt,
 				ThinkingLevel: model.ThinkingLevel(cfg.ThinkingLevel),
 			}
-			_, err = ag.Run(context.Background(), prompt, history, opts,
+			updatedMsgs, runErr := ag.Run(ctx, prompt, history, opts,
 				func(ev agent.AgentEvent) {
 					switch ev.Kind {
 					case agent.EventKindText:
@@ -148,7 +170,22 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 						fmt.Fprintf(os.Stderr, "\nerror: %v\n", ev.Err)
 					}
 				})
-			return err
+
+			// Persist new messages back to the session file.
+			if sess != nil && runErr == nil {
+				for _, msg := range updatedMsgs[historyLen:] {
+					_ = sess.AppendMessage(msg, nil)
+				}
+				// Print session ID only when a new session was created so the
+				// user can continue it with --session <id>.
+				if gf.sessionID == "" {
+					fmt.Fprintf(os.Stderr, "[session: %s]\n", sess.ID)
+				}
+			}
+			if sess != nil {
+				_ = sess.Close()
+			}
+			return runErr
 		},
 	}
 }
@@ -496,15 +533,26 @@ line-delimited JSON-RPC 2.0.  You do not normally call this yourself.`,
 }
 
 func runACPServer(gf *globalFlags) error {
+	ctx := context.Background()
 	cfg, err := loadConfig(gf)
 	if err != nil {
 		return err
 	}
+
+	// Load extensions at ACP startup so all sessions share the same tool set.
+	extMgr, err := loadExtensions(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[warn] extensions: %v\n", err)
+	}
+	if extMgr != nil {
+		defer extMgr.Close()
+	}
+
 	srv, err := acp.New(cfg)
 	if err != nil {
 		return fmt.Errorf("acp: %w", err)
 	}
-	return srv.Serve(context.Background())
+	return srv.Serve(ctx)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -514,4 +562,37 @@ func truncateStr(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+// atFileRe matches @<non-whitespace> tokens in a prompt string.
+var atFileRe = regexp.MustCompile(`@(\S+)`)
+
+// expandAtFiles replaces @filepath tokens with the content of those files.
+// Tokens whose paths cannot be read are left unchanged.
+// Returns the expanded string and the list of successfully expanded paths.
+func expandAtFiles(s string) (string, []string) {
+	var expanded []string
+	result := atFileRe.ReplaceAllStringFunc(s, func(match string) string {
+		path := match[1:] // strip leading @
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return match
+		}
+		expanded = append(expanded, path)
+		return string(data)
+	})
+	return result, expanded
+}
+
+// loadExtensions initialises the extension manager and registers all extension
+// tools into the global tool registry. The returned manager must be closed when done.
+func loadExtensions(ctx context.Context, cfg *config.Config) (*extensions.Manager, error) {
+	mgr, err := extensions.New(ctx, cfg.ExtensionsDir)
+	if err != nil {
+		return nil, fmt.Errorf("extensions: %w", err)
+	}
+	for _, t := range extensions.WrapAsTools(mgr) {
+		tools.Register(t)
+	}
+	return mgr, nil
 }

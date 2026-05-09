@@ -81,15 +81,15 @@ func (r *Report) String() string {
 	for _, c := range r.Checks {
 		icon := statusIcon(c.Status)
 		padding := strings.Repeat(" ", maxName-len(c.Name)+1)
-		sb.WriteString(fmt.Sprintf("%s %-*s  %s", icon, maxName, c.Name, padding))
+		fmt.Fprintf(&sb, "%s %-*s  %s", icon, maxName, c.Name, padding)
 		if c.Detail != "" {
 			sb.WriteString("  " + c.Detail)
 		}
 		sb.WriteByte('\n')
 	}
 
-	sb.WriteString(fmt.Sprintf("\nResult: %d passed, %d warned, %d failed\n",
-		r.Passed, r.Warned, r.Failed))
+	fmt.Fprintf(&sb, "\nResult: %d passed, %d warned, %d failed\n",
+		r.Passed, r.Warned, r.Failed)
 	return sb.String()
 }
 

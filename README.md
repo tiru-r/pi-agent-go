@@ -94,7 +94,7 @@ Pi registers as a native agent server. Zed invokes `pi acp` as a subprocess and 
 ### What you get in Zed's panel
 
 - **Model picker** — all 500+ OpenRouter models, populated from the live API on startup
-- **Thinking level** — Off / Auto / Full selector for extended reasoning (works with Claude 3.7+, DeepSeek R1, QwQ, etc.)
+- **Thinking level** — Off / Minimal / Low / Medium / High / Max selector for extended reasoning (works with Claude 3.7+, Claude 4, DeepSeek R1, QwQ, and any `:thinking`-suffixed model)
 - **Full agentic loop** — pi runs tools (read, write, bash, …) across multiple turns before returning
 
 ### Session flow
@@ -276,7 +276,7 @@ pi models                # Fetches from OpenRouter and prints all available mode
 pi config show
 pi config set model      anthropic/claude-sonnet-4-6
 pi config set model      deepseek/deepseek-r1
-pi config set thinking_level auto
+pi config set thinking_level off       # off | minimal | low | medium | high | xhigh
 pi config set system_prompt "You are an expert Go developer"
 ```
 
@@ -364,14 +364,19 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
 ```json
 {
   "openrouter_api_key": "sk-or-...",
+  "openrouter_site_url": "https://mysite.com",
+  "openrouter_app_name": "My App",
   "model": "tencent/hy3-preview:free",
   "max_tokens": 8096,
+  "temperature": 0.7,
   "thinking_level": "off",
   "system_prompt": "",
   "session_dir": "~/.pi/agent/sessions",
   "sqlite": true
 }
 ```
+
+`openrouter_site_url` and `openrouter_app_name` are optional and appear on your OpenRouter dashboard.
 
 ### Environment variables
 
@@ -440,6 +445,10 @@ internal/
 
 **New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model and thinking level per conversation; Zed's UI controls drive both via `session/set_config_option` and `session/set_model`.
 
+**OpenRouter-native.** Every request goes through OpenRouter's OpenAI-compatible `/v1/chat/completions` endpoint. Pi passes OpenRouter's full provider preferences API through: `provider.order` and `allow_fallbacks` for routing, `data_collection: "deny"` for privacy, `quantization` for quantization level selection, and fallback model lists (route="fallback"). The `HTTP-Referer` and `X-Title` headers are set from `openrouter_site_url` / `openrouter_app_name` in config, which appear on your OpenRouter dashboard.
+
+**Extended thinking maps to Anthropic budget_tokens.** Each level maps to a fixed token budget passed upstream: off=0, minimal=1024, low=2048, medium=8192, high=16384, xhigh=32768. Thinking detection (which models support it) is inferred from the model ID — no hardcoded allowlist.
+
 **Minimal dependencies.** 3 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index). The runtime intelligence package uses only stdlib (`math`, `sort`, `sync`).
 
 **Tool execution is parallel.** All tool calls from a single assistant turn run concurrently (capped at 4 goroutines), results fed back in one user turn.
@@ -465,11 +474,12 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 
 | | |
 |---|---|
-| Go files | 30 |
-| Lines of code | ~6,400 |
+| Go source files | 29 |
+| Lines of code | ~5,900 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |
+| Thinking levels | 6 (off / minimal / low / medium / high / xhigh) |
 | Runtime subsystems | 7 |
 | Direct dependencies | 3 |
 | Go version | 1.23+ |

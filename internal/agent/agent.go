@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
@@ -69,6 +70,10 @@ type Agent struct {
 
 	// Monitor is optional; attach one to enable runtime intelligence.
 	Monitor *runtime.Monitor
+
+	// Compactor is optional; when set it compacts message history before each
+	// LLM call if the estimated token count exceeds the threshold.
+	Compactor *Compactor
 }
 
 // New constructs an Agent backed by the given provider.
@@ -118,6 +123,13 @@ func (a *Agent) Run(
 		case <-ctx.Done():
 			return msgs, ctx.Err()
 		default:
+		}
+
+		// Compact history before calling the LLM if it's grown too large.
+		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, 0) {
+			if compacted, _, compactErr := a.Compactor.Compact(ctx, msgs, systemPrompt); compactErr == nil {
+				msgs = compacted
+			}
 		}
 
 		req := &provider.Request{
@@ -174,6 +186,13 @@ func (a *Agent) Run(
 			return msgs, nil
 		}
 
+		// Halt before running tools if the runtime monitor signals a safety veto.
+		if a.Monitor != nil && a.Monitor.ShouldVeto() {
+			err := fmt.Errorf("agent: runtime safety veto — error rate exceeded threshold, halting tool execution")
+			onEvent(AgentEvent{Kind: EventKindError, Err: err})
+			return msgs, err
+		}
+
 		// Execute tool calls and collect results.
 		toolResults, err := executeTools(ctx, resp.Message.Content, onEvent, a.Monitor, len(msgs))
 		if err != nil {
@@ -204,6 +223,7 @@ func drainStream(
 		textIdx     = -1
 		thinkingIdx = -1
 		toolBlocks  = map[int]*model.ContentBlock{}
+		toolOrder   []int // indices in completion order for stable sorting
 		usage       model.Usage
 		stop        model.StopReason
 	)
@@ -256,8 +276,8 @@ func drainStream(
 				}
 
 			case provider.EventToolCallDone:
-				if tb, ok := toolBlocks[ev.ToolIndex]; ok {
-					blocks = append(blocks, *tb)
+				if _, ok := toolBlocks[ev.ToolIndex]; ok {
+					toolOrder = append(toolOrder, ev.ToolIndex)
 				}
 
 			case provider.EventMessageStop:
@@ -267,6 +287,12 @@ func drainStream(
 		}
 	}
 done:
+	// Append tool blocks sorted by their stream index so ordering is stable
+	// even if EventToolCallDone events arrive out of sequence.
+	sort.Ints(toolOrder)
+	for _, idx := range toolOrder {
+		blocks = append(blocks, *toolBlocks[idx])
+	}
 	return &provider.Response{
 		Message:    model.Message{Role: model.RoleAssistant, Content: blocks},
 		StopReason: stop,

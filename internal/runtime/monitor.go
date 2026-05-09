@@ -29,6 +29,18 @@ func NewMonitor() *Monitor {
 	}
 }
 
+// ShouldVeto returns true when the safety subsystem signals that continued
+// tool execution poses unacceptable risk. It is a cheap read — it does not
+// recompute the full RuntimeReport, so callers can invoke it before every
+// tool batch without performance concern.
+//
+// Veto conditions (mirrors Report logic):
+//   - PAC-Bayes upper bound on error rate > 30%
+//   - OPE doubly-robust estimator signals policy degradation
+func (m *Monitor) ShouldVeto() bool {
+	return m.safety.Veto(0.3) || m.ope.ShouldVeto(0.05, 5.0)
+}
+
 // Observe feeds a new measurement into all relevant subsystems.
 func (m *Monitor) Observe(obs Observation) {
 	lat := obs.Latency.Seconds()

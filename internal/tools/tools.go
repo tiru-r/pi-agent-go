@@ -88,6 +88,19 @@ func Get(name string) (Tool, bool) {
 	return t, ok
 }
 
+// Register adds a dynamically-loaded tool (e.g. from an extension) to the registry.
+// If a tool with the same name already exists it is replaced.
+func Register(t Tool) {
+	toolMap[t.Name()] = t
+	for i, existing := range BuiltinTools {
+		if existing.Name() == t.Name() {
+			BuiltinTools[i] = t
+			return
+		}
+	}
+	BuiltinTools = append(BuiltinTools, t)
+}
+
 // ToDefinitions converts all built-in tools to model.ToolDefinition slice.
 func ToDefinitions() []model.ToolDefinition {
 	defs := make([]model.ToolDefinition, 0, len(BuiltinTools))
@@ -183,10 +196,7 @@ func (r *readTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 	if start >= len(lines) {
 		start = len(lines)
 	}
-	end := start + p.Limit
-	if end > len(lines) {
-		end = len(lines)
-	}
+	end := min(start+p.Limit, len(lines))
 
 	var sb strings.Builder
 	for i, line := range lines[start:end] {
@@ -197,8 +207,8 @@ func (r *readTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 	}
 
 	if end < len(lines) {
-		sb.WriteString(fmt.Sprintf("... (truncated, %d lines total, showing lines %d-%d)\n",
-			len(lines), start+1, end))
+		fmt.Fprintf(&sb, "... (truncated, %d lines total, showing lines %d-%d)\n",
+			len(lines), start+1, end)
 	}
 
 	return textResult(sb.String()), nil
@@ -511,6 +521,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			return
 		}
 		lines := strings.Split(string(data), "\n")
+		lastPrintedEnd := -1 // tracks the next unprinted line to avoid overlap
 		for i, line := range lines {
 			if len(results) >= maxResults {
 				return
@@ -521,18 +532,16 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			default:
 			}
 			if re.MatchString(line) {
-				start := i - p.Context
-				if start < 0 {
-					start = 0
-				}
-				end := i + p.Context + 1
-				if end > len(lines) {
-					end = len(lines)
-				}
-				if p.Context > 0 && len(results) > 0 {
+				start := max(i-p.Context, 0)
+				end := min(i+p.Context+1, len(lines))
+				// Emit separator only when there is an actual gap between match
+				// context windows (avoids duplicated lines and spurious "--").
+				if lastPrintedEnd >= 0 && start > lastPrintedEnd {
 					results = append(results, "--")
 				}
-				for j := start; j < end; j++ {
+				// Only print lines not yet covered by the previous match's context.
+				printStart := max(start, lastPrintedEnd)
+				for j := printStart; j < end; j++ {
 					prefix := "  "
 					if j == i {
 						prefix = "> "
@@ -540,6 +549,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 					results = append(results,
 						fmt.Sprintf("%s%s:%d:%s", prefix, filePath, j+1, lines[j]))
 				}
+				lastPrintedEnd = end
 			}
 		}
 	}
@@ -733,13 +743,13 @@ func (l *lsTool) Execute(_ context.Context, params json.RawMessage) (*Result, er
 
 	const maxEntries = 500
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Contents of %s:\n\n", p.Path))
-	sb.WriteString(fmt.Sprintf("%-12s %-10s %s\n", "TYPE", "SIZE", "NAME"))
+	fmt.Fprintf(&sb, "Contents of %s:\n\n", p.Path)
+	fmt.Fprintf(&sb, "%-12s %-10s %s\n", "TYPE", "SIZE", "NAME")
 	sb.WriteString(strings.Repeat("-", 50) + "\n")
 
 	for i, entry := range entries {
 		if i >= maxEntries {
-			sb.WriteString(fmt.Sprintf("... (truncated, showing first %d entries)\n", maxEntries))
+			fmt.Fprintf(&sb, "... (truncated, showing first %d entries)\n", maxEntries)
 			break
 		}
 
@@ -765,7 +775,7 @@ func (l *lsTool) Execute(_ context.Context, params json.RawMessage) (*Result, er
 		if entry.IsDir() {
 			name += "/"
 		}
-		sb.WriteString(fmt.Sprintf("%-12s %-10s %s\n", entryType, sizeStr, name))
+		fmt.Fprintf(&sb, "%-12s %-10s %s\n", entryType, sizeStr, name)
 	}
 
 	return textResult(sb.String()), nil

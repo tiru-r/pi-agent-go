@@ -21,11 +21,12 @@ const (
 // SessionAgent is a session-aware agent that persists conversation history
 // to a Session and drives the full agentic loop.
 type SessionAgent struct {
-	Provider provider.Provider
-	Tools    []tools.Tool
-	Session  *session.Session
-	Config   *config.Config
-	MaxIter  int // default 20, prevents infinite loops
+	Provider  provider.Provider
+	Tools     []tools.Tool
+	Session   *session.Session
+	Config    *config.Config
+	MaxIter   int // default 20, prevents infinite loops
+	Compactor *Compactor
 
 	// Monitor is optional; attach one to enable runtime intelligence.
 	Monitor *runtime.Monitor
@@ -98,6 +99,17 @@ func (a *SessionAgent) Run(
 
 		msgs := a.Session.Messages()
 
+		// Compact history if it has grown past the threshold.
+		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, 0) {
+			if compacted, summary, compactErr := a.Compactor.Compact(ctx, msgs, opts.System); compactErr == nil {
+				msgs = compacted
+				_ = a.Session.Append(session.Entry{
+					Type:    session.EntryCompaction,
+					Summary: summary,
+				})
+			}
+		}
+
 		req := &provider.Request{
 			Model:         modelName,
 			Messages:      msgs,
@@ -145,6 +157,11 @@ func (a *SessionAgent) Run(
 
 		if resp.StopReason != model.StopReasonToolUse {
 			return nil // end_turn, max_tokens, or stop_sequence
+		}
+
+		// Halt before running tools if the runtime monitor signals a safety veto.
+		if a.Monitor != nil && a.Monitor.ShouldVeto() {
+			return fmt.Errorf("session_agent: runtime safety veto — error rate exceeded threshold, halting tool execution")
 		}
 
 		// Execute all tool calls in parallel (up to maxToolConcurrency).

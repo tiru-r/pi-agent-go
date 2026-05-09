@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"sort"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
 )
@@ -80,6 +81,7 @@ func Collect(events <-chan Event) (*Response, error) {
 		textIdx     = -1
 		thinkingIdx = -1
 		toolBlocks  = map[int]*model.ContentBlock{}
+		toolOrder   []int
 		usage       model.Usage
 		stop        model.StopReason
 	)
@@ -117,14 +119,20 @@ func Collect(events <-chan Event) (*Response, error) {
 			}
 
 		case EventToolCallDone:
-			if tb, ok := toolBlocks[ev.ToolIndex]; ok {
-				blocks = append(blocks, *tb)
+			if _, ok := toolBlocks[ev.ToolIndex]; ok {
+				toolOrder = append(toolOrder, ev.ToolIndex)
 			}
 
 		case EventMessageStop:
 			stop = ev.StopReason
 			usage = ev.Usage
 		}
+	}
+
+	// Append tool blocks sorted by stream index for stable ordering.
+	sort.Ints(toolOrder)
+	for _, idx := range toolOrder {
+		blocks = append(blocks, *toolBlocks[idx])
 	}
 
 	return &Response{
