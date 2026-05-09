@@ -11,8 +11,9 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 - **Full agentic loop** — LLM → tools → LLM cycles inside Zed's chat panel
 - **Session memory** — multi-turn conversation history maintained per Zed session
 - **Runtime intelligence** — CUSUM+BOCPD regime detection, conformal anomaly gating, PAC-Bayes safety bounds, off-policy evaluation, VOI experiment scheduling, weighted attribution, and OCO control (see [Runtime Intelligence](#runtime-intelligence))
+- **JavaScript + native extensions** — load custom tools from `~/.pi/extensions/` (goja JS VM or subprocess JSON protocol)
 - **One API key** — `OPENROUTER_API_KEY` is all you need
-- **Tiny binary** — 3 direct dependencies (cobra, uuid, sqlite)
+- **Tiny binary** — 4 direct dependencies (cobra, uuid, sqlite, goja)
 
 ---
 
@@ -24,7 +25,7 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/install.sh | bash
 ```
 
-Requires Go 1.23+. Installs to `~/.local/bin/pi`.
+Requires Go 1.24+. Installs to `~/.local/bin/pi`.
 
 ```bash
 ./install.sh --system        # /usr/local/bin (needs sudo)
@@ -357,6 +358,55 @@ Returns entries with type and size. Max 500 entries.
 
 ---
 
+## Extensions
+
+Pi loads custom tools from `~/.pi/extensions/` on startup. Two types are supported.
+
+### JavaScript extensions (`.js`)
+
+Written in plain JS and executed in a pure-Go goja VM (no Node.js required):
+
+```js
+// ~/.pi/extensions/my_tool.js
+pi.tool("fetch_url", "Fetch a URL and return the body", {
+  type: "object",
+  properties: { url: { type: "string" } },
+  required: ["url"]
+}, async (params) => {
+  const res = await pi.http({ url: params.url, method: "GET" });
+  return res.body;
+});
+```
+
+Available host APIs: `pi.tool()`, `pi.http()`, `pi.exec()`, `pi.env()`, `pi.session()`, `pi.log()`
+
+Hooks run before and after each tool call (`before_tool`, `after_tool`). Pi applies safe auto-repairs for common JS mistakes (forbidden patterns, unavailable imports) before loading.
+
+### Native extensions (`.json`)
+
+Any subprocess that speaks a simple JSON protocol:
+
+```json
+{
+  "name": "my_tool",
+  "description": "Run my CLI",
+  "command": ["my-cli", "--json"],
+  "schema": { "type": "object", "properties": { "arg": { "type": "string" } } }
+}
+```
+
+Pi sends tool params as JSON on stdin; the process replies with `{"content": "...", "is_error": false}` on stdout.
+
+### Extension directory
+
+```bash
+PI_EXTENSIONS_DIR=~/.pi/extensions    # default location (also configurable in settings.json)
+```
+
+Extensions are discovered automatically at `pi run` and `pi acp` startup. A trust registry allows/quarantines extensions by name.
+
+---
+
 ## Configuration
 
 Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
@@ -432,6 +482,10 @@ internal/
 │   └── monitor.go           Top-level Monitor wiring all subsystems
 ├── session/                 JSONL + SQLite persistence
 ├── tools/tools.go           8 built-in tools
+├── extensions/
+│   ├── manager.go           Extension discovery, trust registry, repair
+│   ├── js.go                JavaScript extensions (goja VM, pi.* host APIs)
+│   └── native.go            Native subprocess extensions (JSON protocol)
 ├── httpclient/client.go     HTTP client (streaming + non-streaming)
 ├── sse/sse.go               SSE parser
 └── doctor/doctor.go         Health checks
@@ -449,7 +503,7 @@ internal/
 
 **Extended thinking maps to Anthropic budget_tokens.** Each level maps to a fixed token budget passed upstream: off=0, minimal=1024, low=2048, medium=8192, high=16384, xhigh=32768. Thinking detection (which models support it) is inferred from the model ID — no hardcoded allowlist.
 
-**Minimal dependencies.** 3 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index). The runtime intelligence package uses only stdlib (`math`, `sort`, `sync`).
+**Minimal dependencies.** 4 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `goja` (pure-Go JS VM for extensions). The runtime intelligence package uses only stdlib (`math`, `sort`, `sync`).
 
 **Tool execution is parallel.** All tool calls from a single assistant turn run concurrently (capped at 4 goroutines), results fed back in one user turn.
 
@@ -481,5 +535,5 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 | Built-in tools | 8 |
 | Thinking levels | 6 (off / minimal / low / medium / high / xhigh) |
 | Runtime subsystems | 7 |
-| Direct dependencies | 3 |
-| Go version | 1.23+ |
+| Direct dependencies | 4 |
+| Go version | 1.24+ |
