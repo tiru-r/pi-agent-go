@@ -326,6 +326,7 @@ func (e *editTool) Execute(_ context.Context, params json.RawMessage) (*Result, 
 const defaultBashTimeoutMS = 120_000
 const bashMaxLines = 2000    // head+tail window
 const bashMaxBytes = 1 << 20 // 1 MB hard cap after line truncation
+const grepMaxLineLen = 500   // per-line char cap to handle minified files
 
 type bashTool struct{}
 
@@ -546,8 +547,12 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 					if j == i {
 						prefix = "> "
 					}
+					content := lines[j]
+					if len(content) > grepMaxLineLen {
+						content = content[:grepMaxLineLen] + "…"
+					}
 					results = append(results,
-						fmt.Sprintf("%s%s:%d:%s", prefix, filePath, j+1, lines[j]))
+						fmt.Sprintf("%s%s:%d:%s", prefix, filePath, j+1, content))
 				}
 				lastPrintedEnd = end
 			}
@@ -586,7 +591,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	if len(results) >= maxResults {
 		output += "\n... (result limit reached)"
 	}
-	return textResult(output), nil
+	return textResult(truncateHeadTail(output)), nil
 }
 
 // ============================================================================
