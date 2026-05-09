@@ -7,9 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dop251/goja"
 )
+
+const hookCallTimeout = 5 * time.Second
 
 // jsExtension runs a JavaScript extension in-process via goja (pure Go, no Node.js).
 //
@@ -23,13 +26,23 @@ import (
 //	    return { content: "result", is_error: false };
 //	}
 //
-// The host injects a `pi` global whose available methods depend on the
-// extension's declared capabilities (see policy.go).
+// Optional lifecycle hooks (any subset may be defined):
+//
+//	function on_init()                            // called once after load
+//	function before_tool(name, params)            // called before any tool runs
+//	function after_tool(name, result, is_error)   // called after any tool runs
+//
+// The host injects console, process, require('path'/'os'), and a capability-gated
+// pi global (see policy.go and shims.go).
 type jsExtension struct {
 	info     Info
-	src      string   // JS source loaded at startup
-	path     string   // file path (for error messages)
+	src      string
+	path     string
 	manifest Manifest
+
+	hasOnInit    bool
+	hasBeforeTool bool
+	hasAfterTool  bool
 }
 
 func loadJS(ctx context.Context, path string) (*jsExtension, error) {
@@ -39,20 +52,61 @@ func loadJS(ctx context.Context, path string) (*jsExtension, error) {
 	}
 	manifest := loadManifest(path)
 	e := &jsExtension{src: string(src), path: path, manifest: manifest}
-
-	info, err := e.runDescribe(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("describe: %w", err)
+	if err := e.runInit(ctx); err != nil {
+		return nil, err
 	}
-	if info.Name == "" {
+	if e.info.Name == "" {
 		return nil, fmt.Errorf("describe: extension returned empty name")
 	}
-	e.info = info
 	return e, nil
 }
 
-func (e *jsExtension) Info() Info { return e.info }
+func (e *jsExtension) Info() Info  { return e.info }
 func (e *jsExtension) Close() error { return nil }
+
+// runInit creates one VM at load time to: call describe(), probe hook existence,
+// and call on_init() if defined. Avoids running the source multiple times.
+func (e *jsExtension) runInit(ctx context.Context) error {
+	tctx, cancel := context.WithTimeout(ctx, extensionCallTimeout)
+	defer cancel()
+
+	vm, err := e.newVM(tctx)
+	if err != nil {
+		return err
+	}
+	if _, err := vm.RunString(e.src); err != nil {
+		return fmt.Errorf("%s: %w", e.path, err)
+	}
+
+	describeFn, ok := goja.AssertFunction(vm.Get("describe"))
+	if !ok {
+		return fmt.Errorf("%s: describe() not defined", e.path)
+	}
+	result, err := describeFn(goja.Undefined())
+	if err != nil {
+		return fmt.Errorf("%s: describe: %w", e.path, err)
+	}
+	raw, err := json.Marshal(result.Export())
+	if err != nil {
+		return fmt.Errorf("%s: marshal describe result: %w", e.path, err)
+	}
+	if err := json.Unmarshal(raw, &e.info); err != nil {
+		return fmt.Errorf("%s: parse describe result: %w", e.path, err)
+	}
+
+	e.hasOnInit = isFunction(vm, "on_init")
+	e.hasBeforeTool = isFunction(vm, "before_tool")
+	e.hasAfterTool = isFunction(vm, "after_tool")
+
+	if e.hasOnInit {
+		initFn, _ := goja.AssertFunction(vm.Get("on_init"))
+		if _, err := initFn(goja.Undefined()); err != nil {
+			return fmt.Errorf("%s: on_init: %w", e.path, err)
+		}
+	}
+
+	return nil
+}
 
 func (e *jsExtension) Execute(ctx context.Context, params json.RawMessage) (string, bool, error) {
 	tctx, cancel := context.WithTimeout(ctx, extensionCallTimeout)
@@ -71,7 +125,6 @@ func (e *jsExtension) Execute(ctx context.Context, params json.RawMessage) (stri
 		return "", true, fmt.Errorf("%s: execute() not defined", e.path)
 	}
 
-	// Unmarshal params into a plain Go value so goja gets a native object.
 	var paramVal any
 	if err := json.Unmarshal(params, &paramVal); err != nil {
 		return "", true, fmt.Errorf("unmarshal params: %w", err)
@@ -82,7 +135,6 @@ func (e *jsExtension) Execute(ctx context.Context, params json.RawMessage) (stri
 		return "", true, fmt.Errorf("%s: execute: %w", e.path, err)
 	}
 
-	// Marshal the JS return value back to JSON then into our response struct.
 	raw, err := json.Marshal(result.Export())
 	if err != nil {
 		return "", true, fmt.Errorf("%s: marshal result: %w", e.path, err)
@@ -92,7 +144,6 @@ func (e *jsExtension) Execute(ctx context.Context, params json.RawMessage) (stri
 		IsError bool   `json:"is_error"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		// If the extension returned a plain string, use it directly.
 		if s, ok := result.Export().(string); ok {
 			return s, false, nil
 		}
@@ -101,60 +152,63 @@ func (e *jsExtension) Execute(ctx context.Context, params json.RawMessage) (stri
 	return resp.Content, resp.IsError, nil
 }
 
-// runDescribe creates a fresh VM, evaluates the source, calls describe(), and
-// returns the parsed Info.
-func (e *jsExtension) runDescribe(ctx context.Context) (Info, error) {
-	tctx, cancel := context.WithTimeout(ctx, extensionCallTimeout)
+// BeforeTool implements HookedExtension. Errors are logged and ignored.
+func (e *jsExtension) BeforeTool(ctx context.Context, name string, params json.RawMessage) {
+	if !e.hasBeforeTool {
+		return
+	}
+	var paramVal any
+	_ = json.Unmarshal(params, &paramVal)
+	e.runHook(ctx, "before_tool", name, paramVal)
+}
+
+// AfterTool implements HookedExtension. Errors are logged and ignored.
+func (e *jsExtension) AfterTool(ctx context.Context, name string, result string, isError bool) {
+	if !e.hasAfterTool {
+		return
+	}
+	e.runHook(ctx, "after_tool", name, result, isError)
+}
+
+// runHook creates a short-lived VM to call a lifecycle hook function.
+// Failures are written to stderr and do not propagate — hooks are best-effort.
+func (e *jsExtension) runHook(ctx context.Context, fnName string, args ...any) {
+	tctx, cancel := context.WithTimeout(ctx, hookCallTimeout)
 	defer cancel()
 
 	vm, err := e.newVM(tctx)
 	if err != nil {
-		return Info{}, err
+		return
 	}
 	if _, err := vm.RunString(e.src); err != nil {
-		return Info{}, fmt.Errorf("%s: %w", e.path, err)
+		return
 	}
-
-	describeFn, ok := goja.AssertFunction(vm.Get("describe"))
+	fn, ok := goja.AssertFunction(vm.Get(fnName))
 	if !ok {
-		return Info{}, fmt.Errorf("%s: describe() not defined", e.path)
+		return
 	}
-	result, err := describeFn(goja.Undefined())
-	if err != nil {
-		return Info{}, fmt.Errorf("%s: describe: %w", e.path, err)
+	gojaArgs := make([]goja.Value, len(args))
+	for i, a := range args {
+		gojaArgs[i] = vm.ToValue(a)
 	}
-
-	raw, err := json.Marshal(result.Export())
-	if err != nil {
-		return Info{}, fmt.Errorf("%s: marshal describe result: %w", e.path, err)
+	if _, err := fn(goja.Undefined(), gojaArgs...); err != nil {
+		fmt.Fprintf(os.Stderr, "[ext] %s: %s: %v\n", e.path, fnName, err)
 	}
-	var info Info
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return Info{}, fmt.Errorf("%s: parse describe result: %w", e.path, err)
-	}
-	return info, nil
 }
 
-// newVM constructs a goja runtime wired with context cancellation and the
-// capability-gated `pi` host API.
+// newVM constructs a goja runtime wired with context cancellation, Node-compatible
+// shims (console, process, require), and the capability-gated pi host API.
 func (e *jsExtension) newVM(ctx context.Context) (*goja.Runtime, error) {
 	vm := goja.New()
-
-	// Cancel the VM when ctx is done.
 	vm.SetParserOptions()
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			vm.Interrupt(ctx.Err())
-		case <-stop:
-		}
-	}()
-	// We close stop when the VM is done via defer in callers — keep it simple
-	// by leaking the goroutine for the (short) extension call duration.
-	_ = stop
 
-	// Expose a `pi` global with capability-gated host functions.
+	go func() {
+		<-ctx.Done()
+		vm.Interrupt(ctx.Err())
+	}()
+
+	setupNodeShims(vm, e.manifest)
+
 	piObj := vm.NewObject()
 
 	if e.manifest.has(CapFSRead) || e.manifest.has(CapFSWrite) {
@@ -231,4 +285,9 @@ func pathAllowed(path string, allowed []string) bool {
 		}
 	}
 	return false
+}
+
+func isFunction(vm *goja.Runtime, name string) bool {
+	_, ok := goja.AssertFunction(vm.Get(name))
+	return ok
 }

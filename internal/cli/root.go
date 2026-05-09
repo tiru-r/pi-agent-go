@@ -20,6 +20,7 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/provider"
 	"github.com/tiru-r/pi-agent-go/internal/provider/factory"
 	"github.com/tiru-r/pi-agent-go/internal/provider/openrouter"
+	"github.com/tiru-r/pi-agent-go/internal/runtime"
 	"github.com/tiru-r/pi-agent-go/internal/session"
 	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
@@ -153,6 +154,10 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 			historyLen := len(history)
 
 			ag := agent.New(prov, cfg.Model, cfg.SystemPrompt, cfg.MaxTokens)
+			ag.Monitor = runtime.NewMonitor()
+			if extMgr != nil {
+				ag.Hooks = extMgr
+			}
 			opts := agent.Options{
 				System:        cfg.SystemPrompt,
 				ThinkingLevel: model.ThinkingLevel(cfg.ThinkingLevel),

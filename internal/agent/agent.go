@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
@@ -61,6 +62,13 @@ type AgentEvent struct {
 	Err error
 }
 
+// HookRunner is implemented by the extension manager to broadcast tool lifecycle
+// events to all loaded extensions that define before_tool / after_tool hooks.
+type HookRunner interface {
+	RunBeforeTool(ctx context.Context, name string, params json.RawMessage)
+	RunAfterTool(ctx context.Context, name string, result string, isError bool)
+}
+
 // Agent drives the LLM ↔ tool loop.
 type Agent struct {
 	prov   provider.Provider
@@ -70,6 +78,10 @@ type Agent struct {
 
 	// Monitor is optional; attach one to enable runtime intelligence.
 	Monitor *runtime.Monitor
+
+	// Hooks is optional; wire an extensions.Manager to broadcast tool lifecycle
+	// events to JS extensions that define before_tool / after_tool.
+	Hooks HookRunner
 
 	// Compactor is optional; when set it compacts message history before each
 	// LLM call if the estimated token count exceeds the threshold.
@@ -194,7 +206,7 @@ func (a *Agent) Run(
 		}
 
 		// Execute tool calls and collect results.
-		toolResults, err := executeTools(ctx, resp.Message.Content, onEvent, a.Monitor, len(msgs))
+		toolResults, err := executeTools(ctx, resp.Message.Content, onEvent, a.Monitor, a.Hooks, len(msgs))
 		if err != nil {
 			return msgs, err
 		}
@@ -306,6 +318,7 @@ func executeTools(
 	blocks []model.ContentBlock,
 	onEvent func(AgentEvent),
 	mon *runtime.Monitor,
+	hooks HookRunner,
 	msgCount int,
 ) ([]model.ContentBlock, error) {
 	var results []model.ContentBlock
@@ -317,7 +330,6 @@ func executeTools(
 
 		t, ok := tools.Get(block.Name)
 		if !ok {
-			// Return an error result for unknown tools.
 			errText := fmt.Sprintf("unknown tool: %s", block.Name)
 			result := model.ContentBlock{
 				Type:      model.ContentTypeToolResult,
@@ -346,6 +358,10 @@ func executeTools(
 			params = json.RawMessage("{}")
 		}
 
+		if hooks != nil {
+			hooks.RunBeforeTool(ctx, block.Name, params)
+		}
+
 		t0tool := time.Now()
 		toolResult, err := t.Execute(ctx, params)
 		toolLatency := time.Since(t0tool)
@@ -360,6 +376,16 @@ func executeTools(
 		} else if toolResult != nil {
 			isError = toolResult.IsError
 			resultContent = toolResult.Content
+		}
+
+		if hooks != nil {
+			var sb strings.Builder
+			for _, rc := range resultContent {
+				if rc.Type == model.ContentTypeText {
+					sb.WriteString(rc.Text)
+				}
+			}
+			hooks.RunAfterTool(ctx, block.Name, sb.String(), isError)
 		}
 
 		if mon != nil {
