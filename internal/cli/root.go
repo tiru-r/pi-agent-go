@@ -221,7 +221,9 @@ func listSessionsJSONL(dir string) error {
 		if err != nil {
 			continue
 		}
-		fmt.Printf("%s  %s\n", id[:8], sess.Title())
+		title := sess.Title()
+		_ = sess.Close()
+		fmt.Printf("%s  %s\n", id[:8], title)
 		found++
 	}
 	if found == 0 {
@@ -245,6 +247,7 @@ func newSessionShowCmd(gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("open session: %w", err)
 			}
+			defer sess.Close()
 			for _, msg := range sess.Messages() {
 				fmt.Printf("[%s]\n%s\n\n", strings.ToUpper(string(msg.Role)), msg.Text())
 			}
