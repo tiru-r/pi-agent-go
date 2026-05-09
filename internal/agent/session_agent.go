@@ -112,7 +112,7 @@ func (a *SessionAgent) Run(
 		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens) {
 			if compacted, summary, compactErr := a.Compactor.Compact(ctx, msgs, opts.System); compactErr == nil {
 				msgs = compacted
-				lastMeasuredTokens = 0 // heuristic will re-estimate after compaction
+				lastMeasuredTokens = estimateTokens(compacted) // prime heuristic from compacted size
 				_ = a.Session.Append(session.Entry{
 					Type:    session.EntryCompaction,
 					Summary: summary,
