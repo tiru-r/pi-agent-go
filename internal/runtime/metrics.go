@@ -47,9 +47,9 @@ type RuntimeReport struct {
 	PACBoundHi   float64 // upper bound on true error rate
 	PolicyVetoed bool
 	OPEValue     float64 // doubly-robust estimate V̂_DR
-	OPERegret    float64 // Δ_regret = r̄_baseline − V̂_DR
+	OPERegret    float64 // median regret across IPS, WIS, DR estimators
 	EffectiveSS  float64 // N_eff
-	ControlParam float64 // current OCO parameter τ
+	ShardStates  map[string]ShardStatus // per-stage routing/batch/backoff state
 	Attribution  []StageAttribution
 	NextProbe    *ProbeSpec
 }

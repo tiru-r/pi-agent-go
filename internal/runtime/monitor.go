@@ -1,6 +1,9 @@
 package runtime
 
-import "sync"
+import (
+	"math"
+	"sync"
+)
 
 // Monitor is the top-level runtime intelligence system.
 // It wires all subsystems together and provides a single integration point.
@@ -12,8 +15,17 @@ type Monitor struct {
 	ope         *OffPolicyEvaluator
 	voi         *VOIPlanner
 	attribution *AttributionTracker
-	controller  *OCOController
-	lastReport  RuntimeReport
+	controller  *LoadController
+
+	// Per-stage in-flight counters for queue depth estimation.
+	queueDepth map[string]int
+
+	// EMA of KL(π||μ) estimated from log importance ratios in policy traces.
+	// Used to keep the PAC-Bayes safety bound calibrated to the actual policy gap.
+	klEMA   float64
+	klCount int
+
+	lastReport RuntimeReport
 }
 
 // NewMonitor constructs a Monitor with all subsystems initialised.
@@ -25,7 +37,8 @@ func NewMonitor() *Monitor {
 		ope:         NewOffPolicyEvaluator(),
 		voi:         NewVOIPlanner(),
 		attribution: NewAttributionTracker(),
-		controller:  NewOCOController(),
+		controller:  NewLoadController(),
+		queueDepth:  make(map[string]int),
 	}
 }
 
@@ -34,11 +47,23 @@ func NewMonitor() *Monitor {
 // recompute the full RuntimeReport, so callers can invoke it before every
 // tool batch without performance concern.
 //
-// Veto conditions (mirrors Report logic):
+// Veto conditions:
 //   - PAC-Bayes upper bound on error rate > 30%
-//   - OPE doubly-robust estimator signals policy degradation
+//   - Median OPE regret across IPS/WIS/DR > 0.05 with N_eff ≥ opeMinNeff
 func (m *Monitor) ShouldVeto() bool {
-	return m.safety.Veto(0.3) || m.ope.ShouldVeto(0.05, 5.0)
+	return m.safety.Veto(0.3) || m.ope.ShouldVeto(0.05, opeMinNeff)
+}
+
+// RecordQueued adjusts the in-flight operation counter for a stage by delta
+// (+1 when a task starts, -1 when it finishes). The counter is used as the
+// queue depth signal fed to the shard load controller.
+func (m *Monitor) RecordQueued(stage string, delta int) {
+	m.mu.Lock()
+	m.queueDepth[stage] += delta
+	if m.queueDepth[stage] < 0 {
+		m.queueDepth[stage] = 0
+	}
+	m.mu.Unlock()
 }
 
 // Observe feeds a new measurement into all relevant subsystems.
@@ -46,32 +71,42 @@ func (m *Monitor) Observe(obs Observation) {
 	lat := obs.Latency.Seconds()
 
 	m.detector.Update(lat)
-
-	anomaly, thresh := m.conformal.Update(lat)
-
+	m.conformal.Update(lat)
 	m.safety.Update(!obs.Success)
-
 	m.attribution.Add(obs)
 
-	// OCO: use latency/threshold as loss; gradient from anomaly signal.
-	loss := 1.0 // default when thresh is zero/invalid
-	if thresh > 0 {
-		loss = lat / thresh
-	}
+	m.mu.RLock()
+	qd := m.queueDepth[obs.Stage]
+	m.mu.RUnlock()
 
-	grad := 0.0
-	if anomaly {
-		grad = 1.0
-	} else if thresh > 0 && lat < thresh*0.5 {
-		grad = -0.5
-	}
-
-	m.controller.Update(loss, grad)
+	m.controller.Update(obs.Stage, qd, lat, obs.Success)
 }
 
-// AddTrace forwards a PolicyTrace to the OPE subsystem.
+// AddTrace forwards a PolicyTrace to the OPE subsystem and updates the
+// PAC-Bayes KL term from the log importance ratio of the trace. This keeps
+// the safety bound calibrated to the true gap between target and behavior
+// policy without requiring external KL computation.
 func (m *Monitor) AddTrace(t PolicyTrace) {
 	m.ope.Add(t)
+
+	if t.TargetProb > 0 && t.BehaviorProb > 0 {
+		logRatio := math.Log(t.TargetProb / t.BehaviorProb)
+		// KL(π||μ) = E_π[log π/μ] ≥ 0; negative log ratios (target < behavior)
+		// contribute zero to the KL and are not used to tighten the bound.
+		if logRatio > 0 {
+			const klDecay = 0.1 // slow EMA for a stable KL estimate
+			m.mu.Lock()
+			if m.klCount == 0 {
+				m.klEMA = logRatio
+			} else {
+				m.klEMA = klDecay*logRatio + (1-klDecay)*m.klEMA
+			}
+			m.klCount++
+			kl := m.klEMA
+			m.mu.Unlock()
+			m.safety.SetKLQP(kl)
+		}
+	}
 }
 
 // RegisterProbe forwards a ProbeSpec to the VOI planner.
@@ -92,18 +127,18 @@ func (m *Monitor) Report() RuntimeReport {
 
 	_, pacBoundHi := m.safety.Bound()
 
-	opeVetoed := m.ope.ShouldVeto(0.05, 5.0)
+	opeVetoed := m.ope.ShouldVeto(0.05, opeMinNeff)
 	safetyVetoed := m.safety.Veto(0.3)
 	policyVetoed := safetyVetoed || opeVetoed
 
 	var opeValue, opeRegret, effSS float64
 	if res, ok := m.ope.Evaluate(); ok {
 		opeValue = res.DR
-		opeRegret = res.Regret
+		opeRegret = res.MedianRegret
 		effSS = res.Neff
 	}
 
-	controlParam := m.controller.Param()
+	shardStates := m.controller.Status()
 	attribution := m.attribution.Report()
 	nextProbe := m.voi.Next(1.0)
 
@@ -116,7 +151,7 @@ func (m *Monitor) Report() RuntimeReport {
 		OPEValue:     opeValue,
 		OPERegret:    opeRegret,
 		EffectiveSS:  effSS,
-		ControlParam: controlParam,
+		ShardStates:  shardStates,
 		Attribution:  attribution,
 		NextProbe:    nextProbe,
 	}

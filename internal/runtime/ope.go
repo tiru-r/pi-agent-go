@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"math"
+	"sort"
 	"sync"
 )
 
@@ -14,20 +15,27 @@ const (
 
 // OPEResult holds the results of an off-policy evaluation.
 type OPEResult struct {
-	IPS    float64
-	WIS    float64
-	DR     float64
-	Neff   float64
+	IPS       float64
+	WIS       float64
+	DR        float64
+	Neff      float64
+	// Per-estimator regret: Δ = r̄_baseline − V̂_estimator.
+	// MedianRegret is the robust summary used for veto decisions.
+	RegretIPS    float64
+	RegretWIS    float64
+	RegretDR     float64
+	MedianRegret float64
+	// Kept for backward compatibility — equals RegretDR.
 	Regret float64
 }
 
 // OffPolicyEvaluator stores a ring buffer of PolicyTrace entries and computes
-// IPS, WIS, DR estimators along with ESS and regret.
+// IPS, WIS, DR estimators along with ESS and per-estimator regret.
 type OffPolicyEvaluator struct {
-	mu     sync.Mutex
-	buf    [opeCapacity]PolicyTrace
-	head   int
-	count  int
+	mu    sync.Mutex
+	buf   [opeCapacity]PolicyTrace
+	head  int
+	count int
 }
 
 // NewOffPolicyEvaluator constructs a ready-to-use OffPolicyEvaluator.
@@ -46,12 +54,12 @@ func (e *OffPolicyEvaluator) Add(t PolicyTrace) {
 	e.mu.Unlock()
 }
 
-// Evaluate computes OPE estimates. Returns (result, false) if insufficient data.
+// Evaluate computes OPE estimates. Returns (result, false) if insufficient data
+// or effective sample size is below opeMinNeff.
 func (e *OffPolicyEvaluator) Evaluate() (OPEResult, bool) {
 	e.mu.Lock()
 	n := e.count
 	traces := make([]PolicyTrace, n)
-	// Copy in order from oldest to newest.
 	start := 0
 	if n == opeCapacity {
 		start = e.head
@@ -65,20 +73,21 @@ func (e *OffPolicyEvaluator) Evaluate() (OPEResult, bool) {
 		return OPEResult{}, false
 	}
 
-	// Compute weights.
+	// Compute clipped importance weights w_i = π(a|x) / μ(a|x).
 	weights := make([]float64, n)
+	wSum := 0.0
+	w2Sum := 0.0
 	for i, t := range traces {
-		var w float64
+		w := 0.0
 		if t.BehaviorProb > 0 {
-			w = t.TargetProb / t.BehaviorProb
-		}
-		if w > opeMaxWeight {
-			w = opeMaxWeight
+			w = math.Min(t.TargetProb/t.BehaviorProb, opeMaxWeight)
 		}
 		weights[i] = w
+		wSum += w
+		w2Sum += w * w
 	}
 
-	// Baseline reward = mean of r_i.
+	// Baseline reward: simple mean of r_i under the behavior policy.
 	baselineSum := 0.0
 	for _, t := range traces {
 		baselineSum += t.Reward
@@ -92,19 +101,17 @@ func (e *OffPolicyEvaluator) Evaluate() (OPEResult, bool) {
 	}
 	vIPS := ipsSum / float64(n)
 
-	// V̂_WIS = Σ w_i r_i / Σ w_i
-	wSum := 0.0
+	// V̂_WIS = Σ w_i r_i / Σ w_i  (self-normalised; falls back to IPS if wSum==0)
+	vWIS := vIPS
 	wrSum := 0.0
 	for i, t := range traces {
-		wSum += weights[i]
 		wrSum += weights[i] * t.Reward
 	}
-	var vWIS float64
 	if wSum > 0 {
 		vWIS = wrSum / wSum
 	}
 
-	// V̂_DR = (1/n) Σ (r̂_i + w_i*(r_i - r̂_i))
+	// V̂_DR = (1/n) Σ (r̂_i + w_i*(r_i − r̂_i))
 	drSum := 0.0
 	for i, t := range traces {
 		drSum += t.ModelEst + weights[i]*(t.Reward-t.ModelEst)
@@ -112,11 +119,7 @@ func (e *OffPolicyEvaluator) Evaluate() (OPEResult, bool) {
 	vDR := drSum / float64(n)
 
 	// N_eff = (Σ w_i)² / Σ w_i²
-	w2Sum := 0.0
-	for _, w := range weights {
-		w2Sum += w * w
-	}
-	var neff float64
+	neff := 0.0
 	if w2Sum > 0 {
 		neff = (wSum * wSum) / w2Sum
 	}
@@ -125,26 +128,45 @@ func (e *OffPolicyEvaluator) Evaluate() (OPEResult, bool) {
 		return OPEResult{}, false
 	}
 
-	// Δ_regret = r̄_baseline - V̂_DR
-	regret := baseline - vDR
+	// Per-estimator regret = r̄_baseline − V̂_estimator.
+	regretIPS := baseline - vIPS
+	regretWIS := baseline - vWIS
+	regretDR := baseline - vDR
+
+	// Median regret across the three estimators provides robustness: a single
+	// mis-specified estimator cannot trigger or suppress a veto on its own.
+	medianRegret := medianOfThree(regretIPS, regretWIS, regretDR)
 
 	return OPEResult{
-		IPS:    vIPS,
-		WIS:    vWIS,
-		DR:     vDR,
-		Neff:   neff,
-		Regret: regret,
+		IPS:          vIPS,
+		WIS:          vWIS,
+		DR:           vDR,
+		Neff:         neff,
+		RegretIPS:    regretIPS,
+		RegretWIS:    regretWIS,
+		RegretDR:     regretDR,
+		MedianRegret: medianRegret,
+		Regret:       regretDR, // backward compat
 	}, true
 }
 
-// ShouldVeto returns true if regret > regretThresh or Neff < neffMin.
+// ShouldVeto returns true when the median regret across all three estimators
+// exceeds regretThresh or effective sample size is below neffMin.
+// Using the median means a single outlier estimator cannot force or block a veto.
 func (e *OffPolicyEvaluator) ShouldVeto(regretThresh, neffMin float64) bool {
 	res, ok := e.Evaluate()
 	if !ok {
 		return false
 	}
-	return res.Regret > regretThresh || res.Neff < neffMin
+	if res.Neff < neffMin {
+		return true
+	}
+	return res.MedianRegret > regretThresh
 }
 
-// ensure math is imported (used for opeMaxWeight clamp via math.Min alternative)
-var _ = math.MaxFloat64
+// medianOfThree returns the median of three float64 values via a sorting network.
+func medianOfThree(a, b, c float64) float64 {
+	vals := [3]float64{a, b, c}
+	sort.Slice(vals[:], func(i, j int) bool { return vals[i] < vals[j] })
+	return vals[1]
+}
