@@ -47,12 +47,18 @@ func setupProcess(vm *goja.Runtime, manifest Manifest) {
 	if manifest.has(CapEnv) {
 		env := vm.NewObject()
 		_ = env.Set("get", func(call goja.FunctionCall) goja.Value {
-			return vm.ToValue(os.Getenv(call.Argument(0).String()))
+			key := call.Argument(0).String()
+			if IsEnvBlocked(key) {
+				return goja.Undefined()
+			}
+			return vm.ToValue(os.Getenv(key))
 		})
-		// Populate declared env vars so extensions can do process.env.PATH etc.
+		// Populate non-blocked env vars so extensions can do process.env.PATH etc.
 		for _, kv := range os.Environ() {
 			if k, v, ok := strings.Cut(kv, "="); ok {
-				_ = env.Set(k, v)
+				if !IsEnvBlocked(k) {
+					_ = env.Set(k, v)
+				}
 			}
 		}
 		_ = proc.Set("env", env)

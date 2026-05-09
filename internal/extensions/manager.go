@@ -25,26 +25,33 @@ type Extension interface {
 }
 
 // HookedExtension is an optional interface extensions can implement to participate
-// in the agent tool lifecycle. Both JS and future extension types may implement it.
+// in the agent tool lifecycle.
 type HookedExtension interface {
-	// BeforeTool is called before any tool (not just this extension's) executes.
 	BeforeTool(ctx context.Context, name string, params json.RawMessage)
-	// AfterTool is called after any tool executes.
 	AfterTool(ctx context.Context, name string, result string, isError bool)
 }
 
-// Manager discovers and holds all loaded extensions.
+// Manager discovers, loads, and governs all extensions.
+// It owns the TrustRegistry and enforces quarantine on killed extensions.
 type Manager struct {
 	extensions []Extension
+	trust      *TrustRegistry
+	repairMode RepairMode
 }
 
-// New discovers and loads all extensions from dir:
-//   - .js files are loaded as in-process goja extensions
-//   - .json files without a sibling .js are loaded as native subprocess extensions
-//
+// New discovers and loads all extensions from dir.
+// repairMode controls how aggressively load errors are auto-repaired.
 // Returns an empty manager (no error) if dir is empty or does not exist.
 func New(ctx context.Context, dir string) (*Manager, error) {
-	m := &Manager{}
+	return NewWithRepair(ctx, dir, RepairAutoSafe)
+}
+
+// NewWithRepair is like New but allows specifying the repair mode.
+func NewWithRepair(ctx context.Context, dir string, mode RepairMode) (*Manager, error) {
+	m := &Manager{
+		trust:      NewTrustRegistry(),
+		repairMode: mode,
+	}
 	if dir == "" {
 		return m, nil
 	}
@@ -56,7 +63,6 @@ func New(ctx context.Context, dir string) (*Manager, error) {
 		return nil, fmt.Errorf("extensions: read %s: %w", dir, err)
 	}
 
-	// Track which base names have a .js file so we can skip their sidecar .json manifests.
 	jsBasenames := make(map[string]bool, len(entries))
 
 	for _, entry := range entries {
@@ -74,10 +80,10 @@ func New(ctx context.Context, dir string) (*Manager, error) {
 		}
 		base := entry.Name()[:len(entry.Name())-len(".js")]
 		jsBasenames[base] = true
+		m.trust.Acknowledge(e.Info().Name)
 		m.extensions = append(m.extensions, e)
 	}
 
-	// Load native descriptor extensions (.json without a sibling .js).
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -87,47 +93,90 @@ func New(ctx context.Context, dir string) (*Manager, error) {
 		}
 		base := entry.Name()[:len(entry.Name())-len(".json")]
 		if jsBasenames[base] {
-			continue // sidecar manifest for a JS extension
+			continue
 		}
 		path := filepath.Join(dir, entry.Name())
 		e, err := loadNative(path)
 		if err != nil {
-			// Silently skip: .json files may be non-extension config.
 			continue
 		}
+		m.trust.Acknowledge(e.Info().Name)
 		m.extensions = append(m.extensions, e)
 	}
 
 	return m, nil
 }
 
-// All returns all loaded extensions.
-func (m *Manager) All() []Extension { return m.extensions }
+// All returns all loaded, non-quarantined extensions.
+func (m *Manager) All() []Extension {
+	var active []Extension
+	for _, e := range m.extensions {
+		if !m.trust.IsQuarantined(e.Info().Name) {
+			active = append(active, e)
+		}
+	}
+	return active
+}
 
-// Get returns the extension with the given name.
+// Get returns the extension with the given name if it is not quarantined.
 func (m *Manager) Get(name string) (Extension, bool) {
 	for _, e := range m.extensions {
 		if e.Info().Name == name {
+			if m.trust.IsQuarantined(name) {
+				return nil, false
+			}
 			return e, true
 		}
 	}
 	return nil, false
 }
 
-// RunBeforeTool calls BeforeTool on every extension that implements HookedExtension.
-// Calls are best-effort and happen synchronously before the tool executes.
+// Kill activates the kill switch for the named extension.
+// The extension is quarantined: it will not be invoked until Lift is called.
+func (m *Manager) Kill(name, reason string) {
+	m.trust.Kill(name, reason)
+}
+
+// Lift removes the kill switch, moving the extension back to Acknowledged.
+func (m *Manager) Lift(name string) error {
+	return m.trust.Lift(name)
+}
+
+// TrustState returns the current trust state for the named extension.
+func (m *Manager) TrustState(name string) TrustState {
+	return m.trust.State(name)
+}
+
+// Trust elevates an extension to fully trusted.
+func (m *Manager) Trust(name string) {
+	m.trust.Trust(name)
+}
+
+// Audits returns the full audit trail from the trust registry.
+func (m *Manager) Audits() []AuditRecord {
+	return m.trust.Audits()
+}
+
+// RunBeforeTool calls BeforeTool on every active hooked extension.
+// Quarantined extensions are skipped.
 func (m *Manager) RunBeforeTool(ctx context.Context, name string, params json.RawMessage) {
 	for _, e := range m.extensions {
+		if m.trust.IsQuarantined(e.Info().Name) {
+			continue
+		}
 		if h, ok := e.(HookedExtension); ok {
 			h.BeforeTool(ctx, name, params)
 		}
 	}
 }
 
-// RunAfterTool calls AfterTool on every extension that implements HookedExtension.
-// Calls are best-effort and happen synchronously after the tool executes.
+// RunAfterTool calls AfterTool on every active hooked extension.
+// Quarantined extensions are skipped.
 func (m *Manager) RunAfterTool(ctx context.Context, name string, result string, isError bool) {
 	for _, e := range m.extensions {
+		if m.trust.IsQuarantined(e.Info().Name) {
+			continue
+		}
 		if h, ok := e.(HookedExtension); ok {
 			h.AfterTool(ctx, name, result, isError)
 		}
