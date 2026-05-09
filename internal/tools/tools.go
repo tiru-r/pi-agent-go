@@ -416,7 +416,10 @@ func (b *bashTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	tctx, tcancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
 	defer tcancel()
 
-	cmd := exec.Command("bash", "-c", p.Command)
+	// Wrap the command with an EXIT trap so background jobs (e.g. "sleep 10 &")
+	// are waited for before the shell exits, preventing orphaned processes.
+	wrappedCmd := "trap 'wait' EXIT\n" + p.Command
+	cmd := exec.Command("bash", "-c", wrappedCmd)
 	// Put the process in its own group so we can SIGTERM/SIGKILL the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 

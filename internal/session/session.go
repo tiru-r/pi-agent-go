@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,10 +49,13 @@ type versionHeader struct {
 }
 
 // Session is a single conversation stored as a JSONL file.
+// Entries form a tree via ParentID; headID tracks the active branch tip.
 type Session struct {
 	ID      string
 	Path    string
 	Entries []Entry
+
+	headID string // ID of the most recent entry on the active branch
 
 	mu   sync.Mutex
 	file *os.File
@@ -79,7 +83,7 @@ func New(dir string) (*Session, error) {
 		return nil, fmt.Errorf("session: write version header: %w", err)
 	}
 
-	// Write initial metadata entry
+	// Write initial metadata entry; its ID becomes the chain root.
 	meta := Entry{
 		Type:      EntryMetadata,
 		ID:        uuid.New().String(),
@@ -126,7 +130,7 @@ func Open(path string) (*Session, error) {
 		entries = append(entries, e)
 	}
 
-	// Extract session ID from metadata entry or filename
+	// Extract session ID from metadata entry or filename.
 	id := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	for _, e := range entries {
 		if e.Type == EntryMetadata {
@@ -146,8 +150,38 @@ func Open(path string) (*Session, error) {
 		ID:      id,
 		Path:    path,
 		Entries: entries,
+		headID:  leafID(entries),
 		file:    f,
 	}, nil
+}
+
+// leafID returns the ID of the most-recently-timestamped leaf entry.
+// A leaf is any entry that no other entry lists as its ParentID.
+// For legacy sessions where all ParentIDs are empty every entry is a leaf,
+// so the most-recent one (last appended) is returned.
+func leafID(entries []Entry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	parents := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.ParentID != "" {
+			parents[e.ParentID] = true
+		}
+	}
+	var leaves []Entry
+	for _, e := range entries {
+		if !parents[e.ID] {
+			leaves = append(leaves, e)
+		}
+	}
+	if len(leaves) == 0 {
+		return entries[len(entries)-1].ID
+	}
+	slices.SortFunc(leaves, func(a, b Entry) int {
+		return b.Timestamp.Compare(a.Timestamp) // descending — most recent first
+	})
+	return leaves[0].ID
 }
 
 // Append atomically appends an entry to the file and in-memory slice.
@@ -165,6 +199,10 @@ func (s *Session) appendEntry(entry Entry) error {
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now().UTC()
 	}
+	// Chain to the current head so the tree is always explicit.
+	if entry.ParentID == "" && s.headID != "" {
+		entry.ParentID = s.headID
+	}
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("session: marshal entry: %w", err)
@@ -174,6 +212,7 @@ func (s *Session) appendEntry(entry Entry) error {
 		return fmt.Errorf("session: write entry: %w", err)
 	}
 	s.Entries = append(s.Entries, entry)
+	s.headID = entry.ID
 	return nil
 }
 
@@ -186,17 +225,152 @@ func (s *Session) AppendMessage(msg model.Message, usage *model.Usage) error {
 	})
 }
 
-// Messages reconstructs the linear message list from entries.
-// Compaction entries cause older messages to be replaced by a summary stub.
+// Branch returns a new Session view branched from the entry with fromEntryID
+// as its head. Both the original and the branch share the same JSONL file;
+// diverging entries are appended with different ParentIDs, forming the tree
+// implicitly in the append-only log.
+func (s *Session) Branch(fromEntryID string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	for _, e := range s.Entries {
+		if e.ID == fromEntryID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("session: branch point %s not found", fromEntryID)
+	}
+
+	f, err := os.OpenFile(s.Path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("session: open branch file: %w", err)
+	}
+
+	return &Session{
+		ID:      s.ID,
+		Path:    s.Path,
+		Entries: append([]Entry(nil), s.Entries...),
+		headID:  fromEntryID,
+		file:    f,
+	}, nil
+}
+
+// HeadID returns the ID of the current branch tip.
+func (s *Session) HeadID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.headID
+}
+
+// SetHead moves the active branch tip to the given entry ID, switching the
+// view without creating a new branch (analogous to `git checkout <sha>`).
+func (s *Session) SetHead(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.Entries {
+		if e.ID == id {
+			s.headID = id
+			return nil
+		}
+	}
+	return fmt.Errorf("session: entry %s not found", id)
+}
+
+// Heads returns all leaf entries — the tips of every branch — sorted newest first.
+func (s *Session) Heads() []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	parents := make(map[string]bool, len(s.Entries))
+	for _, e := range s.Entries {
+		if e.ParentID != "" {
+			parents[e.ParentID] = true
+		}
+	}
+	var heads []Entry
+	for _, e := range s.Entries {
+		if !parents[e.ID] {
+			heads = append(heads, e)
+		}
+	}
+	slices.SortFunc(heads, func(a, b Entry) int {
+		return b.Timestamp.Compare(a.Timestamp)
+	})
+	return heads
+}
+
+// Messages reconstructs the message list for the active branch.
+//
+// When parent links are present it walks head → root via ParentID, reverses
+// the path, and materialises only the messages on that branch.
+// For legacy sessions (all ParentIDs empty) it falls back to linear order.
 func (s *Session) Messages() []model.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	hasLinks := false
+	for _, e := range s.Entries {
+		if e.ParentID != "" {
+			hasLinks = true
+			break
+		}
+	}
+	if hasLinks && s.headID != "" {
+		return s.messagesFromTree()
+	}
+	return s.messagesLinear()
+}
+
+// messagesFromTree walks head → root via ParentID, reverses, then builds the
+// message slice. Must be called with s.mu held.
+func (s *Session) messagesFromTree() []model.Message {
+	byID := make(map[string]*Entry, len(s.Entries))
+	for i := range s.Entries {
+		byID[s.Entries[i].ID] = &s.Entries[i]
+	}
+
+	var path []string
+	cur := s.headID
+	for cur != "" {
+		path = append(path, cur)
+		e, ok := byID[cur]
+		if !ok {
+			break
+		}
+		cur = e.ParentID
+	}
+	slices.Reverse(path)
+
+	return s.buildMessages(path, byID)
+}
+
+// messagesLinear reconstructs in entry order for legacy sessions without
+// parent links. Must be called with s.mu held.
+func (s *Session) messagesLinear() []model.Message {
+	byID := make(map[string]*Entry, len(s.Entries))
+	path := make([]string, 0, len(s.Entries))
+	for i := range s.Entries {
+		byID[s.Entries[i].ID] = &s.Entries[i]
+		path = append(path, s.Entries[i].ID)
+	}
+	return s.buildMessages(path, byID)
+}
+
+// buildMessages materialises messages from an ordered ID path applying
+// compaction. Must be called with s.mu held.
+func (s *Session) buildMessages(path []string, byID map[string]*Entry) []model.Message {
 	var msgs []model.Message
 	compactionIdx := -1
 	var compactionSummary string
 
-	for _, e := range s.Entries {
+	for _, id := range path {
+		e, ok := byID[id]
+		if !ok {
+			continue
+		}
 		switch e.Type {
 		case EntryMessage:
 			if e.Message != nil {
@@ -223,7 +397,7 @@ func (s *Session) Messages() []model.Message {
 	return msgs
 }
 
-// LastN returns the last n messages from the session.
+// LastN returns the last n messages from the active branch.
 func (s *Session) LastN(n int) []model.Message {
 	msgs := s.Messages()
 	if n >= len(msgs) {
