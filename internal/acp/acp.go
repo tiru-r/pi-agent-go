@@ -97,6 +97,7 @@ type acpImpl struct {
 type acpModel struct {
 	ID               string
 	DisplayName      string
+	ContextWindow    int
 	MaxTokens        int
 	SupportsThinking bool
 }
@@ -605,6 +606,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	ag := agent.New(s.provider, modelID, system, maxTokens)
 	ag.Monitor = s.monitor
 	ag.Hooks = s.extMgr
+	ag.Compactor = s.makeCompactor(modelID)
 
 	var finalStop model.StopReason = model.StopReasonEndTurn
 	var finalUsage model.Usage
@@ -754,6 +756,29 @@ func (s *Server) getSession(id string) *sessionState {
 	return s.sessions[id]
 }
 
+// makeCompactor returns a Compactor configured for the given model.
+// It looks up the model's context window from the cached model list so the
+// threshold is ContextWindow - ReserveTokens rather than a flat guess.
+func (s *Server) makeCompactor(modelID string) *agent.Compactor {
+	s.modelsMu.RLock()
+	models := s.models
+	s.modelsMu.RUnlock()
+
+	var contextWindow int
+	for _, m := range models {
+		if m.ID == modelID {
+			contextWindow = m.ContextWindow
+			break
+		}
+	}
+
+	return &agent.Compactor{
+		Provider:      s.provider,
+		Model:         modelID,
+		ContextWindow: contextWindow,
+	}
+}
+
 func newSessionID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
@@ -818,6 +843,7 @@ func toACPModels(infos []model.ModelInfo) []acpModel {
 		out = append(out, acpModel{
 			ID:               m.ID,
 			DisplayName:      m.DisplayName,
+			ContextWindow:    m.ContextWindow,
 			MaxTokens:        m.MaxTokens,
 			SupportsThinking: m.SupportsThinking,
 		})

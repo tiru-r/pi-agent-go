@@ -88,6 +88,7 @@ func toModelInfo(e orModelEntry) model.ModelInfo {
 		ID:               e.ID,
 		Provider:         "openrouter",
 		DisplayName:      e.Name,
+		ContextWindow:    e.ContextLen,
 		MaxTokens:        maxTok,
 		SupportsTools:    supportsTools,
 		SupportsVision:   supportsVision,

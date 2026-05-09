@@ -6,7 +6,8 @@ type ModelInfo struct {
 	ID               string
 	Provider         string
 	DisplayName      string
-	MaxTokens        int
+	ContextWindow    int // total context length in tokens (input + output)
+	MaxTokens        int // max output tokens
 	SupportsTools    bool
 	SupportsVision   bool
 	SupportsThinking bool

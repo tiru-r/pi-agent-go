@@ -95,6 +95,10 @@ func (a *SessionAgent) Run(
 		toolDefs = tools.ToDefinitions()
 	}
 
+	// lastMeasuredTokens holds the InputTokens value from the previous API
+	// response. When non-zero it is used instead of the heuristic estimator.
+	var lastMeasuredTokens int
+
 	for iter := 0; iter < maxIter; iter++ {
 		select {
 		case <-ctx.Done():
@@ -105,9 +109,10 @@ func (a *SessionAgent) Run(
 		msgs := a.Session.Messages()
 
 		// Compact history if it has grown past the threshold.
-		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, 0) {
+		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens) {
 			if compacted, summary, compactErr := a.Compactor.Compact(ctx, msgs, opts.System); compactErr == nil {
 				msgs = compacted
+				lastMeasuredTokens = 0 // heuristic will re-estimate after compaction
 				_ = a.Session.Append(session.Entry{
 					Type:    session.EntryCompaction,
 					Summary: summary,
@@ -153,6 +158,11 @@ func (a *SessionAgent) Run(
 		}
 		if err != nil {
 			return fmt.Errorf("session_agent: collect: %w", err)
+		}
+
+		// Update measured token count for the next compaction check.
+		if resp.Usage.InputTokens > 0 {
+			lastMeasuredTokens = resp.Usage.InputTokens
 		}
 
 		// Append assistant response to session.

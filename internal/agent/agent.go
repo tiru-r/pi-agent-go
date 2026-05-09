@@ -130,6 +130,10 @@ func (a *Agent) Run(
 	// Resolve tool set.
 	toolDefs := resolveTools(opts.Tools)
 
+	// lastMeasuredTokens holds the InputTokens value from the previous API
+	// response. When non-zero it is used instead of the heuristic estimator.
+	var lastMeasuredTokens int
+
 	for turn := 0; turn < maxTurns; turn++ {
 		select {
 		case <-ctx.Done():
@@ -138,9 +142,10 @@ func (a *Agent) Run(
 		}
 
 		// Compact history before calling the LLM if it's grown too large.
-		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, 0) {
+		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens) {
 			if compacted, _, compactErr := a.Compactor.Compact(ctx, msgs, systemPrompt); compactErr == nil {
 				msgs = compacted
+				lastMeasuredTokens = 0 // heuristic will re-estimate after compaction
 			}
 		}
 
@@ -183,6 +188,11 @@ func (a *Agent) Run(
 		}
 		if err != nil {
 			return msgs, err
+		}
+
+		// Update measured token count for the next compaction check.
+		if resp.Usage.InputTokens > 0 {
+			lastMeasuredTokens = resp.Usage.InputTokens
 		}
 
 		// Add the assistant message to history.
