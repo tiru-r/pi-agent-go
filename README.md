@@ -71,15 +71,15 @@ pi acp
 
 ## Zed integration
 
-Pi advertises itself as a native language model provider. Zed invokes `pi acp` as a subprocess and communicates over stdin/stdout via JSON-RPC 2.0.
+Pi registers as a native agent server. Zed invokes `pi acp` as a subprocess and communicates over stdin/stdout via JSON-RPC 2.0 using the Agent Client Protocol (ACP).
 
 ### Zed `settings.json`
 
 ```json
 {
-  "language_models": {
+  "agent_servers": {
     "pi": {
-      "provider": "custom",
+      "type": "custom",
       "command": "pi",
       "args": ["acp"],
       "env": {
@@ -90,15 +90,22 @@ Pi advertises itself as a native language model provider. Zed invokes `pi acp` a
 }
 ```
 
-On `initialize`, pi fetches the live model list from OpenRouter and returns it to Zed. All models appear in Zed's model picker immediately.
+### What you get in Zed's panel
+
+- **Model picker** — all 500+ OpenRouter models, populated from the live API on startup
+- **Thinking level** — Off / Auto / Full selector for extended reasoning (works with Claude 3.7+, DeepSeek R1, QwQ, etc.)
+- **Full agentic loop** — pi runs tools (read, write, bash, …) across multiple turns before returning
 
 ### Session flow
 
-When Zed uses `session/prompt`, pi:
-1. Loads conversation history for the session ID
-2. Runs the full agentic loop — LLM calls tools (read, write, bash, …), feeds results back, repeats
-3. Streams text and tool notifications back to Zed as `chunk` events
-4. Saves updated history for the next turn
+When Zed sends `session/prompt`, pi:
+1. Looks up the session's current model and thinking level
+2. Loads conversation history for the session
+3. Runs the full agentic loop — LLM calls tools, feeds results back, repeats
+4. Streams text chunks (`agent_message_chunk`) and thinking chunks (`agent_thought_chunk`) to Zed via `session/update` notifications
+5. Saves updated history for the next turn
+
+Changing the model or thinking level in Zed's panel triggers `session/set_config_option` or `session/set_model`, which pi applies to all subsequent prompts in that session.
 
 ### Debug logging
 
@@ -109,8 +116,11 @@ PI_DEBUG=1 pi acp    # writes verbose logs to ~/.pi/agent/acp.log
 ### Protocol summary
 
 ```
-Zed → pi:  initialize, complete, session/new, session/prompt, cancel
-pi → Zed:  initialize result (model list), chunk notifications, complete result
+Zed → pi:  initialize, session/new, session/prompt, session/cancel,
+           session/set_config_option, session/set_model, session/close
+pi → Zed:  initialize result (agentInfo), session/new result (configOptions + models),
+           session/update notifications (agent_message_chunk, agent_thought_chunk),
+           session/prompt result (stopReason, usage)
 ```
 
 ---
@@ -317,7 +327,9 @@ internal/
 
 **Single provider.** Everything routes through OpenRouter. One interface, one streaming implementation, one API key.
 
-**Live model list.** `FetchModels()` calls `GET /api/v1/models` on startup. No hardcoded model IDs anywhere. New models on OpenRouter appear in Zed automatically.
+**Live model list.** `FetchModels()` calls `GET /api/v1/models` on startup. No hardcoded model IDs anywhere. New models on OpenRouter appear in Zed's model picker automatically.
+
+**New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model and thinking level per conversation; Zed's UI controls drive both via `session/set_config_option` and `session/set_model`.
 
 **Minimal dependencies.** 3 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index). The rest is stdlib.
 
