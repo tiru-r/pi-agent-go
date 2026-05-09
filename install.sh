@@ -28,7 +28,7 @@ QUIET=0
 BINARY_NAME="pi"
 REPO_URL="https://github.com/tiru-r/pi-agent-go"
 MIN_GO_MAJOR=1
-MIN_GO_MINOR=23
+MIN_GO_MINOR=24
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pi-agent"
 STATE_FILE="$STATE_DIR/install-state.env"
@@ -295,6 +295,10 @@ main() {
     echo ""
     echo "  One-shot prompt:"
     echo "    pi run \"Explain this codebase\""
+    echo ""
+    echo "  Extensions (optional):"
+    echo "    Drop .js or .json tool definitions into ~/.pi/extensions/"
+    echo "    They are loaded automatically at startup."
     echo ""
     echo "  Run 'pi --help' for all options."
   fi

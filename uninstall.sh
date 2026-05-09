@@ -30,6 +30,7 @@ STATE_FILE="$STATE_DIR/install-state.env"
 PATH_MARKER="# pi-agent installer PATH"
 
 CONFIG_DIR="$HOME/.pi/agent"
+EXTENSIONS_DIR="$HOME/.pi/extensions"
 
 # Recorded by installer; overwritten from state file when available.
 PIAG_INSTALL_BIN=""
@@ -166,19 +167,33 @@ remove_path_entries() {
 remove_config_data() {
   [ "$PURGE" -eq 0 ] && return 0
 
-  if [ ! -d "$CONFIG_DIR" ]; then
+  local removed=0
+
+  if [ -d "$CONFIG_DIR" ]; then
+    warn "This will permanently delete ${CONFIG_DIR} (all sessions and settings)."
+    if prompt_confirm "Delete config and session data?" 0; then
+      rm -rf "$CONFIG_DIR"
+      ok "Removed config directory: ${CONFIG_DIR}"
+      removed=1
+    else
+      info "Keeping config data."
+    fi
+  else
     info "No config directory found at ${CONFIG_DIR}."
-    return 0
   fi
 
-  warn "This will permanently delete ${CONFIG_DIR} (all sessions and settings)."
-  if ! prompt_confirm "Delete config and session data?" 0; then
-    info "Keeping config data."
-    return 0
+  if [ -d "$EXTENSIONS_DIR" ]; then
+    warn "This will permanently delete ${EXTENSIONS_DIR} (all extensions)."
+    if prompt_confirm "Delete extensions directory?" 0; then
+      rm -rf "$EXTENSIONS_DIR"
+      ok "Removed extensions directory: ${EXTENSIONS_DIR}"
+      removed=1
+    else
+      info "Keeping extensions."
+    fi
   fi
 
-  rm -rf "$CONFIG_DIR"
-  ok "Removed config directory: ${CONFIG_DIR}"
+  [ "$removed" -eq 0 ] && info "Nothing purged."
 }
 
 # ── State cleanup ─────────────────────────────────────────────────────────────
@@ -216,6 +231,7 @@ plan_summary() {
 
   if [ "$PURGE" -eq 1 ]; then
     echo -e "  \033[0;90mPurge data:     ${CONFIG_DIR}\033[0m"
+    echo -e "  \033[0;90mPurge extns:    ${EXTENSIONS_DIR}\033[0m"
   fi
 }
 
@@ -250,10 +266,18 @@ main() {
   log ""
   if [ "$QUIET" -eq 0 ]; then
     echo -e "\033[1;32mUninstall complete.\033[0m"
-    if [ "$PURGE" -eq 0 ] && [ -d "$CONFIG_DIR" ]; then
-      echo ""
-      echo "  Sessions and config remain at: ${CONFIG_DIR}"
-      echo "  Run with --purge to delete them."
+    if [ "$PURGE" -eq 0 ]; then
+      local leftovers=()
+      [ -d "$CONFIG_DIR" ]     && leftovers+=("$CONFIG_DIR")
+      [ -d "$EXTENSIONS_DIR" ] && leftovers+=("$EXTENSIONS_DIR")
+      if [ "${#leftovers[@]}" -gt 0 ]; then
+        echo ""
+        echo "  Data directories left behind:"
+        for d in "${leftovers[@]}"; do
+          echo "    ${d}"
+        done
+        echo "  Run with --purge to delete them."
+      fi
     fi
   fi
 }
