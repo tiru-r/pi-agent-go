@@ -14,7 +14,7 @@ type Config struct {
 	OpenRouterSiteURL string `json:"openrouter_site_url,omitempty"`
 	OpenRouterAppName string `json:"openrouter_app_name,omitempty"`
 
-	// Model selection — any OpenRouter model ID, e.g. "tencent/hy3-preview:free"
+	// Model selection — any OpenRouter model ID, e.g. "openai/gpt-oss-120b:free"
 	Model string `json:"model,omitempty"`
 
 	// Behaviour
@@ -32,7 +32,7 @@ type Config struct {
 }
 
 var defaultCfg = Config{
-	Model:     "tencent/hy3-preview:free",
+	Model:     "openai/gpt-oss-120b:free",
 	MaxTokens: 8096,
 	SQLite:    true,
 }

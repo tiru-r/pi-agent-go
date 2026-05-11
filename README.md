@@ -416,7 +416,7 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
   "openrouter_api_key": "sk-or-...",
   "openrouter_site_url": "https://mysite.com",
   "openrouter_app_name": "My App",
-  "model": "tencent/hy3-preview:free",
+  "model": "openai/gpt-oss-120b:free",
   "max_tokens": 8096,
   "temperature": 0.7,
   "thinking_level": "off",
