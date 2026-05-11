@@ -5,21 +5,23 @@
 // Wire format: one JSON object per line (no framing headers).
 //
 // Zed → pi  (requests)
-//   initialize                 {protocolVersion, clientInfo?, clientCapabilities?}
-//   session/new                {}
-//   session/prompt             {sessionId, prompt:[{type:"text",text:"…"}]}
-//   session/cancel             {sessionId}  (notification, no id)
-//   session/set_config_option  {sessionId, configId, value}
-//   session/set_model          {sessionId, modelId}
-//   session/close              {sessionId}
+//
+//	initialize                 {protocolVersion, clientInfo?, clientCapabilities?}
+//	session/new                {}
+//	session/prompt             {sessionId, prompt:[{type:"text",text:"…"}]}
+//	session/cancel             {sessionId}  (notification, no id)
+//	session/set_config_option  {sessionId, configId, value}
+//	session/set_model          {sessionId, modelId}
+//	session/close              {sessionId}
 //
 // pi → Zed  (responses + notifications)
-//   initialize result          {protocolVersion, agentInfo:{name,version}}
-//   session/new result         {sessionId, configOptions:[model-select, thinking-select]}
-//   session/update notification {sessionId, update:{sessionUpdate:"agent_message_chunk"|"agent_thought_chunk", content:{type:"text",text:"…"}}}
-//   session/prompt result      {stopReason, usage?}
-//   session/set_config_option  {configOptions:[…]}
-//   error response             {code, message}
+//
+//	initialize result          {protocolVersion, agentInfo:{name,version}}
+//	session/new result         {sessionId, configOptions:[model-select, thinking-select]}
+//	session/update notification {sessionId, update:{sessionUpdate:"agent_message_chunk"|"agent_thought_chunk", content:{type:"text",text:"…"}}}
+//	session/prompt result      {stopReason, usage?}
+//	session/set_config_option  {configOptions:[…]}
+//	error response             {code, message}
 //
 // Set PI_DEBUG=1 to write verbose logs to ~/.pi/agent/acp.log.
 package acp
@@ -84,13 +86,27 @@ type rpcError struct {
 // ── ACP wire shapes ───────────────────────────────────────────────────────────
 
 type acpInitResult struct {
-	ProtocolVersion int      `json:"protocolVersion"`
-	AgentInfo       acpImpl  `json:"agentInfo"`
+	ProtocolVersion   int              `json:"protocolVersion"`
+	AgentInfo         acpImpl          `json:"agentInfo"`
+	AgentCapabilities *acpCapabilities `json:"agentCapabilities,omitempty"`
+	AuthMethods       []any            `json:"authMethods"` // empty = no auth required
 }
 
 type acpImpl struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
+}
+
+// acpCapabilities declares agent feature support per the ACP spec.
+type acpCapabilities struct {
+	LoadSession        bool                   `json:"loadSession,omitempty"`
+	PromptCapabilities *acpPromptCapabilities `json:"promptCapabilities,omitempty"`
+}
+
+type acpPromptCapabilities struct {
+	Image           bool `json:"image,omitempty"`
+	Audio           bool `json:"audio,omitempty"`
+	EmbeddedContext bool `json:"embeddedContext,omitempty"`
 }
 
 // acpModel describes a model returned in the model config-option.
@@ -144,7 +160,7 @@ type acpContent struct {
 // acpPromptParams covers both the new ACP (prompt array) and the old format.
 type acpPromptParams struct {
 	SessionID string     `json:"sessionId"`
-	Prompt    flexString `json:"prompt"`    // new: [{type:"text",text:…}]; old: "string"
+	Prompt    flexString `json:"prompt"` // new: [{type:"text",text:…}]; old: "string"
 	MessageID string     `json:"messageId,omitempty"`
 }
 
@@ -270,7 +286,10 @@ func New(cfg *config.Config) (*Server, error) {
 	extMgr, err := extensions.New(context.Background(), cfg.ExtensionsDir)
 	if err != nil {
 		slog.Warn("acp: extensions init failed", "err", err)
-		extMgr, _ = extensions.New(context.Background(), "") // empty = no extensions
+		extMgr, err = extensions.New(context.Background(), "") // empty = no extensions
+		if err != nil {
+			slog.Warn("acp: extensions fallback also failed", "err", err)
+		}
 	}
 	s.extMgr = extMgr
 	for _, t := range extensions.WrapAsTools(extMgr) {
@@ -279,7 +298,9 @@ func New(cfg *config.Config) (*Server, error) {
 
 	// Open SQLite session index if enabled. Failure is non-fatal.
 	if cfg.SQLite {
-		if err := os.MkdirAll(cfg.SessionDir, 0o700); err == nil {
+		if err := os.MkdirAll(cfg.SessionDir, 0o700); err != nil {
+			slog.Warn("acp: cannot create session dir for sqlite", "err", err)
+		} else {
 			if store, err := session.NewSQLiteStore(filepath.Join(cfg.SessionDir, "index.db")); err == nil {
 				s.sqliteStore = store
 			} else {
@@ -383,6 +404,13 @@ func (s *Server) handleInitialize(req *request) {
 	s.sendResult(rawID(req.ID), acpInitResult{
 		ProtocolVersion: protocolVersion,
 		AgentInfo:       acpImpl{Name: "pi", Version: "1.0.0"},
+		AgentCapabilities: &acpCapabilities{
+			PromptCapabilities: &acpPromptCapabilities{
+				Image:           true,
+				EmbeddedContext: true,
+			},
+		},
+		AuthMethods: []any{}, // empty = no auth required, agent handles auth internally
 	})
 }
 
@@ -406,7 +434,9 @@ func (s *Server) handleSessionNew(req *request) {
 
 	// Create a persistent JSONL session for this ACP session.
 	var sess *session.Session
-	if err := os.MkdirAll(s.cfg.SessionDir, 0o700); err == nil {
+	if err := os.MkdirAll(s.cfg.SessionDir, 0o700); err != nil {
+		slog.Warn("acp: cannot create session dir", "err", err)
+	} else {
 		if newSess, err := session.New(s.cfg.SessionDir); err == nil {
 			sess = newSess
 		} else {
@@ -424,8 +454,10 @@ func (s *Server) handleSessionNew(req *request) {
 
 	// Register in SQLite index so `pi session list` shows it immediately.
 	if s.sqliteStore != nil && sess != nil {
-		if err := s.sqliteStore.SaveSession(sess); err == nil {
-			_ = s.sqliteStore.UpdateSessionMeta(sess.ID, modelID, "openrouter")
+		if err := s.sqliteStore.SaveSession(sess); err != nil {
+			slog.Warn("acp: sqlite save session failed", "session", id, "err", err)
+		} else if err := s.sqliteStore.UpdateSessionMeta(sess.ID, modelID, "openrouter"); err != nil {
+			slog.Warn("acp: sqlite update session meta failed", "session", id, "err", err)
 		}
 	}
 
@@ -454,7 +486,10 @@ func (s *Server) handleSessionSetConfigOption(req *request) {
 
 	// Decode string value.
 	var valStr string
-	_ = json.Unmarshal(p.Value, &valStr)
+	if err := json.Unmarshal(p.Value, &valStr); err != nil {
+		s.sendError(rawID(req.ID), -32602, "invalid config value: "+err.Error())
+		return
+	}
 
 	s.sessionsMu.Lock()
 	switch p.ConfigID {
@@ -521,7 +556,13 @@ func (s *Server) handleSessionClose(req *request) {
 		return
 	}
 	var p acpSessionCloseParams
-	_ = json.Unmarshal(req.Params, &p)
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		slog.Warn("acp: invalid session/close params", "err", err)
+		if req.ID != nil {
+			s.sendError(rawID(req.ID), -32602, "invalid params: "+err.Error())
+		}
+		return
+	}
 
 	// Cancel any in-flight prompt and remove session.
 	s.cancelsMu.Lock()
@@ -574,8 +615,12 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	if ss == nil {
 		// Auto-create session with defaults if not found.
 		var newSess *session.Session
-		if err := os.MkdirAll(s.cfg.SessionDir, 0o700); err == nil {
-			newSess, _ = session.New(s.cfg.SessionDir)
+		if err := os.MkdirAll(s.cfg.SessionDir, 0o700); err != nil {
+			slog.Warn("acp: auto-create session dir failed", "err", err)
+		} else if ns, err := session.New(s.cfg.SessionDir); err != nil {
+			slog.Warn("acp: auto-create session failed", "err", err)
+		} else {
+			newSess = ns
 		}
 		ss = &sessionState{
 			sess:       newSess,
@@ -650,12 +695,16 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	// Persist new messages to the JSONL session file.
 	if fileSess != nil {
 		for _, msg := range updatedMsgs[historyLen:] {
-			_ = fileSess.AppendMessage(msg, nil)
+			if err := fileSess.AppendMessage(msg, nil); err != nil {
+				slog.Warn("acp: failed to persist message", "session", p.SessionID, "err", err)
+			}
 		}
 		// Keep SQLite index in sync.
 		if s.sqliteStore != nil {
-			if err := s.sqliteStore.SaveSession(fileSess); err == nil {
-				_ = s.sqliteStore.UpdateSessionMeta(fileSess.ID, modelID, "openrouter")
+			if err := s.sqliteStore.SaveSession(fileSess); err != nil {
+				slog.Warn("acp: sqlite save failed", "session", p.SessionID, "err", err)
+			} else if err := s.sqliteStore.UpdateSessionMeta(fileSess.ID, modelID, "openrouter"); err != nil {
+				slog.Warn("acp: sqlite meta update failed", "session", p.SessionID, "err", err)
 			}
 		}
 	}
@@ -806,10 +855,18 @@ func (s *Server) write(v any) {
 		return
 	}
 	s.outMu.Lock()
-	_, _ = s.out.Write(b)
-	_ = s.out.WriteByte('\n')
-	_ = s.out.Flush()
-	s.outMu.Unlock()
+	defer s.outMu.Unlock()
+	if _, err := s.out.Write(b); err != nil {
+		slog.Error("acp: stdout write failed", "err", err)
+		return
+	}
+	if err := s.out.WriteByte('\n'); err != nil {
+		slog.Error("acp: stdout write newline failed", "err", err)
+		return
+	}
+	if err := s.out.Flush(); err != nil {
+		slog.Error("acp: stdout flush failed", "err", err)
+	}
 }
 
 // rawID unmarshals a json.RawMessage ID to a concrete any (number or string).
@@ -818,7 +875,10 @@ func rawID(raw json.RawMessage) any {
 		return nil
 	}
 	var v any
-	_ = json.Unmarshal(raw, &v)
+	if err := json.Unmarshal(raw, &v); err != nil {
+		slog.Warn("acp: cannot decode request ID", "raw", string(raw), "err", err)
+		return nil
+	}
 	return v
 }
 

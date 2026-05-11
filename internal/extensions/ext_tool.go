@@ -14,7 +14,7 @@ import (
 // meta-dispatcher tool (only added when at least one extension is loaded).
 // Call tools.Register on each returned tool to add it to the registry.
 func WrapAsTools(m *Manager) []tools.Tool {
-	if len(m.extensions) == 0 {
+	if m == nil || len(m.extensions) == 0 {
 		return nil
 	}
 	ts := make([]tools.Tool, 0, len(m.extensions)+1)
