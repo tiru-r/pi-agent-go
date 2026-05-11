@@ -1,50 +1,51 @@
 package extensions
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/dop251/goja"
+	quickjs "github.com/aperturerobotics/go-quickjs-wasi-reactor/wazero-quickjs"
+	"github.com/tetratelabs/wazero"
 )
 
 const hookCallTimeout = 5 * time.Second
 
-// jsExtension runs a JavaScript extension in-process via goja (pure Go, no Node.js).
+// global compilation cache: shared across all extension instances so the WASM
+// module is only compiled once per process.
+var (
+	compileCacheOnce sync.Once
+	compileCache     wazero.CompilationCache
+)
+
+func getCompileCache() wazero.CompilationCache {
+	compileCacheOnce.Do(func() { compileCache = wazero.NewCompilationCache() })
+	return compileCache
+}
+
+// jsExtension runs a JavaScript extension via QuickJS-WASI (WebAssembly +
+// wazero). Each call to Execute/BeforeTool/AfterTool creates a fresh QuickJS
+// instance; the WASM module is compiled once per process via the global cache.
 //
-// Extensions communicate with Pi through a promise-based hostcall protocol.
-// JS calls pi.tool(), pi.http(), pi.exec(), pi.env(), pi.session(), pi.ui(),
-// or pi.log() — each returns a Promise resolved synchronously before returning
-// to the caller. Extensions may be written as async functions and use await.
-//
-// Execution model (per Execute call):
-//
-//  1. callLocked acquires the VM mutex and sets callCtx.
-//  2. executeFn is called; it runs until completion or the first await.
-//  3. Any pi.* calls inside execute run synchronously: capability is checked,
-//     the request is dispatched, and the returned Promise is pre-resolved.
-//  4. If execute is async, the event loop ticks until the root Promise settles.
-//  5. callLocked releases the mutex.
+// Communication between Go and JS uses a synchronous JSON-over-pipes RPC:
+//   - JS writes  "HC:{json}\n"     to stdout  → Go processes the hostcall
+//   - Go writes  "{json}\n"        to stdin   → JS reads via std.in.getline()
+//   - JS writes  "DESCRIBE:{json}" or "RESULT:{json}" to signal completion
 type jsExtension struct {
-	info     Info
-	manifest Manifest
-
-	mu      sync.Mutex    // serialises all VM access; goja is not goroutine-safe
-	vm      *goja.Runtime
-	callCtx context.Context // current call's context; valid only while mu is held
-
-	// pre-resolved function references (valid for the VM's lifetime)
-	executeFn    goja.Callable
-	beforeToolFn goja.Callable // nil if not defined
-	afterToolFn  goja.Callable // nil if not defined
-
-	// Dispatcher handles capability, dedup, lanes, shadow, telemetry.
+	info      Info
+	manifest  Manifest
+	src       string
+	hasBefore bool
+	hasAfter  bool
 	dispatcher *HostcallDispatcher
 }
 
@@ -53,31 +54,28 @@ func loadJS(ctx context.Context, path string) (*jsExtension, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Static analysis before loading.
 	scan := Scan(string(src))
 	if len(scan.ForbiddenPatterns) > 0 {
-		return nil, fmt.Errorf("%s: forbidden patterns detected: %s", path, strings.Join(scan.ForbiddenPatterns, ", "))
+		return nil, fmt.Errorf("%s: forbidden patterns: %s", path, strings.Join(scan.ForbiddenPatterns, ", "))
 	}
 	if unavail := scan.UnavailableImports(); len(unavail) > 0 {
 		fmt.Fprintf(os.Stderr, "[ext] %s: unavailable require() modules: %s\n",
 			filepath.Base(path), strings.Join(unavail, ", "))
 	}
-
 	manifest := loadManifest(path)
 	e := &jsExtension{
 		manifest:   manifest,
+		src:        string(src),
 		dispatcher: NewHostcallDispatcher(filepath.Base(path), manifest),
 	}
-
-	if err := e.init(ctx, path, string(src)); err != nil {
-		// Auto-repair: try AutoSafe fixes and reload.
+	if err := e.init(ctx, path); err != nil {
 		repaired := Repair(string(src), RepairAutoSafe, scan)
 		if len(repaired.Applied) > 0 {
 			for _, fix := range repaired.Applied {
 				fmt.Fprintf(os.Stderr, "[ext:repair] %s: applied: %s\n", filepath.Base(path), fix.Description)
 			}
-			if err2 := e.init(ctx, path, repaired.Source); err2 == nil {
+			e.src = repaired.Source
+			if err2 := e.init(ctx, path); err2 == nil {
 				return e, nil
 			}
 		}
@@ -86,402 +84,423 @@ func loadJS(ctx context.Context, path string) (*jsExtension, error) {
 	return e, nil
 }
 
-// init creates the VM, runs the source, resolves function refs, and calls on_init.
-func (e *jsExtension) init(ctx context.Context, path, src string) error {
-	tctx, cancel := context.WithTimeout(ctx, extensionCallTimeout)
-	defer cancel()
-
-	vm := goja.New()
-	vm.SetParserOptions()
-	e.vm = vm
-	e.callCtx = tctx
-
-	setupNodeShims(vm, e.manifest)
-	setupPiAPI(vm, e)
-
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-tctx.Done():
-			vm.Interrupt(tctx.Err())
-		case <-done:
-		}
-	}()
-
-	if _, err := vm.RunString(src); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-
-	describeFn, ok := goja.AssertFunction(vm.Get("describe"))
-	if !ok {
-		return fmt.Errorf("%s: describe() not defined", path)
-	}
-	result, err := describeFn(goja.Undefined())
-	if err != nil {
-		return fmt.Errorf("%s: describe: %w", path, err)
-	}
-	raw, err := json.Marshal(result.Export())
-	if err != nil {
-		return fmt.Errorf("%s: marshal describe result: %w", path, err)
-	}
-	if err := json.Unmarshal(raw, &e.info); err != nil {
-		return fmt.Errorf("%s: parse describe result: %w", path, err)
-	}
-	if e.info.Name == "" {
-		return fmt.Errorf("%s: describe returned empty name", path)
-	}
-	// Backfill dispatcher name once we know the extension's declared name.
-	e.dispatcher.extName = e.info.Name
-
-	executeFn, ok := goja.AssertFunction(vm.Get("execute"))
-	if !ok {
-		return fmt.Errorf("%s: execute() not defined", path)
-	}
-	e.executeFn = executeFn
-
-	if fn, ok := goja.AssertFunction(vm.Get("before_tool")); ok {
-		e.beforeToolFn = fn
-	}
-	if fn, ok := goja.AssertFunction(vm.Get("after_tool")); ok {
-		e.afterToolFn = fn
-	}
-
-	if initFn, ok := goja.AssertFunction(vm.Get("on_init")); ok {
-		if _, err := e.runEventLoop(func() (goja.Value, error) {
-			return initFn(goja.Undefined())
-		}); err != nil {
-			return fmt.Errorf("%s: on_init: %w", path, err)
-		}
-	}
-
-	vm.ClearInterrupt()
-	e.callCtx = nil
-	return nil
-}
-
 func (e *jsExtension) Info() Info   { return e.info }
 func (e *jsExtension) Close() error { return nil }
 
-// Telemetry returns the dispatcher's recorded hostcall telemetry.
 func (e *jsExtension) Telemetry() []HostcallTelemetry {
 	return e.dispatcher.Telemetry()
 }
 
-// callLocked acquires the VM mutex, sets callCtx, arms context cancellation,
-// and invokes fn. callCtx is cleared on return.
-func (e *jsExtension) callLocked(ctx context.Context, fn func() error) error {
-	e.mu.Lock()
-	defer func() {
-		e.callCtx = nil
-		e.mu.Unlock()
-	}()
+// ── init ──────────────────────────────────────────────────────────────────────
 
-	e.vm.ClearInterrupt()
-	e.callCtx = ctx
+// initHarness calls on_init (if defined), then describe(), and writes the
+// result as a DESCRIBE: line to stdout.
+const initHarness = `
+;(function(){
+  var _done=function(){
+    var d=describe();
+    std.out.puts('DESCRIBE:'+JSON.stringify({info:d,flags:{hasBefore:typeof before_tool==='function',hasAfter:typeof after_tool==='function'}})+'\n');
+    std.out.flush();
+  };
+  if(typeof on_init==='function'){Promise.resolve(on_init()).then(_done,_done);}else{_done();}
+})();
+`
 
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			e.vm.Interrupt(ctx.Err())
-		case <-done:
-		}
-	}()
-	defer close(done)
-
-	return fn()
+type initOutput struct {
+	Info  Info `json:"info"`
+	Flags struct {
+		HasBefore bool `json:"hasBefore"`
+		HasAfter  bool `json:"hasAfter"`
+	} `json:"flags"`
 }
 
-// runEventLoop drives the goja microtask queue until the value returned by
-// startFn settles. Handles both synchronous return values and Promises from
-// async functions. Must be called with the VM mutex already held (i.e. inside
-// callLocked or init).
-func (e *jsExtension) runEventLoop(startFn func() (goja.Value, error)) (goja.Value, error) {
-	val, err := startFn()
-	if err != nil {
-		return goja.Undefined(), err
-	}
+func (e *jsExtension) init(ctx context.Context, path string) error {
+	tctx, cancel := context.WithTimeout(ctx, extensionCallTimeout)
+	defer cancel()
 
-	// Wrap in Promise.resolve so both sync results and async Promises are
-	// handled uniformly.
-	promiseResolve, ok := goja.AssertFunction(
-		e.vm.GlobalObject().Get("Promise").ToObject(e.vm).Get("resolve"),
-	)
-	if !ok {
-		return val, nil // no Promise support in this VM (shouldn't happen)
-	}
-	wrapped, err := promiseResolve(goja.Undefined(), val)
-	if err != nil {
-		return goja.Undefined(), err
-	}
-
-	// Attach .then/.catch to detect settlement.
-	var finalVal goja.Value = goja.Undefined()
-	var finalErr error
-	settled := false
-
-	thenFn, ok := goja.AssertFunction(wrapped.ToObject(e.vm).Get("then"))
-	if !ok {
-		return val, nil
-	}
-	onFulfilled := e.vm.ToValue(func(call goja.FunctionCall) goja.Value {
-		finalVal = call.Argument(0)
-		settled = true
-		return goja.Undefined()
-	})
-	onRejected := e.vm.ToValue(func(call goja.FunctionCall) goja.Value {
-		finalErr = fmt.Errorf("%s", call.Argument(0).String())
-		settled = true
-		return goja.Undefined()
-	})
-	if _, err := thenFn(goja.Undefined(), onFulfilled, onRejected); err != nil {
-		return goja.Undefined(), err
-	}
-
-	// Drain microtasks one tick at a time until the Promise settles.
-	// Each RunString call flushes goja's internal microtask queue.
-	for !settled {
-		if _, tickErr := e.vm.RunString("void 0"); tickErr != nil {
-			return goja.Undefined(), tickErr
+	var out initOutput
+	err := e.runScript(tctx, e.src+"\n"+initHarness, func(line string) (bool, error) {
+		if rest, ok := strings.CutPrefix(line, "DESCRIBE:"); ok {
+			if jErr := json.Unmarshal([]byte(rest), &out); jErr != nil {
+				return false, fmt.Errorf("parse describe: %w", jErr)
+			}
+			return true, nil
 		}
+		return false, nil
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
 	}
-	return finalVal, finalErr
+	if out.Info.Name == "" {
+		return fmt.Errorf("%s: describe() returned empty name", path)
+	}
+	e.info = out.Info
+	e.hasBefore = out.Flags.HasBefore
+	e.hasAfter = out.Flags.HasAfter
+	e.dispatcher.extName = e.info.Name
+	return nil
 }
+
+// ── Execute ───────────────────────────────────────────────────────────────────
 
 func (e *jsExtension) Execute(ctx context.Context, params json.RawMessage) (string, bool, error) {
 	tctx, cancel := context.WithTimeout(ctx, extensionCallTimeout)
 	defer cancel()
-
 	if params == nil {
 		params = json.RawMessage("{}")
 	}
+	paramsLit, _ := json.Marshal(string(params))
+	harness := fmt.Sprintf(`;(function(){
+  var __p=JSON.parse(%s);
+  Promise.resolve(execute(__p)).then(function(__r){
+    std.out.puts('RESULT:'+JSON.stringify(__r)+'\n');std.out.flush();
+  },function(__e){
+    std.out.puts('RESULT:'+JSON.stringify({content:String(__e),is_error:true})+'\n');std.out.flush();
+  });
+})();`, paramsLit)
 
 	var content string
 	var isError bool
+	var gotResult bool
 
-	err := e.callLocked(tctx, func() error {
-		var paramVal any
-		if err := json.Unmarshal(params, &paramVal); err != nil {
-			return fmt.Errorf("unmarshal params: %w", err)
-		}
-
-		result, err := e.runEventLoop(func() (goja.Value, error) {
-			return e.executeFn(goja.Undefined(), e.vm.ToValue(paramVal))
-		})
-		if err != nil {
-			return err
-		}
-
-		raw, err := json.Marshal(result.Export())
-		if err != nil {
-			return fmt.Errorf("marshal result: %w", err)
-		}
-		var resp struct {
-			Content string `json:"content"`
-			IsError bool   `json:"is_error"`
-		}
-		if jsonErr := json.Unmarshal(raw, &resp); jsonErr != nil {
-			if s, ok := result.Export().(string); ok {
-				content = s
-				return nil
+	err := e.runScript(tctx, e.src+"\n"+harness, func(line string) (bool, error) {
+		if rest, ok := strings.CutPrefix(line, "RESULT:"); ok {
+			var resp struct {
+				Content string `json:"content"`
+				IsError bool   `json:"is_error"`
 			}
-			return fmt.Errorf("execute must return {content, is_error}: %w", jsonErr)
+			if jErr := json.Unmarshal([]byte(rest), &resp); jErr == nil {
+				content, isError, gotResult = resp.Content, resp.IsError, true
+			}
+			return true, nil
 		}
-		content = resp.Content
-		isError = resp.IsError
-		return nil
+		return false, nil
 	})
 	if err != nil {
 		return "", true, err
 	}
+	if !gotResult {
+		return "", true, fmt.Errorf("execute() did not produce a result")
+	}
 	return content, isError, nil
 }
 
-// BeforeTool implements HookedExtension.
+// ── hooks ─────────────────────────────────────────────────────────────────────
+
 func (e *jsExtension) BeforeTool(ctx context.Context, name string, params json.RawMessage) {
-	if e.beforeToolFn == nil {
+	if !e.hasBefore {
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, hookCallTimeout)
 	defer cancel()
-
 	var paramVal any
 	_ = json.Unmarshal(params, &paramVal)
-
-	_ = e.callLocked(tctx, func() error {
-		_, err := e.beforeToolFn(goja.Undefined(), e.vm.ToValue(name), e.vm.ToValue(paramVal))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ext] %s: before_tool: %v\n", e.info.Name, err)
-		}
-		return nil
-	})
+	nameJ, _ := json.Marshal(name)
+	paramsJ, _ := json.Marshal(paramVal)
+	h := fmt.Sprintf(`;if(typeof before_tool==='function'){Promise.resolve(before_tool(%s,%s)).then(null,function(e){std.err.puts('[ext:before_tool] '+String(e)+'\n');});}std.out.puts('DONE\n');std.out.flush();`,
+		nameJ, paramsJ)
+	_ = e.runScript(tctx, e.src+"\n"+h, func(l string) (bool, error) { return l == "DONE", nil })
 }
 
-// AfterTool implements HookedExtension.
 func (e *jsExtension) AfterTool(ctx context.Context, name string, result string, isError bool) {
-	if e.afterToolFn == nil {
+	if !e.hasAfter {
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, hookCallTimeout)
 	defer cancel()
+	nameJ, _ := json.Marshal(name)
+	resultJ, _ := json.Marshal(result)
+	isErrJ, _ := json.Marshal(isError)
+	h := fmt.Sprintf(`;if(typeof after_tool==='function'){Promise.resolve(after_tool(%s,%s,%s)).then(null,function(e){std.err.puts('[ext:after_tool] '+String(e)+'\n');});}std.out.puts('DONE\n');std.out.flush();`,
+		nameJ, resultJ, isErrJ)
+	_ = e.runScript(tctx, e.src+"\n"+h, func(l string) (bool, error) { return l == "DONE", nil })
+}
 
-	_ = e.callLocked(tctx, func() error {
-		_, err := e.afterToolFn(goja.Undefined(), e.vm.ToValue(name), e.vm.ToValue(result), e.vm.ToValue(isError))
+// ── RPC engine ────────────────────────────────────────────────────────────────
+
+// hcReq is a JSON hostcall request written by JS to stdout as "HC:{json}\n".
+type hcReq struct {
+	K       string   `json:"k"`
+	Name    string   `json:"name,omitempty"`
+	Params  any      `json:"params,omitempty"`
+	Opts    any      `json:"opts,omitempty"`
+	Cmd     string   `json:"cmd,omitempty"`
+	Args    []string `json:"args,omitempty"`
+	Key     string   `json:"key,omitempty"`
+	Entry   any      `json:"entry,omitempty"`
+	Path    string   `json:"path,omitempty"`
+	Content string   `json:"content,omitempty"`
+}
+
+// hcResp is the JSON response Go writes to stdin; JS reads via std.in.getline().
+type hcResp struct {
+	Result string `json:"result,omitempty"`
+	Err    string `json:"err,omitempty"`
+}
+
+// runScript creates a fresh QuickJS WASM instance, evaluates the preamble +
+// code, drives the event loop, and calls onLine for every non-HC stdout line.
+// onLine returns (done, err); if done is true, runScript returns immediately.
+func (e *jsExtension) runScript(ctx context.Context, code string, onLine func(string) (bool, error)) error {
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	defer stdinR.Close()
+	defer stdoutR.Close()
+
+	r := wazero.NewRuntimeWithConfig(ctx,
+		wazero.NewRuntimeConfigInterpreter().WithCompilationCache(getCompileCache()))
+	defer r.Close(ctx)
+
+	cfg := wazero.NewModuleConfig().
+		WithStdin(stdinR).
+		WithStdout(stdoutW).
+		WithStderr(os.Stderr)
+
+	qjs, err := quickjs.NewQuickJS(ctx, r, cfg)
+	if err != nil {
+		return fmt.Errorf("quickjs: %w", err)
+	}
+	defer qjs.Close(ctx)
+
+	if err := qjs.Init(ctx, []string{"qjs", "--std"}); err != nil {
+		return fmt.Errorf("quickjs init: %w", err)
+	}
+
+	preamble := buildPreamble(e.manifest)
+
+	wasmDone := make(chan error, 1)
+	go func() {
+		defer stdoutW.Close()
+		if err := qjs.Eval(ctx, preamble+"\n"+code, false); err != nil {
+			wasmDone <- err
+			return
+		}
+		wasmDone <- qjs.RunLoop(ctx)
+	}()
+
+	scanner := bufio.NewScanner(stdoutR)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MB max line
+	var processErr error
+	var resultDone bool
+	for !resultDone && scanner.Scan() {
+		line := scanner.Text()
+		if rest, ok := strings.CutPrefix(line, "HC:"); ok {
+			var req hcReq
+			if jErr := json.Unmarshal([]byte(rest), &req); jErr != nil {
+				writeHCResp(stdinW, hcResp{Err: "parse error"})
+				continue
+			}
+			writeHCResp(stdinW, e.handleHC(ctx, &req))
+			continue
+		}
+		done, callErr := onLine(line)
+		if callErr != nil {
+			processErr = callErr
+			break
+		}
+		if done {
+			resultDone = true
+		}
+	}
+
+	stdinW.Close()
+	io.Copy(io.Discard, stdoutR) // let WASM goroutine finish
+	wasmErr := <-wasmDone
+
+	if processErr != nil {
+		return processErr
+	}
+	if resultDone {
+		return nil // ignore post-result cleanup errors
+	}
+	return wasmErr
+}
+
+func writeHCResp(w io.Writer, resp hcResp) {
+	b, _ := json.Marshal(resp)
+	w.Write(append(b, '\n'))
+}
+
+// handleHC dispatches a single hostcall request from the JS extension.
+func (e *jsExtension) handleHC(ctx context.Context, req *hcReq) hcResp {
+	switch req.K {
+	case "tool":
+		r := e.dispatcher.NewRequest(HCKindTool, req.Name, req.Params)
+		res, isErr, err := e.dispatcher.Dispatch(ctx, r)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ext] %s: after_tool: %v\n", e.info.Name, err)
+			return hcResp{Err: err.Error()}
 		}
-		return nil
-	})
-}
-
-// ── pi host API ───────────────────────────────────────────────────────────────
-
-// setupPiAPI installs the capability-gated pi global into vm.
-// All pi.* functions return already-resolved Promises so extensions can use
-// await without needing a real async event loop.
-func setupPiAPI(vm *goja.Runtime, e *jsExtension) {
-	pi := vm.NewObject()
-
-	// pi.tool(name, params) → Promise<string>
-	_ = pi.Set("tool", func(call goja.FunctionCall) goja.Value {
-		name := call.Argument(0).String()
-		var payload any
-		if len(call.Arguments) > 1 {
-			payload = call.Argument(1).Export()
+		if isErr {
+			return hcResp{Err: res}
 		}
-		ctx := e.callCtx
-		if ctx == nil {
-			ctx = context.Background()
+		return hcResp{Result: res}
+
+	case "http":
+		if !e.manifest.has(CapNetwork) {
+			return hcResp{Err: fmt.Sprintf("capability %q not granted", CapNetwork)}
 		}
-		req := e.dispatcher.NewRequest(HCKindTool, name, payload)
-		result, isErr, err := e.dispatcher.Dispatch(ctx, req)
-		return resolvedPromise(vm, result, isErr, err)
-	})
-
-	// pi.http({url, method, headers, body}) → Promise<{status, body, headers}>
-	if e.manifest.has(CapNetwork) {
-		_ = pi.Set("http", func(call goja.FunctionCall) goja.Value {
-			opts, _ := call.Argument(0).Export().(map[string]any)
-			ctx := e.callCtx
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			req := e.dispatcher.NewRequest(HCKindHTTP, "", opts)
-			if e.dispatcher.CheckPolicy(req) == PolicyDeny {
-				return rejectedPromise(vm, fmt.Errorf("capability %q not granted", CapNetwork))
-			}
-			result, isErr, err := httpHostcall(ctx, opts)
-			return resolvedPromise(vm, result, isErr, err)
-		})
-	} else {
-		_ = pi.Set("http", func(call goja.FunctionCall) goja.Value {
-			return rejectedPromise(vm, fmt.Errorf("capability %q not granted", CapNetwork))
-		})
-	}
-
-	// pi.exec(cmd, args) → Promise<string>
-	if e.manifest.has(CapExec) {
-		_ = pi.Set("exec", func(call goja.FunctionCall) goja.Value {
-			cmd := call.Argument(0).String()
-			var args []string
-			if arr, ok := call.Argument(1).Export().([]any); ok {
-				for _, a := range arr {
-					args = append(args, fmt.Sprint(a))
-				}
-			}
-			payload := map[string]any{"command": cmd + " " + strings.Join(args, " ")}
-			ctx := e.callCtx
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			req := e.dispatcher.NewRequest(HCKindExec, "bash", payload)
-			result, isErr, err := e.dispatcher.Dispatch(ctx, req)
-			return resolvedPromise(vm, result, isErr, err)
-		})
-	} else {
-		_ = pi.Set("exec", func(call goja.FunctionCall) goja.Value {
-			return rejectedPromise(vm, fmt.Errorf("capability %q not granted", CapExec))
-		})
-	}
-
-	// pi.env(key) → string (synchronous; always allowed via CapEnv gate)
-	_ = pi.Set("env", func(call goja.FunctionCall) goja.Value {
-		if !e.manifest.has(CapEnv) {
-			return goja.Undefined()
-		}
-		key := call.Argument(0).String()
-		if IsEnvBlocked(key) {
-			return goja.Undefined()
-		}
-		return vm.ToValue(os.Getenv(key))
-	})
-
-	// pi.session(op, data) → Promise<any>  [stub: returns empty ok]
-	_ = pi.Set("session", func(call goja.FunctionCall) goja.Value {
-		if !e.manifest.has(CapSession) {
-			return rejectedPromise(vm, fmt.Errorf("capability %q not granted", CapSession))
-		}
-		p, resolveFn, _ := vm.NewPromise()
-		_ = resolveFn(nil)
-		return vm.ToValue(p)
-	})
-
-	// pi.ui(op, data) → Promise<any>  [stub: returns empty ok]
-	_ = pi.Set("ui", func(call goja.FunctionCall) goja.Value {
-		if !e.manifest.has(CapUI) {
-			return rejectedPromise(vm, fmt.Errorf("capability %q not granted", CapUI))
-		}
-		p, resolveFn, _ := vm.NewPromise()
-		_ = resolveFn(nil)
-		return vm.ToValue(p)
-	})
-
-	// pi.log(entry) → void  (always allowed)
-	_ = pi.Set("log", func(call goja.FunctionCall) goja.Value {
-		entry := call.Argument(0).Export()
-		logHostcall(entry)
-		return goja.Undefined()
-	})
-
-	// Legacy filesystem helpers (kept for backwards compatibility).
-	if e.manifest.has(CapFSRead) || e.manifest.has(CapFSWrite) {
-		allowed := e.manifest.allowedPaths()
-		if e.manifest.has(CapFSRead) {
-			_ = pi.Set("readFile", readFileFunc(vm, allowed))
-		}
-		if e.manifest.has(CapFSWrite) {
-			_ = pi.Set("writeFile", writeFileFunc(vm, allowed))
-		}
-	}
-
-	_ = vm.Set("pi", pi)
-}
-
-// resolvedPromise creates a Promise already resolved with result,
-// or rejected if isErr or err is set.
-func resolvedPromise(vm *goja.Runtime, result string, isErr bool, err error) goja.Value {
-	if err != nil || isErr {
-		msg := ""
+		opts, _ := req.Opts.(map[string]any)
+		res, isErr, err := httpHostcall(ctx, opts)
 		if err != nil {
-			msg = err.Error()
-		} else {
-			msg = result
+			return hcResp{Err: err.Error()}
 		}
-		return rejectedPromise(vm, fmt.Errorf("%s", msg))
+		if isErr {
+			return hcResp{Err: res}
+		}
+		return hcResp{Result: res}
+
+	case "exec":
+		if !e.manifest.has(CapExec) {
+			return hcResp{Err: fmt.Sprintf("capability %q not granted", CapExec)}
+		}
+		payload := map[string]any{"command": req.Cmd + " " + strings.Join(req.Args, " ")}
+		r := e.dispatcher.NewRequest(HCKindExec, "bash", payload)
+		res, isErr, err := e.dispatcher.Dispatch(ctx, r)
+		if err != nil {
+			return hcResp{Err: err.Error()}
+		}
+		if isErr {
+			return hcResp{Err: res}
+		}
+		return hcResp{Result: res}
+
+	case "env":
+		if !e.manifest.has(CapEnv) || IsEnvBlocked(req.Key) {
+			return hcResp{}
+		}
+		return hcResp{Result: os.Getenv(req.Key)}
+
+	case "readFile":
+		if !e.manifest.has(CapFSRead) {
+			return hcResp{Err: fmt.Sprintf("capability %q not granted", CapFSRead)}
+		}
+		if !pathAllowed(req.Path, e.manifest.allowedPaths()) {
+			return hcResp{Err: fmt.Sprintf("path %q not in allowed paths", req.Path)}
+		}
+		data, err := os.ReadFile(req.Path)
+		if err != nil {
+			return hcResp{Err: err.Error()}
+		}
+		return hcResp{Result: string(data)}
+
+	case "writeFile":
+		if !e.manifest.has(CapFSWrite) {
+			return hcResp{Err: fmt.Sprintf("capability %q not granted", CapFSWrite)}
+		}
+		if !pathAllowed(req.Path, e.manifest.allowedPaths()) {
+			return hcResp{Err: fmt.Sprintf("path %q not in allowed paths", req.Path)}
+		}
+		if err := os.WriteFile(req.Path, []byte(req.Content), 0o644); err != nil {
+			return hcResp{Err: err.Error()}
+		}
+		return hcResp{}
+
+	case "log":
+		logHostcall(req.Entry)
+		return hcResp{}
+
+	case "session", "ui":
+		return hcResp{} // stubs
+
+	default:
+		return hcResp{Err: fmt.Sprintf("unknown hostcall kind %q", req.K)}
 	}
-	p, resolveFn, _ := vm.NewPromise()
-	_ = resolveFn(result)
-	return vm.ToValue(p)
 }
 
+// ── preamble ──────────────────────────────────────────────────────────────────
 
+// buildPreamble returns JS code that sets up console, process, require, and the
+// pi API. It is prepended to every extension before evaluation.
+//
+// stdout is reserved for the RPC protocol; console output goes to stderr.
+func buildPreamble(manifest Manifest) string {
+	var b strings.Builder
 
-// rejectedPromise creates a Promise pre-rejected with err.
-func rejectedPromise(vm *goja.Runtime, err error) goja.Value {
-	p, _, rejectFn := vm.NewPromise()
-	_ = rejectFn(vm.NewGoError(err))
-	return vm.ToValue(p)
+	// console → stderr so stdout stays clean for our RPC protocol.
+	b.WriteString(`;(function(){
+var _w=function(lvl){return function(){std.err.puts('[ext:'+lvl+'] '+Array.prototype.slice.call(arguments).join(' ')+'\n');};};
+console={log:_w('LOG'),info:_w('INF'),warn:_w('WRN'),error:_w('ERR')};
+print=function(){std.err.puts(Array.prototype.slice.call(arguments).join(' ')+'\n');};
+`)
+
+	// Synchronous JSON-over-pipes RPC bridge.
+	b.WriteString(`
+var __pi_rpc=function(req){
+  std.out.puts('HC:'+JSON.stringify(req)+'\n');
+  std.out.flush();
+  var resp=std.in.getline();
+  if(resp===null)throw new Error('pi: stdin closed');
+  var r=JSON.parse(resp);
+  if(r.err)throw new Error(r.err);
+  return r;
+};
+`)
+
+	// pi API.
+	b.WriteString(`
+pi={
+  tool:function(name,params){try{var r=__pi_rpc({k:'tool',name:name,params:params||{}});return Promise.resolve(r.result||'');}catch(e){return Promise.reject(e);}},
+  http:function(opts){try{var r=__pi_rpc({k:'http',opts:opts});return Promise.resolve(r.result||'');}catch(e){return Promise.reject(e);}},
+  exec:function(cmd,args){try{var r=__pi_rpc({k:'exec',cmd:cmd,args:args||[]});return Promise.resolve(r.result||'');}catch(e){return Promise.reject(e);}},
+  env:function(key){try{return __pi_rpc({k:'env',key:key}).result||'';}catch(e){return '';}},
+  session:function(){return Promise.resolve(null);},
+  ui:function(){return Promise.resolve(null);},
+  log:function(entry){try{__pi_rpc({k:'log',entry:entry});}catch(e){}},
+`)
+	if manifest.has(CapFSRead) {
+		b.WriteString(`  readFile:function(path){var r=__pi_rpc({k:'readFile',path:path});if(r.err)throw new Error(r.err);return r.result||'';},`)
+	}
+	if manifest.has(CapFSWrite) {
+		b.WriteString(`  writeFile:function(path,content){var r=__pi_rpc({k:'writeFile',path:path,content:content});if(r.err)throw new Error(r.err);},`)
+	}
+	b.WriteString(`};`)
+
+	// process shim.
+	envObj := "{}"
+	if manifest.has(CapEnv) {
+		var parts []string
+		for _, kv := range os.Environ() {
+			if k, v, ok := strings.Cut(kv, "="); ok && !IsEnvBlocked(k) {
+				kb, _ := json.Marshal(k)
+				vb, _ := json.Marshal(v)
+				parts = append(parts, string(kb)+":"+string(vb))
+			}
+		}
+		envObj = "{" + strings.Join(parts, ",") + "}"
+	}
+	platJ, _ := json.Marshal(goruntime.GOOS)
+	fmt.Fprintf(&b, "\nprocess={platform:%s,version:'v18.0.0',env:%s,exit:function(c){std.exit(c||0);}};\n", platJ, envObj)
+
+	// require shim (path + os modules).
+	sep := string(os.PathSeparator)
+	sepJ, _ := json.Marshal(sep)
+	home, _ := os.UserHomeDir()
+	homeJ, _ := json.Marshal(home)
+	tmpJ, _ := json.Marshal(os.TempDir())
+	eol := "\n"
+	if goruntime.GOOS == "windows" {
+		eol = "\r\n"
+	}
+	eolJ, _ := json.Marshal(eol)
+	fmt.Fprintf(&b, `
+require=function(mod){
+  switch(mod){
+  case 'path':return{
+    sep:%s,
+    join:function(){var p=Array.prototype.slice.call(arguments).join(%s);return p.replace(/\/{2,}/g,'/');},
+    dirname:function(p){var i=p.lastIndexOf(%s);return i<0?'.':(i===0?%s:p.slice(0,i));},
+    basename:function(p,x){var b=p.slice(p.lastIndexOf(%s)+1);return x&&b.endsWith(x)?b.slice(0,-x.length):b;},
+    extname:function(p){var b=p.slice(p.lastIndexOf(%s)+1);var i=b.lastIndexOf('.');return i<1?'':b.slice(i);},
+    resolve:function(){return Array.prototype.slice.call(arguments).join(%s);}
+  };
+  case 'os':return{EOL:%s,platform:function(){return process.platform;},homedir:function(){return %s;},tmpdir:function(){return %s;}};
+  default:throw new Error("require: module '"+mod+"' not available");
+  }
+};
+`, sepJ, sepJ, sepJ, sepJ, sepJ, sepJ, sepJ, eolJ, homeJ, tmpJ)
+
+	b.WriteString("})();")
+	return b.String()
 }
 
 // ── HTTP hostcall ─────────────────────────────────────────────────────────────
@@ -497,15 +516,11 @@ func httpHostcall(ctx context.Context, opts map[string]any) (string, bool, error
 	if m, ok := opts["method"].(string); ok && m != "" {
 		method = strings.ToUpper(m)
 	}
-
-	var bodyReader *strings.Reader
-	if body, ok := opts["body"].(string); ok && body != "" {
-		bodyReader = strings.NewReader(body)
-	} else {
-		bodyReader = strings.NewReader("")
+	bodyStr := ""
+	if b, ok := opts["body"].(string); ok {
+		bodyStr = b
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(bodyStr))
 	if err != nil {
 		return "", true, fmt.Errorf("pi.http: %w", err)
 	}
@@ -514,64 +529,29 @@ func httpHostcall(ctx context.Context, opts map[string]any) (string, bool, error
 			req.Header.Set(k, fmt.Sprint(v))
 		}
 	}
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", true, fmt.Errorf("pi.http: %w", err)
 	}
 	defer resp.Body.Close()
-
-	var buf strings.Builder
-	fmt.Fprintf(&buf, "HTTP %d\n", resp.StatusCode)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "HTTP %d\n", resp.StatusCode)
 	for k, vs := range resp.Header {
-		fmt.Fprintf(&buf, "%s: %s\n", k, strings.Join(vs, ", "))
+		fmt.Fprintf(&sb, "%s: %s\n", k, strings.Join(vs, ", "))
 	}
-	buf.WriteString("\n")
-
-	var body [1 << 20]byte // 1 MB cap
-	n, _ := resp.Body.Read(body[:])
-	buf.Write(body[:n])
-
-	isErr := resp.StatusCode >= 400
-	return buf.String(), isErr, nil
-}
-
-// ── legacy host API functions (kept for compatibility) ────────────────────────
-
-func readFileFunc(vm *goja.Runtime, allowed []string) func(goja.FunctionCall) goja.Value {
-	return func(call goja.FunctionCall) goja.Value {
-		path := call.Argument(0).String()
-		if !pathAllowed(path, allowed) {
-			panic(vm.NewGoError(fmt.Errorf("pi.readFile: path %q not in allowed paths", path)))
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			panic(vm.NewGoError(err))
-		}
-		return vm.ToValue(string(data))
-	}
-}
-
-func writeFileFunc(vm *goja.Runtime, allowed []string) func(goja.FunctionCall) goja.Value {
-	return func(call goja.FunctionCall) goja.Value {
-		path := call.Argument(0).String()
-		content := call.Argument(1).String()
-		if !pathAllowed(path, allowed) {
-			panic(vm.NewGoError(fmt.Errorf("pi.writeFile: path %q not in allowed paths", path)))
-		}
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			panic(vm.NewGoError(err))
-		}
-		return goja.Undefined()
-	}
+	sb.WriteString("\n")
+	var buf [1 << 20]byte
+	n, _ := resp.Body.Read(buf[:])
+	sb.Write(buf[:n])
+	return sb.String(), resp.StatusCode >= 400, nil
 }
 
 // pathAllowed reports whether path is under one of the allowed prefixes.
 func pathAllowed(path string, allowed []string) bool {
-	cleanPath := filepath.Clean(path)
+	clean := filepath.Clean(path)
 	for _, prefix := range allowed {
-		cleanPrefix := filepath.Clean(prefix)
-		if cleanPath == cleanPrefix || strings.HasPrefix(cleanPath, cleanPrefix+string(os.PathSeparator)) {
+		p := filepath.Clean(prefix)
+		if clean == p || strings.HasPrefix(clean, p+string(os.PathSeparator)) {
 			return true
 		}
 	}
