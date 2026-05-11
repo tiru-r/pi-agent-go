@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -92,7 +93,7 @@ func (c *Compactor) ShouldCompact(msgs []model.Message, measuredTokens int) bool
 // The second return value is the summary text; the caller may persist it as
 // a session compaction entry.
 func (c *Compactor) Compact(ctx context.Context, msgs []model.Message, system string) ([]model.Message, string, error) {
-	cut := findCutPoint(msgs, c.keepBudget())
+	cut := findCutPointMI(msgs, c.keepBudget(), system)
 	if cut == 0 {
 		return msgs, "", nil
 	}
@@ -165,6 +166,162 @@ func findCutPoint(msgs []model.Message, keepBudget int) int {
 		return 1
 	}
 	return 0
+}
+
+// findCutPointMI scores each message by TF-IDF term overlap with the system
+// prompt as a mutual-information proxy and keeps messages with highest scores
+// up to keepBudget tokens. Clean turn boundaries are respected the same way as
+// findCutPoint.  Falls back to findCutPoint when system is empty.
+func findCutPointMI(msgs []model.Message, keepBudget int, system string) int {
+	if system == "" {
+		return findCutPoint(msgs, keepBudget)
+	}
+
+	// Build TF-IDF reference from system prompt.
+	refTerms := tokeniseText(system)
+	if len(refTerms) == 0 {
+		return findCutPoint(msgs, keepBudget)
+	}
+	refTF := termFreq(refTerms)
+	n := len(msgs)
+
+	// Compute DF (document frequency) across all messages.
+	df := make(map[string]int, len(refTF))
+	for _, msg := range msgs {
+		text := msgText(msg)
+		seen := make(map[string]bool)
+		for _, t := range tokeniseText(text) {
+			if !seen[t] {
+				df[t]++
+				seen[t] = true
+			}
+		}
+	}
+
+	// Score each message: sum of TF-IDF weight * (1 if term in ref, else 0).
+	scores := make([]float64, n)
+	for i, msg := range msgs {
+		text := msgText(msg)
+		terms := tokeniseText(text)
+		tf := termFreq(terms)
+		score := 0.0
+		for term, msgTF := range tf {
+			if _, inRef := refTF[term]; inRef {
+				idf := math.Log(float64(n+1)/float64(df[term]+1)) + 1
+				score += msgTF * idf
+			}
+		}
+		scores[i] = score
+	}
+
+	// Rank messages by MI score descending, keep top-scoring up to keepBudget.
+	type scored struct {
+		idx   int
+		score float64
+	}
+	ranked := make([]scored, n)
+	for i, s := range scores {
+		ranked[i] = scored{i, s}
+	}
+	sort.Slice(ranked, func(a, b int) bool {
+		return ranked[a].score > ranked[b].score
+	})
+
+	kept := make([]bool, n)
+	budget := keepBudget
+	for _, r := range ranked {
+		tok := estimateMsgTokens(msgs[r.idx])
+		if tok > budget {
+			continue
+		}
+		kept[r.idx] = true
+		budget -= tok
+		if budget <= 0 {
+			break
+		}
+	}
+
+	// Find the earliest index NOT in the kept set to determine cut point.
+	// Walk backward like findCutPoint to prefer a clean boundary.
+	target := n
+	for i := range n {
+		if !kept[i] {
+			target = i
+			break
+		}
+	}
+	if target == n || target == 0 {
+		return 0
+	}
+
+	// Align to a clean turn boundary (same logic as findCutPoint).
+	for i := target; i > 0; i-- {
+		if msgs[i-1].Role == model.RoleAssistant && isRealUserMessage(msgs[i]) {
+			return i
+		}
+	}
+	for i := target + 1; i < n; i++ {
+		if msgs[i-1].Role == model.RoleAssistant && isRealUserMessage(msgs[i]) {
+			return i
+		}
+	}
+	if n > 1 {
+		return 1
+	}
+	return 0
+}
+
+// tokeniseText splits text into lowercase word tokens (non-alpha chars as delimiters).
+func tokeniseText(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if r >= 'a' && r <= 'z' {
+			cur.WriteRune(r)
+		} else {
+			if cur.Len() > 1 {
+				tokens = append(tokens, cur.String())
+			}
+			cur.Reset()
+		}
+	}
+	if cur.Len() > 1 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
+}
+
+// termFreq returns normalised term frequency (count/total) for a token slice.
+func termFreq(tokens []string) map[string]float64 {
+	counts := make(map[string]int, len(tokens))
+	for _, t := range tokens {
+		counts[t]++
+	}
+	n := float64(len(tokens))
+	if n == 0 {
+		n = 1
+	}
+	tf := make(map[string]float64, len(counts))
+	for t, c := range counts {
+		tf[t] = float64(c) / n
+	}
+	return tf
+}
+
+// msgText returns the plain-text content of a message for TF-IDF scoring.
+func msgText(msg model.Message) string {
+	var sb strings.Builder
+	for _, b := range msg.Content {
+		switch b.Type {
+		case model.ContentTypeText:
+			sb.WriteString(b.Text)
+			sb.WriteByte(' ')
+		case model.ContentTypeThinking:
+			sb.WriteString(b.Thinking)
+			sb.WriteByte(' ')
+		}
+	}
+	return sb.String()
 }
 
 // isRealUserMessage returns true when msg is a genuine user prompt, not a

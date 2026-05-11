@@ -2,73 +2,77 @@ package runtime
 
 import (
 	"math"
+	"math/rand"
 	"sync"
 )
 
 const attributionCap = 1000
 
+// StageShapley is a stage's Shapley-value attribution.
+type StageShapley struct {
+	Stage   string
+	Shapley float64 // fraction of total latency attributed via Shapley
+}
+
 // AttributionTracker records per-stage observations and computes weighted
 // bottleneck attribution with 95% confidence intervals.
+// Reservoir sampling (Algorithm R) replaces the FIFO ring buffer so that
+// high-load stages get unbiased random samples rather than recency-biased ones.
 type AttributionTracker struct {
-	mu   sync.Mutex
-	buf  [attributionCap]Observation
-	head int
-	n    int
+	mu      sync.Mutex
+	buf     [attributionCap]Observation
+	n       int // total observations seen (not capped)
+	filled  int // number of valid entries in buf (≤ attributionCap)
+	rng     *rand.Rand
 }
 
 // NewAttributionTracker constructs a ready-to-use AttributionTracker.
 func NewAttributionTracker() *AttributionTracker {
-	return &AttributionTracker{}
+	return &AttributionTracker{
+		rng: rand.New(rand.NewSource(42)), //nolint:gosec — deterministic seed for reproducibility
+	}
 }
 
-// Add appends an Observation to the ring buffer.
+// Add appends an Observation using Algorithm R reservoir sampling.
 func (a *AttributionTracker) Add(obs Observation) {
 	a.mu.Lock()
-	a.buf[a.head] = obs
-	a.head = (a.head + 1) % attributionCap
-	if a.n < attributionCap {
-		a.n++
+	defer a.mu.Unlock()
+	a.n++
+	if a.filled < attributionCap {
+		a.buf[a.filled] = obs
+		a.filled++
+	} else {
+		// Replace a random slot with probability cap/n.
+		j := a.rng.Intn(a.n)
+		if j < attributionCap {
+			a.buf[j] = obs
+		}
 	}
+}
+
+// snapshot returns a copy of the current reservoir under the lock.
+func (a *AttributionTracker) snapshot() []Observation {
+	a.mu.Lock()
+	out := make([]Observation, a.filled)
+	copy(out, a.buf[:a.filled])
 	a.mu.Unlock()
+	return out
 }
 
 // Report computes weighted bottleneck attribution across all stages seen.
 // Returns one StageAttribution per stage, sorted by WeightedShare descending.
 func (a *AttributionTracker) Report() []StageAttribution {
-	a.mu.Lock()
-	n := a.n
-	obs := make([]Observation, n)
-	start := 0
-	if n == attributionCap {
-		start = a.head
-	}
-	for i := range n {
-		obs[i] = a.buf[(start+i)%attributionCap]
-	}
-	a.mu.Unlock()
-
-	if n == 0 {
+	obs := a.snapshot()
+	if len(obs) == 0 {
 		return nil
 	}
 
-	// First pass: compute total latency per observation across all stages.
-	// Since observations are per-stage (one stage per Observation), the
-	// "total latency for observation i" is the sum of latencies of all
-	// observations with the same Weight bucket. However, the spec says
-	// t_i is the total latency across all stages for observation i.
-	// We interpret each Observation as a single-stage measurement and the
-	// denominator is the stage's contribution fraction over the entire window.
-	//
-	// weighted_contribution_s = (Σ_i∈s w_i * m_i) / (Σ_all w_i * m_i) * 100
-	//
-	// This is a normalised weighted sum approach consistent with the spec.
-
 	type stageAccum struct {
-		weightedLatSum float64 // Σ w_i * lat_i  for this stage
-		wSum           float64 // Σ w_i
-		wSumSq         float64 // Σ w_i²
-		shares         []float64 // per-observation latency share (pre-normalisation)
-		weights        []float64 // per-observation weights
+		weightedLatSum float64
+		wSum           float64
+		wSumSq         float64
+		shares         []float64
+		weights        []float64
 	}
 
 	stages := make(map[string]*stageAccum)
@@ -101,17 +105,12 @@ func (a *AttributionTracker) Report() []StageAttribution {
 	for stageName, s := range stages {
 		share := s.weightedLatSum / totalWeightedLat * 100
 
-		// Compute N_eff = (Σ w_i)² / Σ w_i²
 		neff := 0.0
 		if s.wSumSq > 0 {
 			neff = (s.wSum * s.wSum) / s.wSumSq
 		}
 
-		// Weighted mean latency share for this stage.
-		// Per-observation "share" is just the raw latency here.
-		wMean := s.weightedLatSum / s.wSum
-
-		// Weighted variance (Welford-style over the slice).
+		// Weighted variance (Welford-style).
 		wVar := 0.0
 		wSumAcc := 0.0
 		wMeanAcc := 0.0
@@ -126,9 +125,7 @@ func (a *AttributionTracker) Report() []StageAttribution {
 		if s.wSum > 0 {
 			wVar /= s.wSum
 		}
-		_ = wMean // used implicitly via share
 
-		// CI_95 = share ± 1.96 * sqrt(σ²_w / n_eff)
 		ciHalfWidth := 0.0
 		if neff > 0 {
 			ciHalfWidth = 1.96 * math.Sqrt(wVar/neff) / totalWeightedLat * 100
@@ -143,10 +140,123 @@ func (a *AttributionTracker) Report() []StageAttribution {
 		})
 	}
 
-	// Sort by WeightedShare descending.
 	for i := 1; i < len(result); i++ {
 		for j := i; j > 0 && result[j].WeightedShare > result[j-1].WeightedShare; j-- {
 			result[j], result[j-1] = result[j-1], result[j]
+		}
+	}
+
+	return result
+}
+
+// ShapleyReport computes Shapley-value attribution for each stage.
+//
+// For additive systems the Shapley value equals the weighted mean latency
+// share, which coincides with the marginal contribution averaged over all
+// insertion orderings.  For correlated stages (same Weight bucket) we use a
+// sampling-based approximation over random orderings.
+func (a *AttributionTracker) ShapleyReport() []StageShapley {
+	obs := a.snapshot()
+	if len(obs) == 0 {
+		return nil
+	}
+
+	// Group by Weight bucket (rounded to nearest 10) to detect correlation.
+	type stageData struct {
+		weightedLatSum float64
+		wSum           float64
+		bucket         int
+	}
+	stages := make(map[string]*stageData)
+	totalWLat := 0.0
+
+	for _, o := range obs {
+		lat := o.Latency.Seconds()
+		w := o.Weight
+		if w <= 0 {
+			w = 1
+		}
+		totalWLat += w * lat
+		if _, ok := stages[o.Stage]; !ok {
+			bucket := int(w/10) * 10
+			stages[o.Stage] = &stageData{bucket: bucket}
+		}
+		s := stages[o.Stage]
+		s.weightedLatSum += w * lat
+		s.wSum += w
+	}
+
+	if totalWLat == 0 {
+		return nil
+	}
+
+	// Check for correlated buckets.
+	bucketCount := make(map[int]int)
+	for _, s := range stages {
+		bucketCount[s.bucket]++
+	}
+	correlated := false
+	for _, c := range bucketCount {
+		if c > 1 {
+			correlated = true
+			break
+		}
+	}
+
+	result := make([]StageShapley, 0, len(stages))
+
+	if !correlated {
+		// Additive case: Shapley = weighted mean latency share.
+		for name, s := range stages {
+			shapley := 0.0
+			if s.wSum > 0 {
+				shapley = (s.weightedLatSum / totalWLat)
+			}
+			result = append(result, StageShapley{Stage: name, Shapley: shapley})
+		}
+	} else {
+		// Sampling-based Shapley over 200 random coalition orderings.
+		stageNames := make([]string, 0, len(stages))
+		for name := range stages {
+			stageNames = append(stageNames, name)
+		}
+		m := len(stageNames)
+		marginals := make(map[string]float64, m)
+
+		a.mu.Lock()
+		rng := a.rng
+		a.mu.Unlock()
+
+		const numSamples = 200
+		for range numSamples {
+			// Random permutation.
+			perm := rng.Perm(m)
+			var cumLat float64
+			for _, idx := range perm {
+				name := stageNames[idx]
+				s := stages[name]
+				share := s.weightedLatSum / totalWLat
+				marginals[name] += share - cumLat
+				cumLat += share
+			}
+		}
+		for name, sum := range marginals {
+			shapley := sum / numSamples
+			if shapley < 0 {
+				shapley = 0
+			}
+			result = append(result, StageShapley{Stage: name, Shapley: shapley})
+		}
+	}
+
+	// Normalise so values sum to 1.
+	total := 0.0
+	for _, r := range result {
+		total += r.Shapley
+	}
+	if total > 0 {
+		for i := range result {
+			result[i].Shapley /= total
 		}
 	}
 

@@ -10,7 +10,7 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 - **8 built-in tools** — read, write, edit, bash, grep, find, ls, hashline_edit
 - **Full agentic loop** — LLM → tools → LLM cycles inside Zed's chat panel
 - **Session memory** — multi-turn conversation history maintained per Zed session
-- **Runtime intelligence** — CUSUM+BOCPD regime detection, conformal anomaly gating, PAC-Bayes safety bounds, off-policy evaluation, VOI experiment scheduling, weighted attribution, and OCO control (see [Runtime Intelligence](#runtime-intelligence))
+- **Runtime intelligence** — 13 math-driven subsystems covering observability, safety, planning, and agent protocol (see [Runtime Intelligence](#runtime-intelligence))
 - **JavaScript + native extensions** — load custom tools from `~/.pi/extensions/` (goja JS VM or subprocess JSON protocol)
 - **One API key** — `OPENROUTER_API_KEY` is all you need
 - **Tiny binary** — 4 direct dependencies (cobra, uuid, sqlite, goja)
@@ -131,18 +131,44 @@ Internal:  runtime/report  →  RuntimeReport JSON (regime, anomaly, OPE, attrib
 
 ## Runtime Intelligence
 
-Pi's `internal/runtime` package implements seven math-driven decision systems that run continuously alongside every agent session. The goal is safer policy decisions, faster recovery from workload shifts, and more trustworthy performance attribution — not formulas in docs.
+Pi's `internal/runtime` package implements 13 math-driven subsystems that run continuously alongside every agent session. They are grouped into four concern areas: observability, safety, planning, and agent protocol.
 
-### Regime-Shift Detection — CUSUM + BOCPD
+### Observability
+
+#### Regime-shift detection — CUSUM + BOCPD
 
 Two complementary detectors run on every LLM and tool latency sample:
 
 - **CUSUM** (two-sided, k=0.5, h=5.0) catches *persistent drift* — a slow mean shift that accumulates over time.
 - **BOCPD** (Adams & MacKay 2007, λ=50) catches *sudden regime changes* — a spike in P(r=0|x₁:t) without brittle fixed thresholds. Uses a Normal-Gamma conjugate prior with log-space run-length posteriors pruned to 500 hypotheses.
 
-`RegimeDetector` fires when either detector alarms and exposes the BOCPD posterior mode as the estimated change point.
+Output drift runs a parallel pair of CUSUM detectors on response token length and tool call rate, independent of latency, to catch model behavior changes.
 
-### Conformal Prediction Envelope
+#### HDR histogram — tail latency
+
+Per-stage and global HDR histograms with 200 log-spaced bins covering 100 µs–30 s track p50, p95, p99, and p999 latency without allocating per-observation memory. Means cannot hide tail behavior that affects the interactive experience of a coding agent.
+
+#### Reservoir sampling — unbiased attribution
+
+`AttributionTracker` uses Algorithm R reservoir sampling (n=1000) instead of a FIFO ring buffer. Under high tool-call load, every stage gets a statistically uniform random sample regardless of arrival order — not a recency-biased window skewed toward the most recent stage.
+
+#### Shapley-value attribution
+
+`ShapleyReport()` computes each stage's Shapley value — its average marginal contribution to total latency across all insertion orderings. For uncorrelated stages the Shapley value equals the weighted latency share (fast path). For correlated stages (same weight bucket) it uses 200 random coalition samples. Shapley values sum to 1.0 and give a fair blame decomposition in the presence of correlated tool chains.
+
+#### Expected calibration error
+
+`ECECalibrator` bins (probability, outcome) pairs into 10 equal-width buckets and computes:
+
+```
+ECE = Σ_b |acc(b) − conf(b)| · |b| / n
+```
+
+ECE close to 0 means the agent's confidence scores predict outcomes accurately. Rising ECE indicates miscalibrated probability estimates that cannot be trusted for downstream safety decisions.
+
+### Safety & Reliability
+
+#### Conformal prediction envelope
 
 A sliding window (n=200) of nonconformity scores |xₜ − μₜ| provides an *adaptive* anomaly threshold:
 
@@ -152,7 +178,18 @@ q = score[⌈(n+1)·0.95⌉−1]     anomaly if |xₜ − μₜ| > q
 
 The threshold tightens automatically when behavior stabilises and widens when variance is high — no static latency cutoff.
 
-### PAC-Bayes Safety Bound
+#### Conformal quantile UQ
+
+`ConformalPredictor` maintains a 500-point sliding window of calibration residuals and returns distribution-free 95% prediction intervals for the next latency observation:
+
+```
+q̂ = sorted_residuals[⌈(n+1)·0.95⌉−1]
+interval = [center − q̂,  center + q̂]
+```
+
+This is model-free: it makes no parametric assumption about the latency distribution, unlike the PAC-Bayes bound which requires conjugate priors.
+
+#### PAC-Bayes safety bound
 
 Before allowing aggressive policy moves, the safety envelope computes a PAC-Bayes-kl upper bound on the true error rate:
 
@@ -162,7 +199,17 @@ kl(q̂, q_bound) ≤ (KL(Q‖P) + ln(2√n/δ)) / n
 
 Solved via bisection. `PACBayesSafety.Veto(maxErr)` returns true — failing closed — when the upper bound exceeds `maxErr`.
 
-### Off-Policy Evaluation — IPS / WIS / DR + ESS + Regret Gate
+#### Circuit breaker
+
+A `CircuitBreaker` per stage (keyed by "llm", "tool:bash", etc.) prevents cascade failure when a backend degrades:
+
+- **CLOSED** — normal; failures accumulate toward threshold (default 5)
+- **OPEN** — fast-fail for `timeout` (default 30 s); no requests forwarded
+- **HALF-OPEN** — one probe allowed; consecutive successes (default 2) close the circuit
+
+The breaker is updated on every `Monitor.Observe()` call alongside the latency subsystems. `Monitor.CircuitBreakerFor(stage).Allow()` lets callers gate dispatch before sending work.
+
+#### Off-policy evaluation — IPS / WIS / DR + ESS + regret gate
 
 Candidate policy changes are evaluated from trace data before being applied:
 
@@ -172,54 +219,86 @@ V̂_IPS = (1/n) Σ wᵢrᵢ
 V̂_WIS = Σ wᵢrᵢ / Σ wᵢ
 V̂_DR  = (1/n) Σ (r̂ᵢ + wᵢ(rᵢ − r̂ᵢ))
 N_eff  = (Σ wᵢ)² / Σ wᵢ²
-Δ_regret = r̄_baseline − V̂_DR
+median_regret = median(r̄ − V̂_IPS, r̄ − V̂_WIS, r̄ − V̂_DR)
 ```
 
-`ShouldVeto` returns true if N_eff < 5 (insufficient support) or regret exceeds threshold.
+Median regret across all three estimators is used for the veto decision; a single mis-specified estimator cannot trigger or suppress it alone.
 
-### VOI-Driven Experiment Selection
+#### Token-budget guardrail
 
-The VOI planner schedules diagnostic probes by highest expected value per unit cost:
+`Agent.TokenBudget` enforces a hard ceiling on cumulative `InputTokens` per session run. `Options.TurnTokenBudget` adds an independent per-turn ceiling. When either limit is exceeded the agent emits `EventKindError` and returns immediately — preventing runaway cost in long Zed sessions.
 
-```
-priorityᵢ ∝ utilityᵢ / overheadᵢ
-```
+### Planning & Optimization
 
-Only stale probes (TTL expired) within the overhead budget are considered. `Next(budget)` returns the best candidate or nil.
+#### Thompson sampling / Bayesian bandit
 
-### Weighted Bottleneck Attribution
+Each registered probe carries a Beta(α, β) posterior over its utility. `UpdateUtility` shifts the posterior: high observed learning increments α, low increments β. Probe selection in `Plan` and `Next` draws a sample from each Beta distribution via the regularised incomplete beta inverse CDF (Newton–Raphson with Lentz continued fraction), multiplied by 1/overhead. This gives uncertainty-aware exploration: stale or under-tried probes get a chance even when their mean utility is lower than an established probe's.
 
-Per-stage latency is weighted by session message count to reflect realistic workload distribution:
+DAgger-style policy transfer runs in `MarkRun`: when a probe's utility significantly exceeds its Beta prior mean plus one standard deviation, all other probe utilities are nudged upward by δ — a lightweight imitation of the discovered superior policy.
 
-```
-weighted_contribution_s = (Σ wᵢ·mᵢ,s) / (Σ wᵢ·tᵢ) · 100     wᵢ = session_messages
-n_eff = (Σ wᵢ)² / Σ wᵢ²
-CI₉₅  = μ ± 1.96 · √(σ²_w / n_eff)
-```
+#### MCTS probe planning
 
-`AttributionTracker.Report()` returns per-stage shares with 95% confidence intervals — ranking optimisation work by actual end-to-end impact.
-
-### Online Convex Control + Regret Rollback
-
-A continuous parameter tuner (controlling e.g. concurrency or timeout scaling) adapts via projected gradient descent:
+`Monitor.PlanProbes(budget)` uses UCB1 Monte Carlo Tree Search when two or more stale probes are available:
 
 ```
-τₜ₊₁ = clip(τₜ − η·∇L, τ_min, τ_max)
+UCB1(node) = Q(s,a)/N(s,a) + C·√(ln N(s) / N(s,a))     C = 1.414
 ```
 
-If instantaneous loss exceeds the rollback threshold, `τ` reverts immediately to the last known safe value. Default: τ ∈ [0.1, 10], η=0.05, rollback at loss > 2.0.
+State = (remaining budget, set of run probes). Action = run next probe. Reward = cumulative utility. The MCTS runs 500 iterations by default and returns probes in priority order. It degrades gracefully to the greedy VOI plan when only one stale probe exists.
+
+#### Online convex control + regret rollback
+
+A continuous parameter tuner adapts routing weights, batch budgets, and backoff factors per stage via projected gradient descent with oscillation damping:
+
+```
+τₜ₊₁ = clip(τₜ − η_eff·∇L, τ_min, τ_max)
+```
+
+The effective step size η_eff is halved for each gradient sign flip above threshold, preventing the controller from hunting. Starvation recovery boosts weights when a stage has low queue depth and low error rate simultaneously.
+
+### Agent Protocol
+
+#### Semantic cache
+
+`SemanticCache` caches (prompt → response) pairs using Jaccard similarity over character 3-grams as a semantic proxy:
+
+```
+J(A, B) = |A ∩ B| / |A ∪ B|     A, B = sets of char 3-grams
+```
+
+A lookup returns a cached response when the best-match similarity exceeds the threshold (default 0.85). LRU eviction at 512 entries. The cache is wired into the OpenRouter provider; tool-use requests are never cached (their results depend on live filesystem/shell state).
+
+#### Information-theoretic compaction
+
+Context compaction uses TF-IDF term overlap with the system prompt as an MI proxy to rank messages by informativeness. `findCutPointMI` keeps the highest-MI messages up to the token budget rather than simply dropping the oldest ones, then aligns the cut to a clean assistant→user turn boundary. This preserves high-information error traces and failed tool calls that a recency-based cut would discard precisely when they are most needed.
+
+#### Trace distillation
+
+`session.Distill` reads all sessions from SQLite, scores each by a quality heuristic — penalising tool errors, rewarding natural stops and session conciseness — and exports high-quality traces as JSONL for offline fine-tuning.
+
+The OpenRouter provider accepts a `DistillSink` for online knowledge distillation data collection: every completed non-tool response is passed as a (prompt, model, response, timestamp) record to the sink, which appends it as JSONL.
 
 ### Summary
 
-| Subsystem | File | Trigger |
+| Subsystem | File | Concern |
 |---|---|---|
-| CUSUM + BOCPD | `runtime/detector.go` | Every LLM/tool latency sample |
-| Conformal envelope | `runtime/conformal.go` | Every latency sample |
-| PAC-Bayes safety | `runtime/safety.go` | Every success/error event |
-| IPS/WIS/DR + ESS | `runtime/ope.go` | Every logged policy trace |
-| VOI planner | `runtime/voi.go` | On-demand probe selection |
-| Weighted attribution | `runtime/attribution.go` | Rolled up on `Report()` |
-| OCO controller | `runtime/controller.go` | Every latency sample |
+| CUSUM + BOCPD + output drift | `runtime/detector.go` | Observability |
+| HDR histogram (p50/p95/p99/p999) | `runtime/histogram.go` | Observability |
+| Reservoir sampling attribution | `runtime/attribution.go` | Observability |
+| Shapley-value attribution | `runtime/attribution.go` | Observability |
+| ECE calibration error | `runtime/ece.go` | Observability |
+| Conformal anomaly envelope | `runtime/conformal.go` | Safety |
+| Conformal quantile UQ | `runtime/quantile.go` | Safety |
+| PAC-Bayes safety bound | `runtime/safety.go` | Safety |
+| Circuit breaker (per stage) | `runtime/circuitbreaker.go` | Safety |
+| IPS/WIS/DR OPE + regret gate | `runtime/ope.go` | Safety |
+| Token-budget guardrail | `agent/agent.go` | Safety |
+| Thompson sampling / Bayesian bandit | `runtime/voi.go` | Planning |
+| MCTS probe planning | `runtime/mcts.go` | Planning |
+| OCO controller + rollback | `runtime/controller.go` | Planning |
+| Semantic cache | `runtime/semantic_cache.go` | Agent protocol |
+| MI-based context compaction | `agent/compaction.go` | Agent protocol |
+| Trace + knowledge distillation | `session/distill.go` | Agent protocol |
 
 All subsystems are wired through `runtime.Monitor`, attached to the ACP server, and fed from `session_agent.go`. The full report is available via the `runtime/report` internal ACP method.
 
@@ -445,7 +524,16 @@ Sessions live in `~/.pi/agent/sessions/` as `.jsonl` files (one JSON object per 
 
 ### Context compaction
 
-When conversation history grows large, pi automatically summarises older messages and continues from the trimmed context.
+When conversation history grows large, pi automatically compacts older messages. The compaction algorithm scores each message by TF-IDF term overlap with the system prompt (as an MI proxy) and keeps the highest-information messages up to the token budget — preserving error traces and failed tool calls that a recency-only cut would drop.
+
+### Trace distillation
+
+```bash
+# Export high-quality sessions as JSONL for fine-tuning (score ≥ 0.7)
+session.Distill(store, "distill-out.jsonl", 0.7)
+```
+
+Quality score: 1.0 for clean sessions ending with a natural stop; penalised for tool errors and verbose turn counts. The OpenRouter provider can optionally write every completed response to a `JSONLDistillSink` for knowledge distillation data collection.
 
 ---
 
@@ -463,24 +551,35 @@ internal/
 │   ├── provider.go          Provider interface + Request / Event types
 │   ├── factory/factory.go   Builds the OpenRouter provider from config
 │   └── openrouter/
-│       ├── openrouter.go    OpenRouter streaming (OpenAI-compatible SSE)
+│       ├── openrouter.go    OpenRouter streaming + semantic cache + distill sink
 │       └── models.go        Live model list from /api/v1/models
 ├── agent/
-│   ├── agent.go             Core agentic loop (stream → tools → stream)
+│   ├── agent.go             Core agentic loop + token-budget guardrail
 │   ├── session_agent.go     Session-aware wrapper (feeds runtime.Monitor)
-│   └── compaction.go        Context compaction
+│   └── compaction.go        MI-based context compaction
 ├── acp/acp.go               Zed ACP server (JSON-RPC 2.0 over stdio)
 ├── runtime/
 │   ├── metrics.go           Shared types (Observation, PolicyTrace, RuntimeReport)
-│   ├── detector.go          CUSUM + BOCPD regime-shift detection
+│   ├── detector.go          CUSUM + BOCPD latency + output drift detection
 │   ├── conformal.go         Conformal prediction anomaly envelope
+│   ├── histogram.go         HDR histogram — p50/p95/p99/p999 tail latency
+│   ├── ece.go               Expected Calibration Error tracker
 │   ├── safety.go            PAC-Bayes-kl safety bound + veto
+│   ├── circuitbreaker.go    Per-stage circuit breaker (CLOSED/OPEN/HALF-OPEN)
+│   ├── quantile.go          Conformal quantile UQ — distribution-free intervals
 │   ├── ope.go               Off-policy evaluator (IPS/WIS/DR + ESS + regret gate)
-│   ├── voi.go               VOI-driven experiment scheduler
-│   ├── attribution.go       Weighted bottleneck attribution + CI₉₅
-│   ├── controller.go        OCO online controller with rollback
+│   ├── voi.go               Thompson sampling VOI planner + DAgger policy transfer
+│   ├── mcts.go              UCB1 MCTS for multi-probe planning
+│   ├── attribution.go       Reservoir-sampled attribution + Shapley values
+│   ├── semantic_cache.go    Semantic cache (Jaccard 3-gram, LRU)
+│   ├── controller.go        OCO controller — routing weights, batch budget, backoff
 │   └── monitor.go           Top-level Monitor wiring all subsystems
-├── session/                 JSONL + SQLite persistence
+├── session/
+│   ├── session.go           Session types and JSONL persistence
+│   ├── sqlite.go            SQLite session index
+│   ├── index.go             Session listing helpers
+│   ├── metrics.go           Session-level usage metrics
+│   └── distill.go           Trace distillation + JSONLDistillSink
 ├── tools/tools.go           8 built-in tools
 ├── extensions/
 │   ├── manager.go           Extension discovery, trust registry, repair
@@ -499,11 +598,11 @@ internal/
 
 **New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model and thinking level per conversation; Zed's UI controls drive both via `session/set_config_option` and `session/set_model`.
 
-**OpenRouter-native.** Every request goes through OpenRouter's OpenAI-compatible `/v1/chat/completions` endpoint. Pi passes OpenRouter's full provider preferences API through: `provider.order` and `allow_fallbacks` for routing, `data_collection: "deny"` for privacy, `quantization` for quantization level selection, and fallback model lists (route="fallback"). The `HTTP-Referer` and `X-Title` headers are set from `openrouter_site_url` / `openrouter_app_name` in config, which appear on your OpenRouter dashboard.
+**OpenRouter-native.** Every request goes through OpenRouter's OpenAI-compatible `/v1/chat/completions` endpoint. Pi passes OpenRouter's full provider preferences API through: `provider.order` and `allow_fallbacks` for routing, `data_collection: "deny"` for privacy, `quantization` for quantization level selection, and fallback model lists (route="fallback"). The `HTTP-Referer` and `X-Title` headers are set from `openrouter_site_url` / `openrouter_app_name` in config.
 
 **Extended thinking maps to Anthropic budget_tokens.** Each level maps to a fixed token budget passed upstream: off=0, minimal=1024, low=2048, medium=8192, high=16384, xhigh=32768. Thinking detection (which models support it) is inferred from the model ID — no hardcoded allowlist.
 
-**Minimal dependencies.** 4 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `goja` (pure-Go JS VM for extensions). The runtime intelligence package uses only stdlib (`math`, `sort`, `sync`).
+**Minimal dependencies.** 4 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `goja` (pure-Go JS VM for extensions). The entire runtime intelligence package uses only stdlib (`math`, `sort`, `sync`, `container/list`).
 
 **Tool execution is parallel.** All tool calls from a single assistant turn run concurrently (capped at 4 goroutines), results fed back in one user turn.
 
@@ -528,12 +627,12 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 
 | | |
 |---|---|
-| Go source files | 29 |
-| Lines of code | ~5,900 |
+| Go source files | 37 |
+| Lines of code | ~8,500 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |
 | Thinking levels | 6 (off / minimal / low / medium / high / xhigh) |
-| Runtime subsystems | 7 |
+| Runtime subsystems | 17 |
 | Direct dependencies | 4 |
 | Go version | 1.24+ |

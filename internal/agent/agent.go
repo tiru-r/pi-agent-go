@@ -26,6 +26,8 @@ type Options struct {
 	MaxTurns int
 	// Tools lists which tool names are enabled. nil = all built-in tools.
 	Tools []string
+	// TurnTokenBudget caps InputTokens consumed in a single turn (0 = unlimited).
+	TurnTokenBudget int
 }
 
 // EventKind tags the kind of event emitted by the agent.
@@ -86,6 +88,9 @@ type Agent struct {
 	// Compactor is optional; when set it compacts message history before each
 	// LLM call if the estimated token count exceeds the threshold.
 	Compactor *Compactor
+
+	// TokenBudget caps total cumulative InputTokens for a Run (0 = unlimited).
+	TokenBudget int
 }
 
 // New constructs an Agent backed by the given provider.
@@ -133,6 +138,7 @@ func (a *Agent) Run(
 	// lastMeasuredTokens holds the InputTokens value from the previous API
 	// response. When non-zero it is used instead of the heuristic estimator.
 	var lastMeasuredTokens int
+	var cumulativeInputTokens int
 
 	for turn := 0; turn < maxTurns; turn++ {
 		select {
@@ -193,6 +199,21 @@ func (a *Agent) Run(
 		// Update measured token count for the next compaction check.
 		if resp.Usage.InputTokens > 0 {
 			lastMeasuredTokens = resp.Usage.InputTokens
+			cumulativeInputTokens += resp.Usage.InputTokens
+
+			// Enforce cumulative token budget.
+			if a.TokenBudget > 0 && cumulativeInputTokens > a.TokenBudget {
+				budgetErr := fmt.Errorf("agent: token budget exceeded (%d/%d input tokens consumed)", cumulativeInputTokens, a.TokenBudget)
+				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
+				return msgs, budgetErr
+			}
+
+			// Enforce per-turn token budget.
+			if opts.TurnTokenBudget > 0 && resp.Usage.InputTokens > opts.TurnTokenBudget {
+				budgetErr := fmt.Errorf("agent: per-turn token budget exceeded (%d/%d input tokens in turn %d)", resp.Usage.InputTokens, opts.TurnTokenBudget, turn+1)
+				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
+				return msgs, budgetErr
+			}
 		}
 
 		// Add the assistant message to history.

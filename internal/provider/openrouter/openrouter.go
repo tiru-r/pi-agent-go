@@ -16,16 +16,31 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/httpclient"
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/runtime"
 	"github.com/tiru-r/pi-agent-go/internal/sse"
 )
 
 const baseURL = "https://openrouter.ai/api/v1/chat/completions"
+
+// DistillSink receives completed (prompt, response, model) triples for
+// knowledge distillation data collection.
+type DistillSink interface {
+	Record(prompt string, response string, model string)
+}
 
 // Provider implements provider.Provider for OpenRouter.
 type Provider struct {
 	apiKey  string
 	siteURL string // HTTP-Referer header value — shown on openrouter.ai dashboard
 	appName string // X-Title header value — shown on openrouter.ai dashboard
+
+	// SemanticCache is optional; when set, completed responses are cached and
+	// future requests with ≥threshold similarity are served from cache.
+	SemanticCache *runtime.SemanticCache
+
+	// DistillSink is optional; when set, completed responses are forwarded for
+	// knowledge distillation data collection.
+	DistillSink DistillSink
 }
 
 // New creates an OpenRouter provider.
@@ -156,7 +171,34 @@ type orUsage struct {
 
 // ── Stream ────────────────────────────────────────────────────────────────────
 
+// promptKey returns a cache key string for the request (system + user turns).
+func promptKey(req *provider.Request) string {
+	var sb strings.Builder
+	sb.WriteString(req.System)
+	for _, m := range req.Messages {
+		sb.WriteByte('|')
+		sb.WriteString(string(m.Role))
+		sb.WriteByte(':')
+		sb.WriteString(m.Text())
+	}
+	return sb.String()
+}
+
 func (p *Provider) Stream(ctx context.Context, req *provider.Request) (<-chan provider.Event, error) {
+	// Semantic cache lookup — only for non-tool requests to keep safety tight.
+	if p.SemanticCache != nil && len(req.Tools) == 0 {
+		key := promptKey(req)
+		if cached, hit := p.SemanticCache.Lookup(key); hit {
+			ch := make(chan provider.Event, 4)
+			go func() {
+				defer close(ch)
+				ch <- provider.Event{Type: provider.EventTextDelta, Text: cached}
+				ch <- provider.Event{Type: provider.EventMessageStop, StopReason: model.StopReasonEndTurn}
+			}()
+			return ch, nil
+		}
+	}
+
 	body, err := p.buildRequest(req)
 	if err != nil {
 		return nil, err
@@ -172,7 +214,32 @@ func (p *Provider) Stream(ctx context.Context, req *provider.Request) (<-chan pr
 	go func() {
 		defer close(ch)
 		defer rc.Close()
-		p.parseStream(ctx, rc, ch)
+
+		if p.SemanticCache != nil || p.DistillSink != nil {
+			// Intercept the stream to capture the full response text.
+			interceptCh := make(chan provider.Event, 64)
+			go p.parseStream(ctx, rc, interceptCh)
+
+			var textBuf strings.Builder
+			for ev := range interceptCh {
+				if ev.Type == provider.EventTextDelta {
+					textBuf.WriteString(ev.Text)
+				}
+				ch <- ev
+			}
+			resp := textBuf.String()
+			if resp != "" {
+				key := promptKey(req)
+				if p.SemanticCache != nil && len(req.Tools) == 0 {
+					p.SemanticCache.Store(key, resp)
+				}
+				if p.DistillSink != nil {
+					p.DistillSink.Record(key, resp, req.Model)
+				}
+			}
+		} else {
+			p.parseStream(ctx, rc, ch)
+		}
 	}()
 	return ch, nil
 }

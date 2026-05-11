@@ -251,3 +251,70 @@ func (d *RegimeDetector) State() (alarm bool, changePoint int) {
 	defer d.mu.Unlock()
 	return d.alarm, d.cpMode
 }
+
+// ── OutputDriftDetector ───────────────────────────────────────────────────────
+
+// QualityObservation carries proxy quality signals for one agent turn.
+type QualityObservation struct {
+	TokenLength  int
+	ToolCallRate float64
+}
+
+// OutputDriftDetector runs CUSUM on response token length and tool call rate
+// to detect output / concept drift independent of latency drift.
+type OutputDriftDetector struct {
+	mu sync.Mutex
+
+	tokenStats  runningStats
+	tokenCUSUM  cusum
+	tokenAlarm  bool
+
+	rateStats runningStats
+	rateCUSUM cusum
+	rateAlarm bool
+}
+
+// NewOutputDriftDetector returns a ready-to-use OutputDriftDetector.
+func NewOutputDriftDetector() *OutputDriftDetector {
+	return &OutputDriftDetector{}
+}
+
+// Update ingests one quality observation and updates alarm state.
+func (o *OutputDriftDetector) Update(q QualityObservation) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// Token length CUSUM.
+	tMean, tStd := o.tokenStats.meanStd()
+	o.tokenStats.push(float64(q.TokenLength))
+	tz := (float64(q.TokenLength) - tMean) / tStd
+	if o.tokenCUSUM.update(tz) {
+		o.tokenAlarm = true
+		o.tokenCUSUM.reset()
+	}
+
+	// Tool call rate CUSUM.
+	rMean, rStd := o.rateStats.meanStd()
+	o.rateStats.push(q.ToolCallRate)
+	rz := (q.ToolCallRate - rMean) / rStd
+	if o.rateCUSUM.update(rz) {
+		o.rateAlarm = true
+		o.rateCUSUM.reset()
+	}
+}
+
+// Alarm returns true when either the token-length or tool-call-rate CUSUM has
+// fired since the last call to ClearAlarm.
+func (o *OutputDriftDetector) Alarm() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.tokenAlarm || o.rateAlarm
+}
+
+// ClearAlarm resets both alarm flags.
+func (o *OutputDriftDetector) ClearAlarm() {
+	o.mu.Lock()
+	o.tokenAlarm = false
+	o.rateAlarm = false
+	o.mu.Unlock()
+}

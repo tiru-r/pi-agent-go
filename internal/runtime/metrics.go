@@ -39,6 +39,15 @@ type StageAttribution struct {
 	Neff          float64
 }
 
+// CircuitBreakerStateMap maps stage names to their breaker state.
+type CircuitBreakerStateMap map[string]CBState
+
+// QuantileInterval is a conformal prediction interval.
+type QuantileInterval struct {
+	Lo float64
+	Hi float64
+}
+
 // RuntimeReport is a full snapshot of all subsystem states.
 type RuntimeReport struct {
 	RegimeShift  bool
@@ -52,4 +61,22 @@ type RuntimeReport struct {
 	ShardStates  map[string]ShardStatus // per-stage routing/batch/backoff state
 	Attribution  []StageAttribution
 	NextProbe    *ProbeSpec
+
+	// HDR histogram percentiles (seconds) aggregated across all stages.
+	HDRP50  float64
+	HDRP95  float64
+	HDRP99  float64
+	HDRP999 float64
+
+	// Expected Calibration Error from the ECE subsystem.
+	ECE float64
+
+	// Per-stage circuit breaker states.
+	CircuitBreakers CircuitBreakerStateMap
+
+	// Conformal prediction interval for the next latency observation.
+	LatencyInterval QuantileInterval
+
+	// OutputDriftAlarm is true when token-length or tool-call-rate CUSUM fires.
+	OutputDriftAlarm bool
 }
