@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	defaultMaxIter    = 20
-	maxToolConcurrency = 4
+	defaultMaxIter  = 20
+	maxBashWorkers  = 4 // bash spawns real OS processes; cap to avoid CPU saturation
 )
 
 // SessionAgent is a session-aware agent that persists conversation history
@@ -201,27 +201,33 @@ func (a *SessionAgent) Run(
 	return fmt.Errorf("session_agent: max iterations (%d) exceeded", maxIter)
 }
 
-// runTools executes all tool uses concurrently (up to maxToolConcurrency at a
-// time) and returns result ContentBlocks in the same order as uses.
+// bashSem caps concurrent bash tool calls to avoid OS process saturation.
+// I/O-bound tools (read, write, grep, find, ls, edit, hashline_edit) run
+// without a cap — Go parks blocked goroutines for free.
+var bashSem = make(chan struct{}, maxBashWorkers)
+
+// runTools executes all tool uses concurrently and returns result
+// ContentBlocks in the same order as uses.
 func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) []model.ContentBlock {
 	results := make([]model.ContentBlock, len(uses))
-	sem := make(chan struct{}, maxToolConcurrency)
 	var wg sync.WaitGroup
 	for i, use := range uses {
 		wg.Add(1)
 		go func(i int, block model.ContentBlock) {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				results[i] = model.ContentBlock{
-					Type:      model.ContentTypeToolResult,
-					ToolUseID: block.ID,
-					IsError:   true,
-					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+			if block.Name == "bash" {
+				select {
+				case bashSem <- struct{}{}:
+					defer func() { <-bashSem }()
+				case <-ctx.Done():
+					results[i] = model.ContentBlock{
+						Type:      model.ContentTypeToolResult,
+						ToolUseID: block.ID,
+						IsError:   true,
+						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+					}
+					return
 				}
-				return
 			}
 			results[i] = a.runTool(ctx, block)
 		}(i, use)

@@ -686,7 +686,7 @@ internal/
 
 **Minimal dependencies.** 5 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `wazero` (WASM runtime), `wazero-quickjs` (QuickJS-WASI for JS extensions). The entire runtime intelligence package uses only stdlib (`math`, `sort`, `sync`, `container/list`).
 
-**Parallel tool execution.** All tool calls from a single assistant turn run concurrently, capped at 4 goroutines via a semaphore. Each goroutine respects context cancellation while waiting for a slot. Results are collected in original order (by `ToolUseID`) and event callbacks are serialized with a mutex. Both the `Agent` (`pi run`) and `SessionAgent` (ACP/Zed) paths share this design.
+**Parallel tool execution.** All tool calls from a single assistant turn run in their own goroutine — no blanket concurrency cap. I/O-bound tools (`read`, `write`, `edit`, `grep`, `find`, `ls`, `hashline_edit`) park the goroutine in the OS and cost nothing while blocked. `bash` is the only tool that spawns real OS processes and could saturate CPU, so a semaphore (default 4) throttles only bash calls. Results land in original order via a pre-allocated slice indexed by position. The `onEvent` callback is serialized with a mutex since it writes to stdout or the ACP wire. Both the `Agent` (`pi run`) and `SessionAgent` (ACP/Zed) paths share this design.
 
 **QuickJS-WASI sandbox.** JavaScript extensions run in an isolated WebAssembly instance compiled once per process and cached. Each tool invocation creates a fresh QuickJS instance communicating with Go via a synchronous JSON-over-pipes RPC protocol — stdout carries `HC:{json}` hostcall requests; stdin carries responses. Stdout is reserved for the RPC protocol; `console.*` output goes to stderr.
 

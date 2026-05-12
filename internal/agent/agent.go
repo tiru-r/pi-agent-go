@@ -409,7 +409,6 @@ func executeTools(
 	}
 
 	results := make([]model.ContentBlock, len(calls))
-	sem := make(chan struct{}, maxToolConcurrency)
 
 	// emit serialises onEvent calls; the callback may write to stdout/ACP and
 	// is not safe for concurrent use.
@@ -426,14 +425,28 @@ func executeTools(
 		go func(i int, block model.ContentBlock) {
 			defer wg.Done()
 
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
+			// bash spawns real OS processes; cap concurrency to avoid saturation.
+			// All other tools are I/O-bound and run without a semaphore.
+			if block.Name == "bash" {
+				select {
+				case bashSem <- struct{}{}:
+					defer func() { <-bashSem }()
+				case <-ctx.Done():
+					result := model.ContentBlock{
+						Type:      model.ContentTypeToolResult,
+						ToolUseID: block.ID,
+						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+						IsError:   true,
+					}
+					emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+					results[i] = result
+					return
+				}
+			} else if err := ctx.Err(); err != nil {
 				result := model.ContentBlock{
 					Type:      model.ContentTypeToolResult,
 					ToolUseID: block.ID,
-					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: err.Error()}},
 					IsError:   true,
 				}
 				emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
