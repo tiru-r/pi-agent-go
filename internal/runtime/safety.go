@@ -19,9 +19,9 @@ type PACBayesSafety struct {
 // NewPACBayesSafety constructs a PACBayesSafety with default parameters.
 func NewPACBayesSafety() *PACBayesSafety {
 	return &PACBayesSafety{
-		klQP:  1.0,
+		klQP:  0.0,
 		delta: 0.05,
-		minN:  10,
+		minN:  20,
 	}
 }
 
@@ -108,10 +108,11 @@ func (p *PACBayesSafety) Bound() (empiricalErr, upperBound float64) {
 func (p *PACBayesSafety) Veto(maxErrRate float64) bool {
 	p.mu.Lock()
 	n := p.n
+	errors := p.errors
 	minN := p.minN
 	p.mu.Unlock()
 
-	if n < minN {
+	if n < minN || errors == 0 {
 		return false
 	}
 	_, upper := p.Bound()

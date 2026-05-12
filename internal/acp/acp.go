@@ -768,7 +768,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	}
 
 	ag := agent.New(s.provider, modelID, system, maxTokens)
-	ag.Monitor = s.monitor
+	ag.Monitor = runtime.NewMonitor()
 	ag.Hooks = s.extMgr
 	ag.Compactor = s.makeCompactor(modelID)
 
