@@ -538,26 +538,18 @@ line-delimited JSON-RPC 2.0.  You do not normally call this yourself.`,
 }
 
 func runACPServer(gf *globalFlags) error {
-	ctx := context.Background()
 	cfg, err := loadConfig(gf)
 	if err != nil {
 		return err
 	}
-
-	// Load extensions at ACP startup so all sessions share the same tool set.
-	extMgr, err := loadExtensions(ctx, cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[warn] extensions: %v\n", err)
-	}
-	if extMgr != nil {
-		defer extMgr.Close()
-	}
-
+	// Extensions are loaded inside acp.New — registering them here too would
+	// double-register every extension tool into the global registry.
 	srv, err := acp.New(cfg)
 	if err != nil {
 		return fmt.Errorf("acp: %w", err)
 	}
-	return srv.Serve(ctx)
+	defer srv.Close()
+	return srv.Serve(context.Background())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

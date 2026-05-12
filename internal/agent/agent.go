@@ -57,6 +57,7 @@ const (
 	EventKindText        EventKind = "text"
 	EventKindThinking    EventKind = "thinking"
 	EventKindToolStart   EventKind = "tool_start"
+	EventKindToolExec    EventKind = "tool_exec" // full input ready, about to execute
 	EventKindToolDone    EventKind = "tool_done"
 	EventKindError       EventKind = "error"
 	EventKindDone        EventKind = "done"
@@ -69,9 +70,10 @@ type AgentEvent struct {
 	// EventKindText / EventKindThinking
 	Delta string
 
-	// EventKindToolStart
-	ToolID   string
-	ToolName string
+	// EventKindToolStart / EventKindToolExec
+	ToolID    string
+	ToolName  string
+	ToolInput json.RawMessage // populated for EventKindToolExec only
 
 	// EventKindToolDone
 	ToolResult model.ContentBlock
@@ -432,6 +434,13 @@ func executeTools(
 		if hooks != nil {
 			hooks.RunBeforeTool(ctx, block.Name, params)
 		}
+
+		onEvent(AgentEvent{
+			Kind:      EventKindToolExec,
+			ToolID:    block.ID,
+			ToolName:  block.Name,
+			ToolInput: params,
+		})
 
 		t0tool := time.Now()
 		toolResult, err := t.Execute(ctx, params)

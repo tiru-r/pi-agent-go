@@ -102,6 +102,25 @@ func Register(t Tool) {
 	BuiltinTools = append(BuiltinTools, t)
 }
 
+// ============================================================================
+// Working directory context
+// ============================================================================
+
+type cwdCtxKey struct{}
+
+// WithCWD returns a copy of ctx carrying the working directory for tools.
+func WithCWD(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, cwdCtxKey{}, dir)
+}
+
+// CWD returns the working directory stored in ctx, or "" if not set.
+func CWD(ctx context.Context) string {
+	if dir, ok := ctx.Value(cwdCtxKey{}).(string); ok {
+		return dir
+	}
+	return ""
+}
+
 // ToDefinitions converts all built-in tools to model.ToolDefinition slice.
 func ToDefinitions() []model.ToolDefinition {
 	defs := make([]model.ToolDefinition, 0, len(BuiltinTools))
@@ -436,6 +455,9 @@ func (b *bashTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	// are waited for before the shell exits, preventing orphaned processes.
 	wrappedCmd := "trap 'wait' EXIT\n" + p.Command
 	cmd := exec.Command("bash", "-c", wrappedCmd)
+	if dir := CWD(ctx); dir != "" {
+		cmd.Dir = dir
+	}
 	// Put the process in its own group so we can SIGTERM/SIGKILL the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 

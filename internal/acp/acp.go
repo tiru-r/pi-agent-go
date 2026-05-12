@@ -100,6 +100,7 @@ type acpImpl struct {
 // acpCapabilities declares agent feature support per the ACP spec.
 type acpCapabilities struct {
 	LoadSession        bool                   `json:"loadSession,omitempty"`
+	ModelSelector      bool                   `json:"modelSelector,omitempty"`
 	PromptCapabilities *acpPromptCapabilities `json:"promptCapabilities,omitempty"`
 }
 
@@ -194,6 +195,55 @@ type acpSessionCloseParams struct {
 	SessionID string `json:"sessionId"`
 }
 
+// acpInitParams is the Zed → pi initialize request body.
+type acpInitParams struct {
+	ProtocolVersion    int             `json:"protocolVersion"`
+	ClientInfo         json.RawMessage `json:"clientInfo,omitempty"`
+	ClientCapabilities json.RawMessage `json:"clientCapabilities,omitempty"`
+}
+
+// acpSessionNewParams is the Zed → pi session/new request body.
+type acpSessionNewParams struct {
+	CWD string `json:"cwd,omitempty"`
+}
+
+// acpSessionLoadParams is the Zed → pi session/load request body.
+type acpSessionLoadParams struct {
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd,omitempty"`
+}
+
+type acpSessionLoadResult struct {
+	SessionID     string         `json:"sessionId"`
+	ConfigOptions []acpConfigOpt `json:"configOptions,omitempty"`
+}
+
+// ── Tool update types ─────────────────────────────────────────────────────────
+
+type acpToolUseNotifParams struct {
+	SessionID string           `json:"sessionId"`
+	Update    acpToolUseUpdate `json:"update"`
+}
+
+type acpToolUseUpdate struct {
+	SessionUpdate string          `json:"sessionUpdate"` // "agent_tool_use"
+	ToolUseID     string          `json:"toolUseId"`
+	Name          string          `json:"name"`
+	Input         json.RawMessage `json:"input,omitempty"`
+}
+
+type acpToolResultNotifParams struct {
+	SessionID string              `json:"sessionId"`
+	Update    acpToolResultUpdate `json:"update"`
+}
+
+type acpToolResultUpdate struct {
+	SessionUpdate string       `json:"sessionUpdate"` // "agent_tool_result"
+	ToolUseID     string       `json:"toolUseId"`
+	Content       []acpContent `json:"content"`
+	IsError       bool         `json:"isError,omitempty"`
+}
+
 // flexString unmarshals JSON that may arrive as a plain string or as an array
 // of content blocks (e.g. [{type:"text",text:"…"}]).
 type flexString string
@@ -228,6 +278,7 @@ type sessionState struct {
 	modelID    string
 	thinkLevel model.ThinkingLevel
 	mode       agent.AgentMode
+	cwd        string // project root from session/new or session/load
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -341,6 +392,16 @@ func setupDebugLog(cfg *config.Config) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})))
 }
 
+// Close releases resources held by the server (extension runtimes, SQLite).
+func (s *Server) Close() {
+	if s.extMgr != nil {
+		s.extMgr.Close()
+	}
+	if s.sqliteStore != nil {
+		_ = s.sqliteStore.Close()
+	}
+}
+
 // Serve reads line-delimited JSON from stdin and dispatches each message.
 func (s *Server) Serve(ctx context.Context) error {
 	in := bufio.NewReader(os.Stdin)
@@ -365,6 +426,8 @@ func (s *Server) Serve(ctx context.Context) error {
 		switch req.Method {
 		case "session/prompt":
 			go s.handleSessionPrompt(ctx, &req)
+		case "session/load":
+			go s.handleSessionLoad(&req)
 		default:
 			s.dispatch(ctx, &req)
 		}
@@ -402,28 +465,44 @@ func (s *Server) handleRuntimeReport(req *request) {
 }
 
 func (s *Server) handleInitialize(req *request) {
+	if req.Params != nil {
+		var p acpInitParams
+		if err := json.Unmarshal(req.Params, &p); err == nil && p.ProtocolVersion != 0 {
+			if p.ProtocolVersion != protocolVersion {
+				s.sendError(rawID(req.ID), -32600,
+					fmt.Sprintf("unsupported protocol version %d (server supports %d)", p.ProtocolVersion, protocolVersion))
+				return
+			}
+		}
+	}
 	s.sendResult(rawID(req.ID), acpInitResult{
 		ProtocolVersion: protocolVersion,
 		AgentInfo:       acpImpl{Name: "pi", Version: "1.0.0"},
 		AgentCapabilities: &acpCapabilities{
+			LoadSession:   true,
+			ModelSelector: true,
 			PromptCapabilities: &acpPromptCapabilities{
 				Image:           true,
 				EmbeddedContext: true,
 			},
 		},
-		AuthMethods: []any{}, // empty = no auth methods (ACP spec: default is [])
+		AuthMethods: []any{},
 	})
 }
 
 func (s *Server) handleSessionNew(req *request) {
+	// Parse optional params — Zed sends {cwd: "/path/to/project"}.
+	var p acpSessionNewParams
+	if req.Params != nil {
+		_ = json.Unmarshal(req.Params, &p)
+	}
+
 	// Wait up to 5 s for the background model fetch.
 	select {
 	case <-s.modelsReady:
 	case <-time.After(5 * time.Second):
 		slog.Warn("model fetch timed out during session/new")
 	}
-
-	id := newSessionID()
 
 	// Strip provider prefix that may have been stored in old configs.
 	modelID := strings.TrimPrefix(s.cfg.Model, "openrouter/")
@@ -445,11 +524,18 @@ func (s *Server) handleSessionNew(req *request) {
 		}
 	}
 
+	// Use the file's UUID as the ACP session ID so session/load can round-trip.
+	id := newSessionID()
+	if sess != nil {
+		id = sess.ID
+	}
+
 	newState := &sessionState{
 		sess:       sess,
 		modelID:    modelID,
 		thinkLevel: thinkLevel,
 		mode:       agent.AgentModeAct,
+		cwd:        p.CWD,
 	}
 	s.sessionsMu.Lock()
 	s.sessions[id] = newState
@@ -532,19 +618,34 @@ func (s *Server) handleSessionSetModel(req *request) {
 
 	s.sessionsMu.Lock()
 	sess.modelID = p.ModelID
+	modelID := sess.modelID
+	thinkLevel := sess.thinkLevel
+	mode := sess.mode
 	s.sessionsMu.Unlock()
 
-	s.sendResult(rawID(req.ID), map[string]any{})
+	s.modelsMu.RLock()
+	models := s.models
+	s.modelsMu.RUnlock()
+
+	s.sendResult(rawID(req.ID), acpSetConfigResult{
+		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, mode, models),
+	})
 }
 
 func (s *Server) handleSessionCancel(req *request) {
 	if req.Params == nil {
+		if req.ID != nil {
+			s.sendResult(rawID(req.ID), map[string]any{})
+		}
 		return
 	}
 	var p struct {
 		SessionID string `json:"sessionId"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil {
+		if req.ID != nil {
+			s.sendError(rawID(req.ID), -32602, "invalid params: "+err.Error())
+		}
 		return
 	}
 	s.cancelsMu.Lock()
@@ -552,6 +653,9 @@ func (s *Server) handleSessionCancel(req *request) {
 		fn()
 	}
 	s.cancelsMu.Unlock()
+	if req.ID != nil {
+		s.sendResult(rawID(req.ID), map[string]any{})
+	}
 }
 
 func (s *Server) handleSessionClose(req *request) {
@@ -603,9 +707,6 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 		return
 	}
 
-	// Expand @file tokens so Zed users can reference local files.
-	prompt := expandAtFilesACP(string(p.Prompt))
-
 	cctx, cancel := context.WithCancel(ctx)
 	s.cancelsMu.Lock()
 	s.cancels[p.SessionID] = cancel
@@ -633,6 +734,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 			modelID:    strings.TrimPrefix(s.cfg.Model, "openrouter/"),
 			thinkLevel: model.ThinkingLevel(s.cfg.ThinkingLevel),
 			mode:       agent.AgentModeAct,
+			cwd:        "",
 		}
 		s.sessionsMu.Lock()
 		s.sessions[p.SessionID] = ss
@@ -643,10 +745,19 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	modelID := ss.modelID
 	thinkLevel := ss.thinkLevel
 	agentMode := ss.mode
+	cwd := ss.cwd
 	fileSess := ss.sess
 	history := make([]model.Message, len(ss.msgs))
 	copy(history, ss.msgs)
 	s.sessionsMu.RUnlock()
+
+	// Expand @file tokens relative to the project working directory.
+	prompt := expandAtFilesACP(string(p.Prompt), cwd)
+
+	// Inject cwd into context so tools (bash, etc.) run in the right directory.
+	if cwd != "" {
+		cctx = tools.WithCWD(cctx, cwd)
+	}
 
 	historyLen := len(history)
 
@@ -680,11 +791,11 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 				s.sendSessionUpdate(p.SessionID, "agent_thought_chunk", ev.Delta)
 			}
 		case agent.EventKindToolStart:
-			s.sendSessionUpdate(p.SessionID, "agent_message_chunk",
-				fmt.Sprintf("\n[tool: %s]\n", ev.ToolName))
-			slog.Debug("tool start", "name", ev.ToolName)
+			slog.Debug("tool queued", "name", ev.ToolName)
+		case agent.EventKindToolExec:
+			s.sendToolUseUpdate(p.SessionID, ev.ToolID, ev.ToolName, ev.ToolInput)
 		case agent.EventKindToolDone:
-			slog.Debug("tool done", "name", ev.ToolResult.Name)
+			s.sendToolResultUpdate(p.SessionID, ev.ToolResult)
 		case agent.EventKindDone:
 			finalStop = ev.StopReason
 			finalUsage = ev.Usage
@@ -744,6 +855,124 @@ func (s *Server) sendSessionUpdate(sessionID, updateType, text string) {
 		Update: acpUpdate{
 			SessionUpdate: updateType,
 			Content:       acpContent{Type: "text", Text: text},
+		},
+	})
+}
+
+// handleSessionLoad loads a prior session from disk, registers it, replays
+// assistant history as session/update notifications, then returns the result.
+func (s *Server) handleSessionLoad(req *request) {
+	if req.Params == nil {
+		s.sendError(rawID(req.ID), -32602, "params required")
+		return
+	}
+	var p acpSessionLoadParams
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.sendError(rawID(req.ID), -32602, "invalid params: "+err.Error())
+		return
+	}
+	if p.SessionID == "" {
+		s.sendError(rawID(req.ID), -32602, "sessionId is required")
+		return
+	}
+
+	// If already resident in memory, return immediately.
+	if existing := s.getSession(p.SessionID); existing != nil {
+		s.modelsMu.RLock()
+		models := s.models
+		s.modelsMu.RUnlock()
+		s.sendResult(rawID(req.ID), acpSessionLoadResult{
+			SessionID:     p.SessionID,
+			ConfigOptions: s.makeConfigOptions(existing.modelID, existing.thinkLevel, existing.mode, models),
+		})
+		return
+	}
+
+	path := filepath.Join(s.cfg.SessionDir, p.SessionID+".jsonl")
+	sess, err := session.Open(path)
+	if err != nil {
+		s.sendError(rawID(req.ID), -32001, "session not found: "+p.SessionID)
+		return
+	}
+
+	modelID := strings.TrimPrefix(s.cfg.Model, "openrouter/")
+	thinkLevel := model.ThinkingLevel(s.cfg.ThinkingLevel)
+	if thinkLevel == "" {
+		thinkLevel = model.ThinkingLevelOff
+	}
+
+	msgs := sess.Messages()
+	s.sessionsMu.Lock()
+	s.sessions[p.SessionID] = &sessionState{
+		sess:       sess,
+		msgs:       msgs,
+		modelID:    modelID,
+		thinkLevel: thinkLevel,
+		mode:       agent.AgentModeAct,
+		cwd:        p.CWD,
+	}
+	s.sessionsMu.Unlock()
+
+	// Replay assistant messages so Zed can reconstruct the conversation thread.
+	for _, msg := range msgs {
+		if msg.Role != model.RoleAssistant {
+			continue
+		}
+		for _, block := range msg.Content {
+			switch block.Type {
+			case model.ContentTypeText:
+				if block.Text != "" {
+					s.sendSessionUpdate(p.SessionID, "agent_message_chunk", block.Text)
+				}
+			case model.ContentTypeThinking:
+				if block.Thinking != "" {
+					s.sendSessionUpdate(p.SessionID, "agent_thought_chunk", block.Thinking)
+				}
+			}
+		}
+	}
+
+	s.modelsMu.RLock()
+	models := s.models
+	s.modelsMu.RUnlock()
+
+	s.sendResult(rawID(req.ID), acpSessionLoadResult{
+		SessionID:     p.SessionID,
+		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, agent.AgentModeAct, models),
+	})
+}
+
+// sendToolUseUpdate sends an agent_tool_use session/update notification.
+func (s *Server) sendToolUseUpdate(sessionID, toolID, name string, input json.RawMessage) {
+	s.sendNotification("session/update", acpToolUseNotifParams{
+		SessionID: sessionID,
+		Update: acpToolUseUpdate{
+			SessionUpdate: "agent_tool_use",
+			ToolUseID:     toolID,
+			Name:          name,
+			Input:         input,
+		},
+	})
+}
+
+// sendToolResultUpdate sends an agent_tool_result session/update notification.
+func (s *Server) sendToolResultUpdate(sessionID string, result model.ContentBlock) {
+	var contents []acpContent
+	for _, c := range result.Content {
+		if c.Type == model.ContentTypeText {
+			contents = append(contents, acpContent{Type: "text", Text: c.Text})
+		}
+	}
+	if contents == nil {
+		contents = []acpContent{}
+	}
+	s.sendNotification("session/update", acpToolResultNotifParams{
+		SessionID: sessionID,
+		Update: acpToolResultUpdate{
+			SessionUpdate: "agent_tool_result",
+			ToolUseID:     result.ToolUseID,
+			Content:       contents,
+			IsError:       result.IsError,
 		},
 	})
 }
@@ -913,10 +1142,15 @@ func rawID(raw json.RawMessage) any {
 var atFileRe = regexp.MustCompile(`@(\S+)`)
 
 // expandAtFilesACP replaces @filepath tokens in s with the file's contents.
-// Unreadable paths are left unchanged.
-func expandAtFilesACP(s string) string {
+// Relative paths are resolved against cwd when provided. Unreadable paths are
+// left unchanged.
+func expandAtFilesACP(s, cwd string) string {
 	return atFileRe.ReplaceAllStringFunc(s, func(match string) string {
-		data, err := os.ReadFile(match[1:]) // strip leading @
+		path := match[1:] // strip leading @
+		if cwd != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(cwd, path)
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return match
 		}
