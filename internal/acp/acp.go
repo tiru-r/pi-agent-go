@@ -89,7 +89,7 @@ type acpInitResult struct {
 	ProtocolVersion   int              `json:"protocolVersion"`
 	AgentInfo         acpImpl          `json:"agentInfo"`
 	AgentCapabilities *acpCapabilities `json:"agentCapabilities,omitempty"`
-	AuthMethods       []any            `json:"authMethods"` // empty = no auth required
+	AuthMethods       []any            `json:"authMethods"` // empty array = no auth required (ACP spec default)
 }
 
 type acpImpl struct {
@@ -411,7 +411,7 @@ func (s *Server) handleInitialize(req *request) {
 				EmbeddedContext: true,
 			},
 		},
-		AuthMethods: []any{}, // empty = no auth required, agent handles auth internally
+		AuthMethods: []any{}, // empty = no auth methods (ACP spec: default is [])
 	})
 }
 
@@ -483,7 +483,7 @@ func (s *Server) handleSessionSetConfigOption(req *request) {
 
 	sess := s.getSession(p.SessionID)
 	if sess == nil {
-		s.sendError(rawID(req.ID), -32000, "session not found: "+p.SessionID)
+		s.sendError(rawID(req.ID), -32001, "session not found: "+p.SessionID)
 		return
 	}
 
@@ -526,7 +526,7 @@ func (s *Server) handleSessionSetModel(req *request) {
 
 	sess := s.getSession(p.SessionID)
 	if sess == nil {
-		s.sendError(rawID(req.ID), -32000, "session not found: "+p.SessionID)
+		s.sendError(rawID(req.ID), -32001, "session not found: "+p.SessionID)
 		return
 	}
 
@@ -697,7 +697,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	}
 	if err != nil {
 		slog.Warn("session/prompt agent error", "err", err)
-		s.sendError(rawID(req.ID), -32000, "agent error: "+err.Error())
+		s.sendError(rawID(req.ID), -32001, "agent error: "+err.Error())
 		return
 	}
 
