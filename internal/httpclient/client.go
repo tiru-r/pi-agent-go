@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"time"
 )
@@ -110,7 +111,7 @@ func PostJSONStream(ctx context.Context, url string, headers map[string]string, 
 
 	delay := retryBaseDelay
 	var lastErr error
-	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
+	for attempt := range retryMaxAttempts {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -121,6 +122,8 @@ func PostJSONStream(ctx context.Context, url string, headers map[string]string, 
 			if delay > retryMaxDelay {
 				delay = retryMaxDelay
 			}
+			// Add up to 25% jitter to avoid thundering herd on concurrent retries.
+			delay += time.Duration(rand.Int63n(int64(delay/4) + 1)) //nolint:gosec
 		}
 
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))

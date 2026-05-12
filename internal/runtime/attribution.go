@@ -3,6 +3,7 @@ package runtime
 import (
 	"math"
 	"math/rand"
+	"sort"
 	"sync"
 )
 
@@ -140,11 +141,9 @@ func (a *AttributionTracker) Report() []StageAttribution {
 		})
 	}
 
-	for i := 1; i < len(result); i++ {
-		for j := i; j > 0 && result[j].WeightedShare > result[j-1].WeightedShare; j-- {
-			result[j], result[j-1] = result[j-1], result[j]
-		}
-	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].WeightedShare > result[j].WeightedShare
+	})
 
 	return result
 }
@@ -223,14 +222,17 @@ func (a *AttributionTracker) ShapleyReport() []StageShapley {
 		m := len(stageNames)
 		marginals := make(map[string]float64, m)
 
+		// Seed a local RNG from the shared source under lock, then release the lock.
+		// Using the shared rng pointer outside the lock would race with Add().
 		a.mu.Lock()
-		rng := a.rng
+		seed := a.rng.Int63()
 		a.mu.Unlock()
+		localRng := rand.New(rand.NewSource(seed))
 
 		const numSamples = 200
 		for range numSamples {
 			// Random permutation.
-			perm := rng.Perm(m)
+			perm := localRng.Perm(m)
 			var cumLat float64
 			for _, idx := range perm {
 				name := stageNames[idx]

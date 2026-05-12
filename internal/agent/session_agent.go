@@ -209,6 +209,12 @@ var bashSem = make(chan struct{}, maxBashWorkers)
 // runTools executes all tool uses concurrently and returns result
 // ContentBlocks in the same order as uses.
 func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) []model.ContentBlock {
+	// Build a name→tool map once so each goroutine does an O(1) lookup.
+	toolMap := make(map[string]tools.Tool, len(a.Tools))
+	for _, t := range a.Tools {
+		toolMap[t.Name()] = t
+	}
+
 	results := make([]model.ContentBlock, len(uses))
 	var wg sync.WaitGroup
 	for i, use := range uses {
@@ -229,7 +235,7 @@ func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) 
 					return
 				}
 			}
-			results[i] = a.runTool(ctx, block)
+			results[i] = a.runTool(ctx, block, toolMap)
 		}(i, use)
 	}
 	wg.Wait()
@@ -237,24 +243,18 @@ func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) 
 }
 
 // runTool executes a single tool call and returns a tool_result ContentBlock.
-func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock) model.ContentBlock {
+// toolMap is the pre-built name→tool index from the caller's a.Tools slice.
+func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock, toolMap map[string]tools.Tool) model.ContentBlock {
 	result := model.ContentBlock{
 		Type:      model.ContentTypeToolResult,
 		ToolUseID: block.ID,
 	}
 
-	// Resolve the tool.
-	var t tools.Tool
-	for _, candidate := range a.Tools {
-		if candidate.Name() == block.Name {
-			t = candidate
-			break
-		}
-	}
-	if t == nil {
-		// Fall back to built-in tools.
-		t2, ok := tools.Get(block.Name)
-		if !ok {
+	// Resolve the tool: check caller-provided tools first, then built-ins.
+	t, ok := toolMap[block.Name]
+	if !ok {
+		t2, ok2 := tools.Get(block.Name)
+		if !ok2 {
 			result.IsError = true
 			result.Content = []model.ContentBlock{{
 				Type: model.ContentTypeText,

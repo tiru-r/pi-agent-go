@@ -69,10 +69,26 @@ func betaSample(alpha, beta float64, rng *rand.Rand) float64 {
 }
 
 // betaInvCDF approximates the quantile function of Beta(a, b) at p ∈ (0,1)
-// using a Newton–Raphson iteration initialised by the mean a/(a+b).
+// using Newton–Raphson with a mode-biased starting guess.
 func betaInvCDF(p, a, b float64) float64 {
-	// Starting guess: mean of the distribution.
-	x := a / (a + b)
+	// Starting guess: mode when the distribution is unimodal (a>1, b>1),
+	// otherwise the mean. The mode is a better seed than the mean for
+	// skewed Betas because it lies closer to the high-density region.
+	var x float64
+	if a > 1 && b > 1 {
+		x = (a - 1) / (a + b - 2)
+	} else {
+		x = a / (a + b)
+	}
+	// For very extreme quantiles, bias the seed further toward the tail so the
+	// Newton step converges in fewer iterations.
+	if p < 0.05 && a >= 1 {
+		x = math.Min(x, math.Pow(p, 1/a))
+	} else if p > 0.95 && b >= 1 {
+		x = math.Max(x, 1-math.Pow(1-p, 1/b))
+	}
+	x = math.Max(1e-9, math.Min(1-1e-9, x))
+
 	logB, _ := math.Lgamma(a + b)
 	logB -= func() float64 { v, _ := math.Lgamma(a); return v }()
 	logB -= func() float64 { v, _ := math.Lgamma(b); return v }()

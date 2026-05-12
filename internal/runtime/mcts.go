@@ -43,6 +43,9 @@ func MCTSPlan(probes []ProbeSpec, budget float64, iterations int) []ProbeSpec {
 	root := &mctsNode{actionIdx: -1, budget: budget}
 	const ucbC = 1.414
 
+	// Local RNG avoids global lock contention and makes simulations independent.
+	localRng := rand.New(rand.NewSource(rand.Int63())) //nolint:gosec
+
 	for range iterations {
 		// Selection: traverse to a promising leaf.
 		node := root
@@ -89,7 +92,7 @@ func MCTSPlan(probes []ProbeSpec, budget float64, iterations int) []ProbeSpec {
 				cands = append(cands, i)
 			}
 		}
-		rand.Shuffle(len(cands), func(a, b int) { cands[a], cands[b] = cands[b], cands[a] })
+		localRng.Shuffle(len(cands), func(a, b int) { cands[a], cands[b] = cands[b], cands[a] })
 		for _, i := range cands {
 			p := probes[i]
 			if p.Overhead > simBudget {

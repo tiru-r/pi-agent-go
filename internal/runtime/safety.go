@@ -87,7 +87,7 @@ func (p *PACBayesSafety) Bound() (empiricalErr, upperBound float64) {
 		return qHat, hi
 	}
 
-	for range 100 {
+	for range 60 {
 		mid := (lo + hi) / 2
 		if binaryKL(qHat, mid) < rhs {
 			lo = mid
