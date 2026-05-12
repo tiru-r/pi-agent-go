@@ -90,8 +90,9 @@ func betaInvCDF(p, a, b float64) float64 {
 	x = math.Max(1e-9, math.Min(1-1e-9, x))
 
 	logB, _ := math.Lgamma(a + b)
-	logB -= func() float64 { v, _ := math.Lgamma(a); return v }()
-	logB -= func() float64 { v, _ := math.Lgamma(b); return v }()
+	lgA, _ := math.Lgamma(a)
+	lgB, _ := math.Lgamma(b)
+	logB -= lgA + lgB
 
 	for range 30 {
 		// CDF value at x.

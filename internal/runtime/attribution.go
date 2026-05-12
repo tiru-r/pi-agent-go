@@ -231,15 +231,12 @@ func (a *AttributionTracker) ShapleyReport() []StageShapley {
 
 		const numSamples = 200
 		for range numSamples {
-			// Random permutation.
 			perm := localRng.Perm(m)
-			var cumLat float64
 			for _, idx := range perm {
 				name := stageNames[idx]
 				s := stages[name]
-				share := s.weightedLatSum / totalWLat
-				marginals[name] += share - cumLat
-				cumLat += share
+				// For additive v(S), marginal contribution of i is always share_i.
+				marginals[name] += s.weightedLatSum / totalWLat
 			}
 		}
 		for name, sum := range marginals {
