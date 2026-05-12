@@ -153,7 +153,16 @@ remove_path_entries() {
     [ -f "$rc" ] || continue
     grep -qF "$PATH_MARKER" "$rc" 2>/dev/null || continue
     local tmp="${rc}.pi-uninstall.tmp"
-    grep -vF "$PATH_MARKER" "$rc" > "$tmp" || true
+    # Remove the PATH export line and any blank line immediately before it.
+    awk -v marker="$PATH_MARKER" '
+      BEGIN { n=0 }
+      index($0, marker) {
+        if (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--
+        next
+      }
+      { buf[++n] = $0 }
+      END { for (i=1; i<=n; i++) print buf[i] }
+    ' "$rc" > "$tmp"
     mv "$tmp" "$rc"
     ok "Removed PATH entry from ${rc}"
     touched=1

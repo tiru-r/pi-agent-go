@@ -169,7 +169,7 @@ build_binary() {
 
   cd "$src_dir"
   go build \
-    -ldflags "-s -w -X github.com/tiru-r/pi-agent-go/internal/cli.Version=${version}" \
+    -ldflags "-s -w -X main.Version=${version}" \
     -o "$src_dir/pi" \
     ./cmd/pi/
 

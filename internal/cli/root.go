@@ -5,7 +5,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"text/tabwriter"
@@ -15,6 +18,7 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/acp"
 	"github.com/tiru-r/pi-agent-go/internal/agent"
 	"github.com/tiru-r/pi-agent-go/internal/config"
+	"github.com/tiru-r/pi-agent-go/internal/doctor"
 	"github.com/tiru-r/pi-agent-go/internal/extensions"
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
@@ -67,6 +71,7 @@ func NewRootCmd() *cobra.Command {
 		newDoctorCmd(),
 		newConfigCmd(&gf),
 		newVersionCmd(),
+		newUpdateCmd(),
 		newACPCmd(&gf),
 	)
 
@@ -424,30 +429,18 @@ func newDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Run health checks",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("Pi doctor")
-			fmt.Println()
-
 			cfg, err := config.Load()
 			if err != nil {
-				fmt.Printf("  [FAIL] load config: %v\n", err)
+				return fmt.Errorf("load config: %w", err)
+			}
+			report, err := doctor.Run(cmd.Context(), cfg)
+			if err != nil {
+				return err
+			}
+			fmt.Print(report.String())
+			if report.Failed > 0 {
 				os.Exit(1)
 			}
-			fmt.Println("  [ OK ] config loaded")
-
-			if err := os.MkdirAll(cfg.SessionDir, 0o700); err != nil {
-				fmt.Printf("  [FAIL] session dir: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("  [ OK ] session dir: %s\n", cfg.SessionDir)
-
-			if cfg.OpenRouterAPIKey != "" {
-				fmt.Println("  [ OK ] OPENROUTER_API_KEY set")
-			} else {
-				fmt.Println("  [WARN] OPENROUTER_API_KEY not set")
-			}
-
-			fmt.Printf("  [ OK ] model: %s\n", cfg.Model)
-			fmt.Println("\nAll checks passed.")
 			return nil
 		},
 	}
@@ -518,6 +511,104 @@ func newVersionCmd() *cobra.Command {
 			fmt.Printf("pi version %s\n", Version)
 		},
 	}
+}
+
+// ── pi update ─────────────────────────────────────────────────────────────────
+
+const repoURL = "https://github.com/tiru-r/pi-agent-go"
+
+func newUpdateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "update",
+		Short: "Update pi to the latest version",
+		Long: `Clones the latest source from GitHub, builds it with the correct version
+ldflags, and atomically replaces the running binary.
+
+Requires: go 1.24+, git`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runUpdate(cmd.Context())
+		},
+	}
+}
+
+func runUpdate(ctx context.Context) error {
+	if _, err := exec.LookPath("go"); err != nil {
+		return fmt.Errorf("go not found — install Go 1.24+ from https://go.dev/dl/")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git not found — required to clone source")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot locate current binary: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	tmp, err := os.MkdirTemp("", "pi-update-*")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	fmt.Fprintln(os.Stderr, "→ Cloning latest source...")
+	clone := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, tmp)
+	clone.Stdout = os.Stderr
+	clone.Stderr = os.Stderr
+	if err := clone.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
+	}
+
+	version := "dev"
+	if out, err := exec.CommandContext(ctx, "git", "-C", tmp, "describe", "--tags", "--always").Output(); err == nil {
+		version = strings.TrimSpace(string(out))
+	}
+
+	fmt.Fprintf(os.Stderr, "→ Building pi %s...\n", version)
+	outBin := filepath.Join(tmp, "pi")
+	build := exec.CommandContext(ctx, "go", "build",
+		"-ldflags", fmt.Sprintf("-s -w -X main.Version=%s", version),
+		"-o", outBin,
+		"./cmd/pi/")
+	build.Dir = tmp
+	build.Stdout = os.Stderr
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		return fmt.Errorf("build failed: %w", err)
+	}
+
+	newPath := exe + ".new"
+	if err := copyFileTo(outBin, newPath); err != nil {
+		return fmt.Errorf("copy binary: %w", err)
+	}
+	if err := os.Chmod(newPath, 0o755); err != nil {
+		_ = os.Remove(newPath)
+		return fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(newPath, exe); err != nil {
+		_ = os.Remove(newPath)
+		return fmt.Errorf("install to %s: %w", exe, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "✓ Updated to pi %s at %s\n", version, exe)
+	return nil
+}
+
+func copyFileTo(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // ── pi acp ───────────────────────────────────────────────────────────────────
