@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"os"
 	"sort"
@@ -243,26 +244,35 @@ func (d *HostcallDispatcher) Dispatch(ctx context.Context, req HostcallRequest) 
 	return result, isError, execErr
 }
 
-// fastDispatch is the low-allocation path: type-assert payload, call tool directly.
+// fastDispatch is the low-allocation path: skips JSON re-serialization when
+// the payload is already a json.RawMessage, avoiding an extra marshal round-trip.
 func (d *HostcallDispatcher) fastDispatch(ctx context.Context, req HostcallRequest) (string, bool, error) {
 	switch req.Kind {
 	case HCKindTool:
+		if raw, ok := req.Payload.(json.RawMessage); ok {
+			return dispatchToolRaw(ctx, req.ToolName, raw)
+		}
 		return dispatchTool(ctx, req.ToolName, req.Payload)
 	case HCKindLog:
 		return logHostcall(req.Payload), false, nil
 	case HCKindEnv:
 		return envHostcall(req.Payload), false, nil
 	default:
-		// Fall through to compat for unhandled kinds.
 		return d.compatDispatch(ctx, req)
 	}
 }
 
-// compatDispatch is the full marshal/unmarshal path for validation and unusual calls.
+// compatDispatch is the full marshal/unmarshal path: always serializes payload
+// through JSON for canonical validation before dispatch.  Used as the fallback
+// lane and for shadow comparison.
 func (d *HostcallDispatcher) compatDispatch(ctx context.Context, req HostcallRequest) (string, bool, error) {
 	switch req.Kind {
 	case HCKindTool:
-		return dispatchTool(ctx, req.ToolName, req.Payload)
+		raw, err := json.Marshal(req.Payload)
+		if err != nil {
+			return "", true, fmt.Errorf("marshal payload for %q: %w", req.ToolName, err)
+		}
+		return dispatchToolRaw(ctx, req.ToolName, raw)
 	case HCKindLog:
 		return logHostcall(req.Payload), false, nil
 	case HCKindEnv:
@@ -274,21 +284,26 @@ func (d *HostcallDispatcher) compatDispatch(ctx context.Context, req HostcallReq
 
 // runShadow executes req on the compat lane and compares the fingerprint to
 // fastResult. Divergence increments the counter; exceeding shadowBudget backs
-// off the fast lane.
+// off the fast lane.  Divergences are emitted via slog for structured capture.
 func (d *HostcallDispatcher) runShadow(ctx context.Context, req HostcallRequest, fastResult string) {
 	compatResult, _, err := d.compatDispatch(ctx, req)
 	if err != nil {
 		return
 	}
-	fHash := sha256Hex(fastResult)
-	cHash := sha256Hex(compatResult)
-	if fHash != cHash {
+	if sha256Hex(fastResult) != sha256Hex(compatResult) {
 		d.shadowCount++
-		fmt.Printf("[ext:shadow] divergence %d/%d for %s\n", d.shadowCount, d.shadowBudget, req.CallID)
+		slog.Info("ext:shadow divergence",
+			"count", d.shadowCount,
+			"budget", d.shadowBudget,
+			"call_id", req.CallID,
+			"ext", d.extName,
+		)
 		if d.shadowCount >= d.shadowBudget {
 			d.fastLaneOK.Store(false)
-			fmt.Printf("[ext:shadow] fast lane disabled after %d divergences (ext=%s)\n",
-				d.shadowCount, d.extName)
+			slog.Warn("ext:shadow fast lane disabled",
+				"divergences", d.shadowCount,
+				"ext", d.extName,
+			)
 		}
 	}
 }
@@ -349,14 +364,13 @@ func (d *HostcallDispatcher) dedupStore(key, result string, isError bool) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func dispatchTool(ctx context.Context, name string, payload any) (string, bool, error) {
+// dispatchToolRaw calls a registered tool with a pre-serialized JSON payload,
+// skipping any marshal step.  Used by the fast lane when payload is already
+// a json.RawMessage, and by the compat lane after it has marshaled the payload.
+func dispatchToolRaw(ctx context.Context, name string, raw json.RawMessage) (string, bool, error) {
 	t, ok := tools.Get(name)
 	if !ok {
 		return "", true, fmt.Errorf("tool %q not found", name)
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return "", true, fmt.Errorf("marshal params for %q: %w", name, err)
 	}
 	res, err := t.Execute(ctx, raw)
 	if err != nil {
@@ -367,6 +381,16 @@ func dispatchTool(ctx context.Context, name string, payload any) (string, bool, 
 		sb.WriteString(block.Text)
 	}
 	return sb.String(), res.IsError, nil
+}
+
+// dispatchTool marshals payload to JSON and then calls dispatchToolRaw.
+// Used by the fast lane when payload is not already a json.RawMessage.
+func dispatchTool(ctx context.Context, name string, payload any) (string, bool, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", true, fmt.Errorf("marshal params for %q: %w", name, err)
+	}
+	return dispatchToolRaw(ctx, name, raw)
 }
 
 func logHostcall(payload any) string {
