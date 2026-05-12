@@ -273,12 +273,13 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 
 type sessionState struct {
 	// sess persists conversation history to JSONL; nil if file creation failed.
-	sess       *session.Session
-	msgs       []model.Message // in-memory cache, always the authoritative view
-	modelID    string
-	thinkLevel model.ThinkingLevel
-	mode       agent.AgentMode
-	cwd        string // project root from session/new or session/load
+	sess         *session.Session
+	msgs         []model.Message // in-memory cache, always the authoritative view
+	modelID      string
+	thinkLevel   model.ThinkingLevel
+	mode         agent.AgentMode
+	cwd          string // project root from session/new or session/load
+	systemPrefix string // project snapshot injected at the top of every system prompt
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -537,11 +538,12 @@ func (s *Server) handleSessionNew(req *request) {
 	}
 
 	newState := &sessionState{
-		sess:       sess,
-		modelID:    modelID,
-		thinkLevel: thinkLevel,
-		mode:       agent.AgentModeAct,
-		cwd:        p.CWD,
+		sess:         sess,
+		modelID:      modelID,
+		thinkLevel:   thinkLevel,
+		mode:         agent.AgentModeAct,
+		cwd:          p.CWD,
+		systemPrefix: projectSnapshot(p.CWD),
 	}
 	s.sessionsMu.Lock()
 	s.sessions[id] = newState
@@ -740,7 +742,6 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 			modelID:    strings.TrimPrefix(s.cfg.Model, "openrouter/"),
 			thinkLevel: model.ThinkingLevel(s.cfg.ThinkingLevel),
 			mode:       agent.AgentModeAct,
-			cwd:        "",
 		}
 		s.sessionsMu.Lock()
 		s.sessions[p.SessionID] = ss
@@ -752,6 +753,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	thinkLevel := ss.thinkLevel
 	agentMode := ss.mode
 	cwd := ss.cwd
+	systemPrefix := ss.systemPrefix
 	fileSess := ss.sess
 	history := make([]model.Message, len(ss.msgs))
 	copy(history, ss.msgs)
@@ -771,6 +773,13 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	historyLen := len(history)
 
 	system := s.cfg.SystemPrompt
+	if systemPrefix != "" {
+		if system != "" {
+			system = systemPrefix + "\n" + system
+		} else {
+			system = systemPrefix
+		}
+	}
 	maxTokens := s.cfg.MaxTokens
 	if maxTokens == 0 {
 		maxTokens = 8096
@@ -913,12 +922,13 @@ func (s *Server) handleSessionLoad(req *request) {
 	msgs := sess.Messages()
 	s.sessionsMu.Lock()
 	s.sessions[p.SessionID] = &sessionState{
-		sess:       sess,
-		msgs:       msgs,
-		modelID:    modelID,
-		thinkLevel: thinkLevel,
-		mode:       agent.AgentModeAct,
-		cwd:        p.CWD,
+		sess:         sess,
+		msgs:         msgs,
+		modelID:      modelID,
+		thinkLevel:   thinkLevel,
+		mode:         agent.AgentModeAct,
+		cwd:          p.CWD,
+		systemPrefix: projectSnapshot(p.CWD),
 	}
 	s.sessionsMu.Unlock()
 
