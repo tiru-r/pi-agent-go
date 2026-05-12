@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -72,18 +74,18 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
-// SaveSession upserts the session header and all its entries.
+// SaveSession upserts the session header and inserts any new entries.
+// Existing entries are skipped (they are immutable once written).
 func (s *SQLiteStore) SaveSession(sess *Session) error {
 	sess.mu.Lock()
-	entries := make([]Entry, len(sess.Entries))
-	copy(entries, sess.Entries)
+	entries := make([]Entry, len(sess.entries))
+	copy(entries, sess.entries)
 	id := sess.ID
 	path := sess.Path
 	sess.mu.Unlock()
 
 	title := sess.Title()
 
-	// Count messages and tokens
 	var msgCount, tokenCount int
 	for _, e := range entries {
 		if e.Type == EntryMessage {
@@ -102,7 +104,6 @@ func (s *SQLiteStore) SaveSession(sess *Session) error {
 
 	now := time.Now().UTC()
 
-	// Upsert session row
 	_, err = tx.Exec(`
 		INSERT INTO sessions (id, title, model, provider, created_at, updated_at, message_count, token_count, path)
 		VALUES (?, ?, '', '', ?, ?, ?, ?, ?)
@@ -117,26 +118,26 @@ func (s *SQLiteStore) SaveSession(sess *Session) error {
 		return fmt.Errorf("sqlite: upsert session: %w", err)
 	}
 
-	// Upsert entries
+	// INSERT OR IGNORE: entries are immutable once written, so we skip duplicates
+	// rather than re-writing unchanged data on every save.
 	for _, e := range entries {
 		data, err := json.Marshal(e)
 		if err != nil {
 			continue
 		}
 		_, err = tx.Exec(`
-			INSERT INTO session_entries (id, session_id, parent_id, type, timestamp, data)
-			VALUES (?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+			INSERT OR IGNORE INTO session_entries (id, session_id, parent_id, type, timestamp, data)
+			VALUES (?, ?, ?, ?, ?, ?)`,
 			e.ID, id, nullStr(e.ParentID), string(e.Type), e.Timestamp.UTC(), string(data))
 		if err != nil {
-			return fmt.Errorf("sqlite: upsert entry %s: %w", e.ID, err)
+			return fmt.Errorf("sqlite: insert entry %s: %w", e.ID, err)
 		}
 	}
 
 	return tx.Commit()
 }
 
-// LoadSession loads a session from SQLite by ID.
+// LoadSession loads a session from SQLite by ID and opens its JSONL file for appending.
 func (s *SQLiteStore) LoadSession(id string) (*Session, error) {
 	var path string
 	err := s.db.QueryRow(`SELECT path FROM sessions WHERE id=?`, id).Scan(&path)
@@ -147,10 +148,31 @@ func (s *SQLiteStore) LoadSession(id string) (*Session, error) {
 		return nil, fmt.Errorf("sqlite: query session: %w", err)
 	}
 
+	entries, err := s.QueryEntries(id)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: open session file for append: %w", err)
+	}
+
+	return &Session{
+		ID:      id,
+		Path:    path,
+		entries: entries,
+		headID:  leafID(entries),
+		file:    f,
+	}, nil
+}
+
+// QueryEntries returns all entries for the given session ID ordered by timestamp.
+func (s *SQLiteStore) QueryEntries(sessionID string) ([]Entry, error) {
 	rows, err := s.db.Query(`
 		SELECT data FROM session_entries
 		WHERE session_id=?
-		ORDER BY timestamp ASC`, id)
+		ORDER BY timestamp ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: query entries: %w", err)
 	}
@@ -171,8 +193,7 @@ func (s *SQLiteStore) LoadSession(id string) (*Session, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sqlite: iterate entries: %w", err)
 	}
-
-	return &Session{ID: id, Path: path, Entries: entries}, nil
+	return entries, nil
 }
 
 // ListSessions returns metadata for all sessions, newest first.
@@ -206,18 +227,27 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 }
 
 // Search performs a case-insensitive title search.
+// The query string is escaped so that '%' and '_' are treated as literals.
 func (s *SQLiteStore) Search(query string) ([]SessionMeta, error) {
-	pattern := "%" + query + "%"
+	pattern := "%" + escapeLike(query) + "%"
 	rows, err := s.db.Query(`
 		SELECT id, title, model, provider, created_at, updated_at, message_count, token_count, path
 		FROM sessions
-		WHERE title LIKE ? COLLATE NOCASE
+		WHERE title LIKE ? ESCAPE '\' COLLATE NOCASE
 		ORDER BY updated_at DESC`, pattern)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: search: %w", err)
 	}
 	defer rows.Close()
 	return scanSessionMetas(rows)
+}
+
+// escapeLike escapes special LIKE characters (\, %, _) for use with ESCAPE '\'.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
 
 // UpdateSessionMeta updates the model and provider for a session.
@@ -265,7 +295,7 @@ func scanSessionMetas(rows *sql.Rows) ([]SessionMeta, error) {
 }
 
 // nullStr returns nil for empty strings (for nullable SQL columns).
-func nullStr(s string) interface{} {
+func nullStr(s string) any {
 	if s == "" {
 		return nil
 	}

@@ -1,11 +1,13 @@
 package session
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
+
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 // DistillSink receives completed (prompt, response, model) triples for
@@ -22,21 +24,28 @@ type distillRecord struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// JSONLDistillSink appends (prompt, model, response, timestamp) JSONL lines to a file.
+// JSONLDistillSink appends (prompt, model, response, timestamp) JSONL lines to a
+// file. The file is kept open for the lifetime of the sink; call Close when done.
 type JSONLDistillSink struct {
-	path string
+	mu   sync.Mutex
+	file *os.File
 }
 
-// NewJSONLDistillSink creates a sink that appends to path (creating if absent).
-func NewJSONLDistillSink(path string) *JSONLDistillSink {
-	return &JSONLDistillSink{path: path}
+// NewJSONLDistillSink opens path for appending (creating it if absent) and
+// returns a sink ready to receive records.
+func NewJSONLDistillSink(path string) (*JSONLDistillSink, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("distill: open sink: %w", err)
+	}
+	return &JSONLDistillSink{file: f}, nil
 }
 
 // Record appends one distillation record to the sink file.
-func (s *JSONLDistillSink) Record(prompt, response, model string) {
+func (s *JSONLDistillSink) Record(prompt, response, modelName string) {
 	rec := distillRecord{
 		Prompt:    prompt,
-		Model:     model,
+		Model:     modelName,
 		Response:  response,
 		Timestamp: time.Now().UTC(),
 	}
@@ -44,20 +53,24 @@ func (s *JSONLDistillSink) Record(prompt, response, model string) {
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.Write(append(data, '\n'))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.file.Write(append(data, '\n'))
 }
 
-// traceScore returns a quality score ∈ [0, 1] for a session loaded from the
-// store.  The scoring heuristic:
-//   - If any message entry carries a tool error, base score → 0.
-//   - Sessions that ended with a natural stop get base score 1.
-//   - Efficiency bonus: shorter sessions (fewer turns) get a small bonus so
-//     we prefer concise, correct sessions over verbose ones.
+// Close flushes and closes the underlying file.
+func (s *JSONLDistillSink) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.file.Close()
+}
+
+// traceScore returns a quality score ∈ [0, 1] for a session.
+//
+// Heuristic:
+//   - A tool error drops the base score to 0.
+//   - Ending with a natural assistant stop gives base score 1.
+//   - An efficiency bonus rewards shorter sessions (≤10 turns).
 func traceScore(entries []Entry) float64 {
 	var msgCount int
 	hasToolError := false
@@ -81,15 +94,14 @@ func traceScore(entries []Entry) float64 {
 	if msgCount == 0 {
 		return 0
 	}
-	// Natural stop: last message entry is an assistant message (not user/tool).
+
+	// Natural stop: last message entry is an assistant message.
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		if e.Type != EntryMessage || e.Message == nil {
 			continue
 		}
-		if string(e.Message.Role) == "assistant" {
-			naturalStop = true
-		}
+		naturalStop = e.Message.Role == model.RoleAssistant
 		break
 	}
 
@@ -104,7 +116,7 @@ func traceScore(entries []Entry) float64 {
 
 	// Efficiency interpolation: [1..10] turns → max bonus 0.2; >10 → 0 bonus.
 	efficiency := 0.0
-	if msgCount <= 10 && msgCount > 0 {
+	if msgCount <= 10 {
 		efficiency = 0.2 * (1 - float64(msgCount-1)/10)
 	}
 
@@ -132,7 +144,7 @@ func Distill(store *SQLiteStore, outPath string, threshold float64) (int, error)
 
 	exported := 0
 	for _, meta := range metas {
-		entries, queryErr := loadSessionEntries(store.db, meta.ID)
+		entries, queryErr := store.QueryEntries(meta.ID)
 		if queryErr != nil {
 			continue
 		}
@@ -156,31 +168,4 @@ func Distill(store *SQLiteStore, outPath string, threshold float64) (int, error)
 		exported++
 	}
 	return exported, nil
-}
-
-// loadSessionEntries returns the entries for the given session ID directly
-// from the database without constructing a full Session object.
-func loadSessionEntries(db *sql.DB, sessionID string) ([]Entry, error) {
-	rows, err := db.Query(`
-		SELECT data FROM session_entries
-		WHERE session_id=?
-		ORDER BY timestamp ASC`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var entries []Entry
-	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
-			continue
-		}
-		var e Entry
-		if err := json.Unmarshal([]byte(raw), &e); err != nil {
-			continue
-		}
-		entries = append(entries, e)
-	}
-	return entries, rows.Err()
 }

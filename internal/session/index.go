@@ -14,9 +14,11 @@ import (
 const indexFileName = ".index.json"
 
 // Index is an in-memory session index that can be persisted to disk.
+// All exported methods are safe for concurrent use.
 type Index struct {
-	Dir      string
-	Sessions []SessionMeta
+	Dir string
+
+	sessions []SessionMeta // guarded by mu
 	mu       sync.RWMutex
 }
 
@@ -61,7 +63,7 @@ func (idx *Index) Refresh() error {
 
 		info, _ := d.Info()
 		var msgCount, tokenCount int
-		for _, e := range sess.Entries {
+		for _, e := range sess.entries {
 			if e.Type == EntryMessage {
 				msgCount++
 				if e.Usage != nil {
@@ -71,9 +73,9 @@ func (idx *Index) Refresh() error {
 		}
 
 		var createdAt, updatedAt time.Time
-		if len(sess.Entries) > 0 {
-			createdAt = sess.Entries[0].Timestamp
-			updatedAt = sess.Entries[len(sess.Entries)-1].Timestamp
+		if len(sess.entries) > 0 {
+			createdAt = sess.entries[0].Timestamp
+			updatedAt = sess.entries[len(sess.entries)-1].Timestamp
 		} else if info != nil {
 			createdAt = info.ModTime()
 			updatedAt = info.ModTime()
@@ -94,43 +96,46 @@ func (idx *Index) Refresh() error {
 		return err
 	}
 
-	// Sort newest first
 	sort.Slice(metas, func(i, j int) bool {
 		return metas[i].UpdatedAt.After(metas[j].UpdatedAt)
 	})
 
 	idx.mu.Lock()
-	idx.Sessions = metas
+	idx.sessions = metas
 	idx.mu.Unlock()
 
 	return idx.persist()
 }
 
-// Add inserts or updates a SessionMeta in the index.
-func (idx *Index) Add(meta SessionMeta) {
+// Add inserts or updates a SessionMeta in the index and persists to disk.
+func (idx *Index) Add(meta SessionMeta) error {
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	for i, m := range idx.Sessions {
+	found := false
+	for i, m := range idx.sessions {
 		if m.ID == meta.ID {
-			idx.Sessions[i] = meta
-			return
+			idx.sessions[i] = meta
+			found = true
+			break
 		}
 	}
-	idx.Sessions = append([]SessionMeta{meta}, idx.Sessions...)
+	if !found {
+		idx.sessions = append([]SessionMeta{meta}, idx.sessions...)
+	}
+	idx.mu.Unlock()
+	return idx.persist()
 }
 
-// Remove deletes a session from the index by ID.
-func (idx *Index) Remove(id string) {
+// Remove deletes a session from the index by ID and persists to disk.
+func (idx *Index) Remove(id string) error {
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	for i, m := range idx.Sessions {
+	for i, m := range idx.sessions {
 		if m.ID == id {
-			idx.Sessions = append(idx.Sessions[:i], idx.Sessions[i+1:]...)
-			return
+			idx.sessions = append(idx.sessions[:i], idx.sessions[i+1:]...)
+			break
 		}
 	}
+	idx.mu.Unlock()
+	return idx.persist()
 }
 
 // Find looks up a session by ID.
@@ -138,7 +143,7 @@ func (idx *Index) Find(id string) (SessionMeta, bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	for _, m := range idx.Sessions {
+	for _, m := range idx.sessions {
 		if m.ID == id {
 			return m, true
 		}
@@ -151,13 +156,12 @@ func (idx *Index) Recent(n int) []SessionMeta {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	if n >= len(idx.Sessions) {
-		out := make([]SessionMeta, len(idx.Sessions))
-		copy(out, idx.Sessions)
-		return out
+	src := idx.sessions
+	if n < len(src) {
+		src = src[:n]
 	}
-	out := make([]SessionMeta, n)
-	copy(out, idx.Sessions[:n])
+	out := make([]SessionMeta, len(src))
+	copy(out, src)
 	return out
 }
 
@@ -168,7 +172,7 @@ func (idx *Index) Search(q string) []SessionMeta {
 
 	q = strings.ToLower(q)
 	var results []SessionMeta
-	for _, m := range idx.Sessions {
+	for _, m := range idx.sessions {
 		if strings.Contains(strings.ToLower(m.Title), q) {
 			results = append(results, m)
 		}
@@ -188,24 +192,26 @@ func (idx *Index) load() error {
 		return err
 	}
 	idx.mu.Lock()
-	idx.Sessions = disk.Sessions
+	idx.sessions = disk.Sessions
 	idx.mu.Unlock()
 	return nil
 }
 
-// persist writes the current index to .index.json.
+// persist writes the current index to .index.json atomically (snapshot under
+// RLock, then write — concurrent callers each write a valid full state).
 func (idx *Index) persist() error {
 	if err := os.MkdirAll(idx.Dir, 0o755); err != nil {
 		return err
 	}
 	idx.mu.RLock()
-	disk := indexDisk{
-		UpdatedAt: time.Now().UTC(),
-		Sessions:  idx.Sessions,
-	}
+	sessions := make([]SessionMeta, len(idx.sessions))
+	copy(sessions, idx.sessions)
 	idx.mu.RUnlock()
 
-	data, err := json.MarshalIndent(disk, "", "  ")
+	data, err := json.Marshal(indexDisk{
+		UpdatedAt: time.Now().UTC(),
+		Sessions:  sessions,
+	})
 	if err != nil {
 		return err
 	}

@@ -23,10 +23,7 @@ type Metrics struct {
 
 // Compute calculates Metrics from a Session's entries.
 func Compute(s *Session) Metrics {
-	s.mu.Lock()
-	entries := make([]Entry, len(s.Entries))
-	copy(entries, s.Entries)
-	s.mu.Unlock()
+	entries := s.Snapshot()
 
 	var m Metrics
 
@@ -47,7 +44,6 @@ func Compute(s *Session) Metrics {
 			m.UserMessages++
 		case model.RoleAssistant:
 			m.AssistantMessages++
-			// Count tool_use blocks as tool calls
 			for _, block := range e.Message.Content {
 				if block.Type == model.ContentTypeToolUse {
 					m.ToolCalls++

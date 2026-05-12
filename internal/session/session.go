@@ -15,8 +15,8 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
-// SESSION_VERSION is the current JSONL file format version.
-const SESSION_VERSION = 3
+// SessionVersion is the current JSONL file format version.
+const SessionVersion = 3
 
 // EntryType tags each JSONL entry.
 type EntryType string
@@ -50,12 +50,15 @@ type versionHeader struct {
 
 // Session is a single conversation stored as a JSONL file.
 // Entries form a tree via ParentID; headID tracks the active branch tip.
+//
+// Session is safe for concurrent use. All exported methods acquire the
+// internal mutex; callers must not hold it externally.
 type Session struct {
-	ID      string
-	Path    string
-	Entries []Entry
+	ID   string
+	Path string
 
-	headID string // ID of the most recent entry on the active branch
+	entries []Entry // guarded by mu
+	headID  string  // ID of the most recent entry on the active branch; guarded by mu
 
 	mu   sync.Mutex
 	file *os.File
@@ -76,8 +79,7 @@ func New(dir string) (*Session, error) {
 
 	s := &Session{ID: id, Path: path, file: f}
 
-	// Write version header
-	hdr, _ := json.Marshal(versionHeader{Version: SESSION_VERSION})
+	hdr, _ := json.Marshal(versionHeader{Version: SessionVersion})
 	if _, err := f.Write(append(hdr, '\n')); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("session: write version header: %w", err)
@@ -98,7 +100,7 @@ func New(dir string) (*Session, error) {
 	return s, nil
 }
 
-// Open loads an existing session from a JSONL file.
+// Open loads an existing session from a JSONL file and opens it for appending.
 func Open(path string) (*Session, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -110,7 +112,7 @@ func Open(path string) (*Session, error) {
 		return nil, fmt.Errorf("session: file is empty")
 	}
 
-	// First line may be version header — skip it.
+	// First line may be a version header — skip it.
 	start := 0
 	var hdr versionHeader
 	if err := json.Unmarshal([]byte(lines[0]), &hdr); err == nil && hdr.Version > 0 {
@@ -149,26 +151,33 @@ func Open(path string) (*Session, error) {
 	return &Session{
 		ID:      id,
 		Path:    path,
-		Entries: entries,
+		entries: entries,
 		headID:  leafID(entries),
 		file:    f,
 	}, nil
 }
 
-// leafID returns the ID of the most-recently-timestamped leaf entry.
-// A leaf is any entry that no other entry lists as its ParentID.
-// For legacy sessions where all ParentIDs are empty every entry is a leaf,
-// so the most-recent one (last appended) is returned.
-func leafID(entries []Entry) string {
-	if len(entries) == 0 {
-		return ""
-	}
+// computeLeafSet returns a set of entry IDs that are referenced as a
+// parent by at least one other entry. Entries not in this set are leaves.
+func computeLeafSet(entries []Entry) map[string]bool {
 	parents := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		if e.ParentID != "" {
 			parents[e.ParentID] = true
 		}
 	}
+	return parents
+}
+
+// leafID returns the ID of the most-recently-timestamped leaf entry.
+// A leaf is any entry that no other entry lists as its ParentID.
+// For legacy sessions where all ParentIDs are empty, every entry is a leaf,
+// so the most recent one (last appended) is returned.
+func leafID(entries []Entry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	parents := computeLeafSet(entries)
 	var leaves []Entry
 	for _, e := range entries {
 		if !parents[e.ID] {
@@ -182,6 +191,15 @@ func leafID(entries []Entry) string {
 		return b.Timestamp.Compare(a.Timestamp) // descending — most recent first
 	})
 	return leaves[0].ID
+}
+
+// Snapshot returns a copy of all entries in the session at the moment of the call.
+func (s *Session) Snapshot() []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Entry, len(s.entries))
+	copy(out, s.entries)
+	return out
 }
 
 // Append atomically appends an entry to the file and in-memory slice.
@@ -211,7 +229,7 @@ func (s *Session) appendEntry(entry Entry) error {
 	if _, err := s.file.Write(data); err != nil {
 		return fmt.Errorf("session: write entry: %w", err)
 	}
-	s.Entries = append(s.Entries, entry)
+	s.entries = append(s.entries, entry)
 	s.headID = entry.ID
 	return nil
 }
@@ -229,12 +247,15 @@ func (s *Session) AppendMessage(msg model.Message, usage *model.Usage) error {
 // as its head. Both the original and the branch share the same JSONL file;
 // diverging entries are appended with different ParentIDs, forming the tree
 // implicitly in the append-only log.
+//
+// The caller must Close the returned Session when done — it holds an
+// independent file descriptor.
 func (s *Session) Branch(fromEntryID string) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	found := false
-	for _, e := range s.Entries {
+	for _, e := range s.entries {
 		if e.ID == fromEntryID {
 			found = true
 			break
@@ -252,7 +273,7 @@ func (s *Session) Branch(fromEntryID string) (*Session, error) {
 	return &Session{
 		ID:      s.ID,
 		Path:    s.Path,
-		Entries: append([]Entry(nil), s.Entries...),
+		entries: append([]Entry(nil), s.entries...),
 		headID:  fromEntryID,
 		file:    f,
 	}, nil
@@ -265,12 +286,12 @@ func (s *Session) HeadID() string {
 	return s.headID
 }
 
-// SetHead moves the active branch tip to the given entry ID, switching the
-// view without creating a new branch (analogous to `git checkout <sha>`).
+// SetHead moves the active branch tip to the given entry ID without creating
+// a new branch (analogous to `git checkout <sha>`).
 func (s *Session) SetHead(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, e := range s.Entries {
+	for _, e := range s.entries {
 		if e.ID == id {
 			s.headID = id
 			return nil
@@ -284,14 +305,9 @@ func (s *Session) Heads() []Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	parents := make(map[string]bool, len(s.Entries))
-	for _, e := range s.Entries {
-		if e.ParentID != "" {
-			parents[e.ParentID] = true
-		}
-	}
+	parents := computeLeafSet(s.entries)
 	var heads []Entry
-	for _, e := range s.Entries {
+	for _, e := range s.entries {
 		if !parents[e.ID] {
 			heads = append(heads, e)
 		}
@@ -312,7 +328,7 @@ func (s *Session) Messages() []model.Message {
 	defer s.mu.Unlock()
 
 	hasLinks := false
-	for _, e := range s.Entries {
+	for _, e := range s.entries {
 		if e.ParentID != "" {
 			hasLinks = true
 			break
@@ -327,9 +343,9 @@ func (s *Session) Messages() []model.Message {
 // messagesFromTree walks head → root via ParentID, reverses, then builds the
 // message slice. Must be called with s.mu held.
 func (s *Session) messagesFromTree() []model.Message {
-	byID := make(map[string]*Entry, len(s.Entries))
-	for i := range s.Entries {
-		byID[s.Entries[i].ID] = &s.Entries[i]
+	byID := make(map[string]*Entry, len(s.entries))
+	for i := range s.entries {
+		byID[s.entries[i].ID] = &s.entries[i]
 	}
 
 	var path []string
@@ -350,11 +366,11 @@ func (s *Session) messagesFromTree() []model.Message {
 // messagesLinear reconstructs in entry order for legacy sessions without
 // parent links. Must be called with s.mu held.
 func (s *Session) messagesLinear() []model.Message {
-	byID := make(map[string]*Entry, len(s.Entries))
-	path := make([]string, 0, len(s.Entries))
-	for i := range s.Entries {
-		byID[s.Entries[i].ID] = &s.Entries[i]
-		path = append(path, s.Entries[i].ID)
+	byID := make(map[string]*Entry, len(s.entries))
+	path := make([]string, 0, len(s.entries))
+	for i := range s.entries {
+		byID[s.entries[i].ID] = &s.entries[i]
+		path = append(path, s.entries[i].ID)
 	}
 	return s.buildMessages(path, byID)
 }
@@ -406,17 +422,17 @@ func (s *Session) LastN(n int) []model.Message {
 	return msgs[len(msgs)-n:]
 }
 
-// Title returns the first user message truncated to 60 characters.
+// Title returns the first user message truncated to 60 runes.
 func (s *Session) Title() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, e := range s.Entries {
+	for _, e := range s.entries {
 		if e.Type == EntryMessage && e.Message != nil && e.Message.Role == model.RoleUser {
-			text := e.Message.Text()
-			if len(text) > 60 {
-				text = text[:60] + "..."
+			runes := []rune(e.Message.Text())
+			if len(runes) > 60 {
+				return string(runes[:60]) + "..."
 			}
-			return text
+			return string(runes)
 		}
 	}
 	return s.ID
