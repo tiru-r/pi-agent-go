@@ -9,11 +9,13 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 - **Every OpenRouter model** — model list fetched live from the API; no hardcoded registry
 - **8 built-in tools** — read, write, edit, bash, grep, find, ls, hashline_edit
 - **Full agentic loop** — LLM → tools → LLM cycles inside Zed's chat panel
+- **Agent modes** — act (default), plan, plan_act, interactive, pipe, handoff
 - **Session memory** — multi-turn conversation history maintained per Zed session
-- **Runtime intelligence** — 13 math-driven subsystems covering observability, safety, planning, and agent protocol (see [Runtime Intelligence](#runtime-intelligence))
-- **JavaScript + native extensions** — load custom tools from `~/.pi/extensions/` (goja JS VM or subprocess JSON protocol)
+- **Runtime intelligence** — 17 math-driven subsystems covering observability, safety, planning, and agent protocol (see [Runtime Intelligence](#runtime-intelligence))
+- **JavaScript + native extensions** — load custom tools from `~/.pi/extensions/` (QuickJS-WASI via wazero or subprocess JSON protocol)
+- **Capability-based extension sandboxing** — JS extensions declare required permissions; sensitive env vars are blocked
 - **One API key** — `OPENROUTER_API_KEY` is all you need
-- **Tiny binary** — 4 direct dependencies (cobra, uuid, sqlite, goja)
+- **Tiny binary** — 5 direct dependencies (cobra, uuid, sqlite, wazero, wazero-quickjs)
 
 ---
 
@@ -61,6 +63,9 @@ pi auth set sk-or-...
 # One-shot agent run
 pi run "Explain this codebase"
 pi run --model deepseek/deepseek-r1 "Solve this bug"
+
+# Inline file content with @file tokens
+pi run "Review @src/main.go and @src/utils.go"
 
 # List every model OpenRouter offers
 pi models
@@ -131,7 +136,7 @@ Internal:  runtime/report  →  RuntimeReport JSON (regime, anomaly, OPE, attrib
 
 ## Runtime Intelligence
 
-Pi's `internal/runtime` package implements 13 math-driven subsystems that run continuously alongside every agent session. They are grouped into four concern areas: observability, safety, planning, and agent protocol.
+Pi's `internal/runtime` package implements 17 math-driven subsystems that run continuously alongside every agent session. They are grouped into four concern areas: observability, safety, planning, and agent protocol.
 
 ### Observability
 
@@ -314,7 +319,7 @@ All subsystems are wired through `runtime.Monitor`, attached to the ACP server, 
 | `--system` | | Override system prompt |
 | `--session` | `-s` | Session ID to continue |
 | `--no-session` | | Disable session persistence |
-| `--think` | | Enable extended thinking |
+| `--think` | | Enable extended thinking (xhigh level) |
 | `--debug` | | Enable debug logging |
 
 ### Commands
@@ -324,9 +329,12 @@ All subsystems are wired through `runtime.Monitor`, attached to the ACP server, 
 ```bash
 pi run "Refactor this module to use interfaces"
 pi run --model qwen/qwq-32b "Solve this algorithmic problem"
+
+# @file tokens expand file contents inline
+pi run "Review @src/main.go for bugs"
 ```
 
-Streams the full agentic response (including tool output) to stdout.
+Streams the full agentic response (including tool output) to stdout. The session ID is printed to stderr so you can continue it with `--session <id>`.
 
 #### `pi session` — Session management
 
@@ -437,29 +445,91 @@ Returns entries with type and size. Max 500 entries.
 
 ---
 
+## Agent modes
+
+The `Mode` field in `agent.Options` selects the execution strategy for a run. The ACP server exposes this via session configuration.
+
+| Mode | Behaviour |
+|---|---|
+| `act` (default) | Full agentic loop — LLM calls tools as needed until done |
+| `plan` | Single turn, no tools — outputs a numbered plan only |
+| `plan_act` | Writes a plan first, then executes it with tools |
+| `interactive` | Describes each tool action before running it |
+| `pipe` | Single-turn pass-through — no tools, pure Q&A |
+| `handoff` | Runs normally, appends a HANDOFF summary for agent chaining |
+
+---
+
 ## Extensions
 
 Pi loads custom tools from `~/.pi/extensions/` on startup. Two types are supported.
 
 ### JavaScript extensions (`.js`)
 
-Written in plain JS and executed in a pure-Go goja VM (no Node.js required):
+JavaScript files are executed in a QuickJS-WASI sandbox via wazero (no Node.js required). Each extension must export two functions: `describe()` which returns its metadata, and `execute(params)` which runs the tool.
 
 ```js
-// ~/.pi/extensions/my_tool.js
-pi.tool("fetch_url", "Fetch a URL and return the body", {
-  type: "object",
-  properties: { url: { type: "string" } },
-  required: ["url"]
-}, async (params) => {
-  const res = await pi.http({ url: params.url, method: "GET" });
-  return res.body;
-});
+// ~/.pi/extensions/fetch_url.js
+
+function describe() {
+  return {
+    name: "fetch_url",
+    description: "Fetch a URL and return the body",
+    schema: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"]
+    }
+  };
+}
+
+async function execute(params) {
+  const body = await pi.http({ url: params.url, method: "GET" });
+  return { content: body, is_error: false };
+}
 ```
 
-Available host APIs: `pi.tool()`, `pi.http()`, `pi.exec()`, `pi.env()`, `pi.session()`, `pi.log()`
+Extensions can optionally define `before_tool(name, params)` and `after_tool(name, result, isError)` hooks that run around every Pi tool call.
 
-Hooks run before and after each tool call (`before_tool`, `after_tool`). Pi applies safe auto-repairs for common JS mistakes (forbidden patterns, unavailable imports) before loading.
+**Available `pi.*` host APIs:**
+
+| API | Description |
+|---|---|
+| `pi.tool(name, params)` | Call a Pi built-in tool, returns Promise\<string\> |
+| `pi.http(opts)` | Outbound HTTP request, returns Promise\<string\> (status + headers + body) |
+| `pi.exec(cmd, args)` | Shell command, returns Promise\<string\> |
+| `pi.env(key)` | Read an environment variable (blocked keys return empty string) |
+| `pi.readFile(path)` | Read a file (requires `fs_read` capability) |
+| `pi.writeFile(path, content)` | Write a file (requires `fs_write` capability) |
+| `pi.log(entry)` | Structured log to stderr |
+| `pi.session()` | Session info stub |
+
+Also available: `require('path')` and `require('os')` shims, `console.log/warn/error`, and a `process` shim.
+
+Pi applies safe auto-repairs for common JS mistakes (wrong-case API names, missing `await`, unavailable imports) before loading. Forbidden patterns (`eval`, `new Function`, `process.binding`, `dlopen`) cause the extension to be rejected.
+
+### Capability manifest (`.json` sibling for JS extensions)
+
+JS extensions are sandboxed by a capability system. Place a `<name>.json` file alongside `<name>.js` to declare what the extension is permitted to do:
+
+```json
+{
+  "capabilities": ["network", "env"],
+  "allow_paths": ["/tmp"]
+}
+```
+
+| Capability | Grants |
+|---|---|
+| `fs_read` | Read files via `pi.readFile()` |
+| `fs_write` | Write files via `pi.writeFile()` |
+| `network` | Outbound HTTP via `pi.http()` |
+| `exec` | Shell commands via `pi.exec()` |
+| `env` | Environment variable reads via `pi.env()` |
+| `session` | Session read/write (stub) |
+| `ui` | UI interaction (stub) |
+
+Sensitive environment variables (API keys, tokens, passwords, credentials) are always blocked regardless of the `env` capability.
 
 ### Native extensions (`.json`)
 
@@ -474,15 +544,19 @@ Any subprocess that speaks a simple JSON protocol:
 }
 ```
 
-Pi sends tool params as JSON on stdin; the process replies with `{"content": "...", "is_error": false}` on stdout.
+Pi sends tool params as JSON on stdin; the process replies with `{"content": "...", "is_error": false}` on stdout (or plain text).
+
+### Extension trust registry
+
+Every loaded extension begins in `acknowledged` state. The `Manager` exposes `Kill(name, reason)` and `Lift(name)` to quarantine or restore extensions at runtime. All state transitions are written to an in-memory audit trail.
 
 ### Extension directory
 
 ```bash
-PI_EXTENSIONS_DIR=~/.pi/extensions    # default location (also configurable in settings.json)
+PI_EXTENSIONS_DIR=~/.pi/extensions    # default (also configurable in settings.json)
 ```
 
-Extensions are discovered automatically at `pi run` and `pi acp` startup. A trust registry allows/quarantines extensions by name.
+Extensions are discovered automatically at `pi run` and `pi acp` startup. A sidecar `ext` meta-dispatcher tool is also registered, allowing the LLM to invoke any extension by name via `{"extension": "fetch_url", "params": {...}}`.
 
 ---
 
@@ -501,6 +575,7 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
   "thinking_level": "off",
   "system_prompt": "",
   "session_dir": "~/.pi/agent/sessions",
+  "extensions_dir": "~/.pi/extensions",
   "sqlite": true
 }
 ```
@@ -514,6 +589,7 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 | `PI_MODEL` | Override model |
 | `PI_CONFIG` | Custom config file path |
+| `PI_EXTENSIONS_DIR` | Override extensions directory |
 | `PI_DEBUG` | Set to any value to enable debug logging to `~/.pi/agent/acp.log` |
 
 ---
@@ -542,7 +618,7 @@ Quality score: 1.0 for clean sessions ending with a natural stop; penalised for 
 ```
 cmd/pi/main.go
 internal/
-├── cli/root.go              Cobra command tree
+├── cli/root.go              Cobra command tree (run, session, auth, models, config, doctor, acp, version)
 ├── config/config.go         Settings (file + env)
 ├── model/
 │   ├── message.go           Message / ContentBlock / Usage types
@@ -554,7 +630,7 @@ internal/
 │       ├── openrouter.go    OpenRouter streaming + semantic cache + distill sink
 │       └── models.go        Live model list from /api/v1/models
 ├── agent/
-│   ├── agent.go             Core agentic loop + token-budget guardrail
+│   ├── agent.go             Core agentic loop + agent modes + token-budget guardrail
 │   ├── session_agent.go     Session-aware wrapper (feeds runtime.Monitor)
 │   └── compaction.go        MI-based context compaction
 ├── acp/acp.go               Zed ACP server (JSON-RPC 2.0 over stdio)
@@ -582,9 +658,15 @@ internal/
 │   └── distill.go           Trace distillation + JSONLDistillSink
 ├── tools/tools.go           8 built-in tools
 ├── extensions/
-│   ├── manager.go           Extension discovery, trust registry, repair
-│   ├── js.go                JavaScript extensions (goja VM, pi.* host APIs)
-│   └── native.go            Native subprocess extensions (JSON protocol)
+│   ├── manager.go           Extension discovery and lifecycle
+│   ├── js.go                JavaScript extensions (QuickJS-WASI via wazero, pi.* host APIs)
+│   ├── native.go            Native subprocess extensions (JSON protocol)
+│   ├── ext_tool.go          Tool wrappers + ext meta-dispatcher
+│   ├── hostcall.go          Hostcall dispatcher (capability check, dedup, telemetry)
+│   ├── policy.go            Capability definitions and env-var blocklist
+│   ├── scanner.go           Static analysis — forbidden patterns, inferred capabilities
+│   ├── repair.go            Auto-repair for common JS mistakes
+│   └── trust.go             Trust registry (pending/acknowledged/trusted/killed + audit)
 ├── httpclient/client.go     HTTP client (streaming + non-streaming)
 ├── sse/sse.go               SSE parser
 └── doctor/doctor.go         Health checks
@@ -602,9 +684,13 @@ internal/
 
 **Extended thinking maps to Anthropic budget_tokens.** Each level maps to a fixed token budget passed upstream: off=0, minimal=1024, low=2048, medium=8192, high=16384, xhigh=32768. Thinking detection (which models support it) is inferred from the model ID — no hardcoded allowlist.
 
-**Minimal dependencies.** 4 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `goja` (pure-Go JS VM for extensions). The entire runtime intelligence package uses only stdlib (`math`, `sort`, `sync`, `container/list`).
+**Minimal dependencies.** 5 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `wazero` (WASM runtime), `wazero-quickjs` (QuickJS-WASI for JS extensions). The entire runtime intelligence package uses only stdlib (`math`, `sort`, `sync`, `container/list`).
 
-**Tool execution is parallel.** All tool calls from a single assistant turn run concurrently (capped at 4 goroutines), results fed back in one user turn.
+**Parallel tool execution.** All tool calls from a single assistant turn run concurrently, capped at 4 goroutines via a semaphore. Each goroutine respects context cancellation while waiting for a slot. Results are collected in original order (by `ToolUseID`) and event callbacks are serialized with a mutex. Both the `Agent` (`pi run`) and `SessionAgent` (ACP/Zed) paths share this design.
+
+**QuickJS-WASI sandbox.** JavaScript extensions run in an isolated WebAssembly instance compiled once per process and cached. Each tool invocation creates a fresh QuickJS instance communicating with Go via a synchronous JSON-over-pipes RPC protocol — stdout carries `HC:{json}` hostcall requests; stdin carries responses. Stdout is reserved for the RPC protocol; `console.*` output goes to stderr.
+
+**Capability-enforced extensions.** JS extensions declare capabilities in a sidecar `.json` manifest. The hostcall dispatcher enforces them before every API call, with deduplication (500 ms TTL), shadow dual-execution for read-only calls, adaptive batching under queue pressure, and a 1000-entry telemetry ring buffer per extension.
 
 ---
 
@@ -627,12 +713,13 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 
 | | |
 |---|---|
-| Go source files | 37 |
-| Lines of code | ~8,500 |
+| Go source files | 46 |
+| Lines of code | ~9,500 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |
+| Agent modes | 6 (act / plan / plan_act / interactive / pipe / handoff) |
 | Thinking levels | 6 (off / minimal / low / medium / high / xhigh) |
 | Runtime subsystems | 17 |
-| Direct dependencies | 4 |
+| Direct dependencies | 5 |
 | Go version | 1.24+ |

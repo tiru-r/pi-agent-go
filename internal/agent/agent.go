@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
@@ -385,7 +386,8 @@ done:
 	}, nil
 }
 
-// executeTools runs all tool_use blocks from the assistant message.
+// executeTools runs all tool_use blocks from the assistant message in parallel
+// (up to maxToolConcurrency goroutines) and returns results in original order.
 func executeTools(
 	ctx context.Context,
 	blocks []model.ContentBlock,
@@ -394,100 +396,134 @@ func executeTools(
 	hooks HookRunner,
 	msgCount int,
 ) ([]model.ContentBlock, error) {
-	var results []model.ContentBlock
-
-	for _, block := range blocks {
-		if block.Type != model.ContentTypeToolUse {
-			continue
+	// Collect tool-use blocks preserving original order.
+	type call struct{ block model.ContentBlock }
+	var calls []call
+	for _, b := range blocks {
+		if b.Type == model.ContentTypeToolUse {
+			calls = append(calls, call{b})
 		}
+	}
+	if len(calls) == 0 {
+		return nil, nil
+	}
 
-		t, ok := tools.Get(block.Name)
-		if !ok {
-			errText := fmt.Sprintf("unknown tool: %s", block.Name)
+	results := make([]model.ContentBlock, len(calls))
+	sem := make(chan struct{}, maxToolConcurrency)
+
+	// emit serialises onEvent calls; the callback may write to stdout/ACP and
+	// is not safe for concurrent use.
+	var evMu sync.Mutex
+	emit := func(ev AgentEvent) {
+		evMu.Lock()
+		onEvent(ev)
+		evMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for i, c := range calls {
+		wg.Add(1)
+		go func(i int, block model.ContentBlock) {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				result := model.ContentBlock{
+					Type:      model.ContentTypeToolResult,
+					ToolUseID: block.ID,
+					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+					IsError:   true,
+				}
+				emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+				results[i] = result
+				return
+			}
+
+			t, ok := tools.Get(block.Name)
+			if !ok {
+				result := model.ContentBlock{
+					Type:      model.ContentTypeToolResult,
+					ToolUseID: block.ID,
+					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: fmt.Sprintf("unknown tool: %s", block.Name)}},
+					IsError:   true,
+				}
+				if mon != nil {
+					mon.Observe(runtime.Observation{
+						Time:    time.Now(),
+						Stage:   "tool:" + block.Name,
+						Weight:  float64(msgCount),
+						Success: false,
+					})
+				}
+				emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+				results[i] = result
+				return
+			}
+
+			params := block.Input
+			if params == nil {
+				params = json.RawMessage("{}")
+			}
+
+			if hooks != nil {
+				hooks.RunBeforeTool(ctx, block.Name, params)
+			}
+
+			emit(AgentEvent{
+				Kind:      EventKindToolExec,
+				ToolID:    block.ID,
+				ToolName:  block.Name,
+				ToolInput: params,
+			})
+
+			t0 := time.Now()
+			toolResult, err := t.Execute(ctx, params)
+			latency := time.Since(t0)
+
+			var resultContent []model.ContentBlock
+			isError := false
+			if err != nil {
+				isError = true
+				resultContent = []model.ContentBlock{{Type: model.ContentTypeText, Text: "tool error: " + err.Error()}}
+			} else if toolResult != nil {
+				isError = toolResult.IsError
+				resultContent = toolResult.Content
+			}
+
+			if hooks != nil {
+				var sb strings.Builder
+				for _, rc := range resultContent {
+					if rc.Type == model.ContentTypeText {
+						sb.WriteString(rc.Text)
+					}
+				}
+				hooks.RunAfterTool(ctx, block.Name, sb.String(), isError)
+			}
+
+			if mon != nil {
+				mon.Observe(runtime.Observation{
+					Time:    t0,
+					Stage:   "tool:" + block.Name,
+					Latency: latency,
+					Weight:  float64(msgCount),
+					Success: !isError,
+				})
+			}
+
 			result := model.ContentBlock{
 				Type:      model.ContentTypeToolResult,
 				ToolUseID: block.ID,
-				Content: []model.ContentBlock{
-					{Type: model.ContentTypeText, Text: errText},
-				},
-				IsError: true,
+				Content:   resultContent,
+				IsError:   isError,
 			}
-			if mon != nil {
-				mon.Observe(runtime.Observation{
-					Time:    time.Now(),
-					Stage:   "tool:" + block.Name,
-					Latency: 0,
-					Weight:  float64(msgCount),
-					Success: false,
-				})
-			}
-			onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
-			results = append(results, result)
-			continue
-		}
-
-		params := block.Input
-		if params == nil {
-			params = json.RawMessage("{}")
-		}
-
-		if hooks != nil {
-			hooks.RunBeforeTool(ctx, block.Name, params)
-		}
-
-		onEvent(AgentEvent{
-			Kind:      EventKindToolExec,
-			ToolID:    block.ID,
-			ToolName:  block.Name,
-			ToolInput: params,
-		})
-
-		t0tool := time.Now()
-		toolResult, err := t.Execute(ctx, params)
-		toolLatency := time.Since(t0tool)
-
-		var resultContent []model.ContentBlock
-		isError := false
-		if err != nil {
-			isError = true
-			resultContent = []model.ContentBlock{
-				{Type: model.ContentTypeText, Text: "tool error: " + err.Error()},
-			}
-		} else if toolResult != nil {
-			isError = toolResult.IsError
-			resultContent = toolResult.Content
-		}
-
-		if hooks != nil {
-			var sb strings.Builder
-			for _, rc := range resultContent {
-				if rc.Type == model.ContentTypeText {
-					sb.WriteString(rc.Text)
-				}
-			}
-			hooks.RunAfterTool(ctx, block.Name, sb.String(), isError)
-		}
-
-		if mon != nil {
-			mon.Observe(runtime.Observation{
-				Time:    t0tool,
-				Stage:   "tool:" + block.Name,
-				Latency: toolLatency,
-				Weight:  float64(msgCount),
-				Success: !isError,
-			})
-		}
-
-		result := model.ContentBlock{
-			Type:      model.ContentTypeToolResult,
-			ToolUseID: block.ID,
-			Content:   resultContent,
-			IsError:   isError,
-		}
-		onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
-		results = append(results, result)
+			emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+			results[i] = result
+		}(i, c.block)
 	}
 
+	wg.Wait()
 	return results, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/config"
@@ -200,22 +201,32 @@ func (a *SessionAgent) Run(
 	return fmt.Errorf("session_agent: max iterations (%d) exceeded", maxIter)
 }
 
-// runTools executes all tool uses concurrently and returns result ContentBlocks.
+// runTools executes all tool uses concurrently (up to maxToolConcurrency at a
+// time) and returns result ContentBlocks in the same order as uses.
 func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) []model.ContentBlock {
 	results := make([]model.ContentBlock, len(uses))
 	sem := make(chan struct{}, maxToolConcurrency)
-
-	done := make(chan struct{})
+	var wg sync.WaitGroup
 	for i, use := range uses {
-		go func() {
-			sem <- struct{}{}
-			defer func() { <-sem; done <- struct{}{} }()
-			results[i] = a.runTool(ctx, use)
-		}()
+		wg.Add(1)
+		go func(i int, block model.ContentBlock) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results[i] = model.ContentBlock{
+					Type:      model.ContentTypeToolResult,
+					ToolUseID: block.ID,
+					IsError:   true,
+					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+				}
+				return
+			}
+			results[i] = a.runTool(ctx, block)
+		}(i, use)
 	}
-	for range uses {
-		<-done
-	}
+	wg.Wait()
 	return results
 }
 
