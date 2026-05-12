@@ -227,6 +227,7 @@ type sessionState struct {
 	msgs       []model.Message // in-memory cache, always the authoritative view
 	modelID    string
 	thinkLevel model.ThinkingLevel
+	mode       agent.AgentMode
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -444,12 +445,14 @@ func (s *Server) handleSessionNew(req *request) {
 		}
 	}
 
-	s.sessionsMu.Lock()
-	s.sessions[id] = &sessionState{
+	newState := &sessionState{
 		sess:       sess,
 		modelID:    modelID,
 		thinkLevel: thinkLevel,
+		mode:       agent.AgentModeAct,
 	}
+	s.sessionsMu.Lock()
+	s.sessions[id] = newState
 	s.sessionsMu.Unlock()
 
 	// Register in SQLite index so `pi session list` shows it immediately.
@@ -467,7 +470,7 @@ func (s *Server) handleSessionNew(req *request) {
 
 	s.sendResult(rawID(req.ID), acpSessionNewResult{
 		SessionID:     id,
-		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, models),
+		ConfigOptions: s.makeConfigOptions(newState.modelID, newState.thinkLevel, newState.mode, models),
 	})
 }
 
@@ -497,9 +500,12 @@ func (s *Server) handleSessionSetConfigOption(req *request) {
 		sess.modelID = valStr
 	case "thinking_level":
 		sess.thinkLevel = model.ThinkingLevel(valStr)
+	case "mode":
+		sess.mode = agent.AgentMode(valStr)
 	}
 	modelID := sess.modelID
 	thinkLevel := sess.thinkLevel
+	mode := sess.mode
 	s.sessionsMu.Unlock()
 
 	s.modelsMu.RLock()
@@ -507,7 +513,7 @@ func (s *Server) handleSessionSetConfigOption(req *request) {
 	s.modelsMu.RUnlock()
 
 	s.sendResult(rawID(req.ID), acpSetConfigResult{
-		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, models),
+		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, mode, models),
 	})
 }
 
@@ -626,6 +632,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 			sess:       newSess,
 			modelID:    strings.TrimPrefix(s.cfg.Model, "openrouter/"),
 			thinkLevel: model.ThinkingLevel(s.cfg.ThinkingLevel),
+			mode:       agent.AgentModeAct,
 		}
 		s.sessionsMu.Lock()
 		s.sessions[p.SessionID] = ss
@@ -635,6 +642,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	s.sessionsMu.RLock()
 	modelID := ss.modelID
 	thinkLevel := ss.thinkLevel
+	agentMode := ss.mode
 	fileSess := ss.sess
 	history := make([]model.Message, len(ss.msgs))
 	copy(history, ss.msgs)
@@ -656,10 +664,11 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	var finalStop model.StopReason = model.StopReasonEndTurn
 	var finalUsage model.Usage
 
-	slog.Debug("session/prompt", "session", p.SessionID, "model", modelID, "thinking", thinkLevel)
+	slog.Debug("session/prompt", "session", p.SessionID, "model", modelID, "thinking", thinkLevel, "mode", agentMode)
 
 	updatedMsgs, err := ag.Run(cctx, prompt, history, agent.Options{
 		ThinkingLevel: thinkLevel,
+		Mode:          agentMode,
 	}, func(ev agent.AgentEvent) {
 		switch ev.Kind {
 		case agent.EventKindText:
@@ -752,8 +761,11 @@ func normalizeThinkingLevel(level model.ThinkingLevel) model.ThinkingLevel {
 	}
 }
 
-func (s *Server) makeConfigOptions(modelID string, thinkLevel model.ThinkingLevel, models []acpModel) []acpConfigOpt {
+func (s *Server) makeConfigOptions(modelID string, thinkLevel model.ThinkingLevel, mode agent.AgentMode, models []acpModel) []acpConfigOpt {
 	thinkStr := string(normalizeThinkingLevel(thinkLevel))
+	if mode == "" {
+		mode = agent.AgentModeAct
+	}
 
 	// Build model options list.
 	var modelOpts []acpSelectOpt
@@ -794,6 +806,21 @@ func (s *Server) makeConfigOptions(modelID string, thinkLevel model.ThinkingLeve
 				{Value: "medium", Name: "Medium"},
 				{Value: "high", Name: "High"},
 				{Value: "xhigh", Name: "Max"},
+			},
+		},
+		{
+			Type:         "select",
+			ID:           "mode",
+			Name:         "Mode",
+			Category:     "agent",
+			CurrentValue: string(mode),
+			Options: []acpSelectOpt{
+				{Value: "act",         Name: "Execute"},
+				{Value: "plan",        Name: "Plan"},
+				{Value: "plan_act",    Name: "Plan & Act"},
+				{Value: "interactive", Name: "Interactive"},
+				{Value: "pipe",        Name: "Pipe"},
+				{Value: "handoff",     Name: "Handoff"},
 			},
 		},
 	}

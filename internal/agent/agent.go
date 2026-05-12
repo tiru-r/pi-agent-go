@@ -16,6 +16,24 @@ import (
 	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
+// AgentMode controls the execution strategy for a Run.
+type AgentMode string
+
+const (
+	// AgentModeAct is the default: full agentic loop with all tools.
+	AgentModeAct AgentMode = "act"
+	// AgentModePlan outputs a plan only — no tools are executed.
+	AgentModePlan AgentMode = "plan"
+	// AgentModePlanAct plans first, then executes with tools.
+	AgentModePlanAct AgentMode = "plan_act"
+	// AgentModeInteractive describes each tool action before running it.
+	AgentModeInteractive AgentMode = "interactive"
+	// AgentModePipe is single-turn, no tools — pure Q&A / stdin→stdout.
+	AgentModePipe AgentMode = "pipe"
+	// AgentModeHandoff executes normally then emits a HANDOFF summary.
+	AgentModeHandoff AgentMode = "handoff"
+)
+
 // Options controls a single agent run.
 type Options struct {
 	// System overrides the system prompt from config for this run only.
@@ -28,6 +46,8 @@ type Options struct {
 	Tools []string
 	// TurnTokenBudget caps InputTokens consumed in a single turn (0 = unlimited).
 	TurnTokenBudget int
+	// Mode selects the execution strategy (default: AgentModeAct).
+	Mode AgentMode
 }
 
 // EventKind tags the kind of event emitted by the agent.
@@ -132,8 +152,28 @@ func (a *Agent) Run(
 	msgs = append(msgs, history...)
 	msgs = append(msgs, model.NewTextMessage(model.RoleUser, input))
 
-	// Resolve tool set.
-	toolDefs := resolveTools(opts.Tools)
+	// Apply mode overrides before resolving tools so Plan/Pipe skip the lookup.
+	var toolDefs []model.ToolDefinition
+	switch opts.Mode {
+	case AgentModePlan:
+		// No tools — forces end_turn after the plan text.
+		maxTurns = 1
+		systemPrompt = modePrefix("You are in PLAN MODE. Do not use any tools. Output a detailed numbered plan of exactly what you would do to complete this task.", systemPrompt)
+	case AgentModePipe:
+		// No tools — single-turn pass-through.
+		maxTurns = 1
+	case AgentModePlanAct:
+		toolDefs = resolveTools(opts.Tools)
+		systemPrompt = modePrefix("First write a concise numbered plan of your approach. Then execute each step using the available tools.", systemPrompt)
+	case AgentModeInteractive:
+		toolDefs = resolveTools(opts.Tools)
+		systemPrompt = modePrefix("You are in INTERACTIVE MODE. Before invoking any tool, briefly describe what you are about to do and why, then proceed.", systemPrompt)
+	case AgentModeHandoff:
+		toolDefs = resolveTools(opts.Tools)
+		systemPrompt = modeSuffix(systemPrompt, "When your task is complete, output a HANDOFF section with a concise state summary so another agent can continue from where you left off.")
+	default: // AgentModeAct and unset ("")
+		toolDefs = resolveTools(opts.Tools)
+	}
 
 	// lastMeasuredTokens holds the InputTokens value from the previous API
 	// response. When non-zero it is used instead of the heuristic estimator.
@@ -459,4 +499,20 @@ func resolveTools(names []string) []model.ToolDefinition {
 		}
 	}
 	return defs
+}
+
+// modePrefix prepends instruction to system, separated by a blank line.
+func modePrefix(instruction, system string) string {
+	if system == "" {
+		return instruction
+	}
+	return instruction + "\n\n" + system
+}
+
+// modeSuffix appends instruction to system, separated by a blank line.
+func modeSuffix(system, instruction string) string {
+	if system == "" {
+		return instruction
+	}
+	return system + "\n\n" + instruction
 }
