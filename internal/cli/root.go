@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"text/tabwriter"
 
@@ -17,6 +16,7 @@ import (
 
 	"github.com/tiru-r/pi-agent-go/internal/acp"
 	"github.com/tiru-r/pi-agent-go/internal/agent"
+	"github.com/tiru-r/pi-agent-go/internal/autocomplete"
 	"github.com/tiru-r/pi-agent-go/internal/config"
 	"github.com/tiru-r/pi-agent-go/internal/doctor"
 	"github.com/tiru-r/pi-agent-go/internal/extensions"
@@ -138,7 +138,7 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 
 			// Expand @file tokens in the prompt.
 			raw := strings.Join(args, " ")
-			prompt, expandedFiles := expandAtFiles(raw)
+			prompt, expandedFiles := autocomplete.ExpandAtFiles(raw, "")
 			for _, f := range expandedFiles {
 				fmt.Fprintf(os.Stderr, "[expanded: %s]\n", f)
 			}
@@ -652,25 +652,6 @@ func truncateStr(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
-// atFileRe matches @<non-whitespace> tokens in a prompt string.
-var atFileRe = regexp.MustCompile(`@(\S+)`)
-
-// expandAtFiles replaces @filepath tokens with the content of those files.
-// Tokens whose paths cannot be read are left unchanged.
-// Returns the expanded string and the list of successfully expanded paths.
-func expandAtFiles(s string) (string, []string) {
-	var expanded []string
-	result := atFileRe.ReplaceAllStringFunc(s, func(match string) string {
-		path := match[1:] // strip leading @
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return match
-		}
-		expanded = append(expanded, path)
-		return string(data)
-	})
-	return result, expanded
-}
 
 // loadExtensions initialises the extension manager and registers all extension
 // tools into the global tool registry. The returned manager must be closed when done.

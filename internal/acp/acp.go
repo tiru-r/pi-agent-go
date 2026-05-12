@@ -37,12 +37,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/agent"
+	"github.com/tiru-r/pi-agent-go/internal/autocomplete"
 	"github.com/tiru-r/pi-agent-go/internal/config"
 	"github.com/tiru-r/pi-agent-go/internal/extensions"
 	"github.com/tiru-r/pi-agent-go/internal/model"
@@ -314,6 +314,9 @@ type Server struct {
 
 	// sqliteStore is the session index; nil when SQLite is disabled or unavailable.
 	sqliteStore *session.SQLiteStore
+
+	// completer handles input/complete requests.
+	completer *autocomplete.Provider
 }
 
 // New builds a Server.
@@ -344,6 +347,7 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	}
 	s.extMgr = extMgr
+	s.completer = autocomplete.New(extMgr, nil)
 	for _, t := range extensions.WrapAsTools(extMgr) {
 		tools.Register(t)
 	}
@@ -450,6 +454,8 @@ func (s *Server) dispatch(_ context.Context, req *request) {
 		s.handleSessionClose(req)
 	case "runtime/report":
 		s.handleRuntimeReport(req)
+	case "input/complete":
+		s.handleInputComplete(req)
 	default:
 		if req.ID != nil {
 			s.sendError(rawID(req.ID), -32601, "method not found: "+req.Method)
@@ -752,7 +758,10 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	s.sessionsMu.RUnlock()
 
 	// Expand @file tokens relative to the project working directory.
-	prompt := expandAtFilesACP(string(p.Prompt), cwd)
+	prompt, expandedFiles := autocomplete.ExpandAtFiles(string(p.Prompt), cwd)
+	if len(expandedFiles) > 0 {
+		slog.Debug("session/prompt: expanded @files", "session", p.SessionID, "files", expandedFiles)
+	}
 
 	// Inject cwd into context so tools (bash, etc.) run in the right directory.
 	if cwd != "" {
@@ -1138,24 +1147,69 @@ func rawID(raw json.RawMessage) any {
 	return v
 }
 
-// atFileRe matches @<non-whitespace> tokens used for file expansion.
-var atFileRe = regexp.MustCompile(`@(\S+)`)
 
-// expandAtFilesACP replaces @filepath tokens in s with the file's contents.
-// Relative paths are resolved against cwd when provided. Unreadable paths are
-// left unchanged.
-func expandAtFilesACP(s, cwd string) string {
-	return atFileRe.ReplaceAllStringFunc(s, func(match string) string {
-		path := match[1:] // strip leading @
-		if cwd != "" && !filepath.IsAbs(path) {
-			path = filepath.Join(cwd, path)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return match
-		}
-		return string(data)
-	})
+// ── input/complete ────────────────────────────────────────────────────────────
+
+type acpCompleteParams struct {
+	SessionID string `json:"sessionId"`
+	Text      string `json:"text"`
+	Cursor    int    `json:"cursor"`
+}
+
+type acpCompleteResult struct {
+	Suggestions []acpSuggestion `json:"suggestions"`
+	Replace     acpRange        `json:"replace"`
+}
+
+type acpSuggestion struct {
+	Label      string `json:"label"`
+	Detail     string `json:"detail,omitempty"`
+	Kind       string `json:"kind"`
+	InsertText string `json:"insertText"`
+}
+
+type acpRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+func (s *Server) handleInputComplete(req *request) {
+	if req.Params == nil {
+		s.sendError(rawID(req.ID), -32602, "params required")
+		return
+	}
+	var p acpCompleteParams
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		s.sendError(rawID(req.ID), -32602, "invalid params: "+err.Error())
+		return
+	}
+
+	var cwd string
+	if ss := s.getSession(p.SessionID); ss != nil {
+		s.sessionsMu.RLock()
+		cwd = ss.cwd
+		s.sessionsMu.RUnlock()
+	}
+
+	suggestions, replace, err := s.completer.Complete(p.Text, p.Cursor, cwd)
+	if err != nil {
+		s.sendError(rawID(req.ID), -32001, "complete: "+err.Error())
+		return
+	}
+
+	result := acpCompleteResult{
+		Suggestions: make([]acpSuggestion, 0, len(suggestions)),
+		Replace:     acpRange{Start: replace.Start, End: replace.End},
+	}
+	for _, sg := range suggestions {
+		result.Suggestions = append(result.Suggestions, acpSuggestion{
+			Label:      sg.Label,
+			Detail:     sg.Detail,
+			Kind:       sg.Kind.String(),
+			InsertText: sg.InsertText,
+		})
+	}
+	s.sendResult(rawID(req.ID), result)
 }
 
 func toACPModels(infos []model.ModelInfo) []acpModel {
