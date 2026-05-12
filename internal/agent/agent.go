@@ -137,6 +137,15 @@ func (a *Agent) Run(
 	opts Options,
 	onEvent func(AgentEvent),
 ) ([]model.Message, error) {
+	// Wrap onEvent once so tool goroutines can call it concurrently without
+	// the caller needing to worry about thread safety.
+	var evMu sync.Mutex
+	safeEmit := func(ev AgentEvent) {
+		evMu.Lock()
+		onEvent(ev)
+		evMu.Unlock()
+	}
+
 	systemPrompt := a.system
 	if opts.System != "" {
 		systemPrompt = opts.System
@@ -280,7 +289,9 @@ func (a *Agent) Run(
 		}
 
 		// Execute tool calls and collect results.
-		toolResults, err := executeTools(ctx, resp.Message.Content, onEvent, a.Monitor, a.Hooks, len(msgs))
+		// safeEmit is passed so goroutines inside executeTools can emit events
+		// without the caller needing to handle concurrent access.
+		toolResults, err := executeTools(ctx, resp.Message.Content, safeEmit, a.Monitor, a.Hooks, len(msgs))
 		if err != nil {
 			return msgs, err
 		}
@@ -410,15 +421,6 @@ func executeTools(
 
 	results := make([]model.ContentBlock, len(calls))
 
-	// emit serialises onEvent calls; the callback may write to stdout/ACP and
-	// is not safe for concurrent use.
-	var evMu sync.Mutex
-	emit := func(ev AgentEvent) {
-		evMu.Lock()
-		onEvent(ev)
-		evMu.Unlock()
-	}
-
 	var wg sync.WaitGroup
 	for i, c := range calls {
 		wg.Add(1)
@@ -438,7 +440,7 @@ func executeTools(
 						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
 						IsError:   true,
 					}
-					emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+					onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 					results[i] = result
 					return
 				}
@@ -449,7 +451,7 @@ func executeTools(
 					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: err.Error()}},
 					IsError:   true,
 				}
-				emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+				onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 				results[i] = result
 				return
 			}
@@ -470,7 +472,7 @@ func executeTools(
 						Success: false,
 					})
 				}
-				emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+				onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 				results[i] = result
 				return
 			}
@@ -484,7 +486,7 @@ func executeTools(
 				hooks.RunBeforeTool(ctx, block.Name, params)
 			}
 
-			emit(AgentEvent{
+			onEvent(AgentEvent{
 				Kind:      EventKindToolExec,
 				ToolID:    block.ID,
 				ToolName:  block.Name,
@@ -531,7 +533,7 @@ func executeTools(
 				Content:   resultContent,
 				IsError:   isError,
 			}
-			emit(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+			onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 			results[i] = result
 		}(i, c.block)
 	}
