@@ -145,10 +145,13 @@ Zed → pi:  initialize, session/new, session/load, session/prompt, session/canc
            session/set_config_option, session/set_model, session/close,
            input/complete
 
-pi → Zed:  initialize result (agentInfo), session/new result (configOptions + models),
+pi → Zed:  initialize result (agentInfo + agentCapabilities),
+           session/new result (sessionId + configOptions),
+           session/load result (sessionId + configOptions),
            session/update notifications (agent_message_chunk, agent_thought_chunk,
-             tool_use, tool_result),
+             agent_tool_use, agent_tool_result),
            session/prompt result (stopReason, usage),
+           session/set_config_option result (configOptions),
            input/complete result (suggestions + replace range)
 
 Internal:  runtime/report  →  RuntimeReport JSON (regime, anomaly, OPE, attribution, …)
@@ -298,7 +301,7 @@ The effective step size η_eff is halved for each gradient sign flip above thres
 J(A, B) = |A ∩ B| / |A ∪ B|     A, B = sets of char 3-grams
 ```
 
-A lookup returns a cached response when the best-match similarity exceeds the threshold (default 0.85). LRU eviction at 512 entries. The cache is wired into the OpenRouter provider; tool-use requests are never cached (their results depend on live filesystem/shell state).
+A lookup returns a cached response when the best-match similarity exceeds the threshold (default 0.85). LRU eviction at 512 entries. The cache is wired into the OpenRouter provider; tool-use requests are never cached (their results depend on live filesystem/shell state). Enable it in config with `"semantic_cache": true`.
 
 #### Information-theoretic compaction
 
@@ -310,7 +313,7 @@ Compaction can run **synchronously** (blocking the current turn) or **asynchrono
 
 `session.Distill` reads all sessions from SQLite, scores each by a quality heuristic — penalising tool errors, rewarding natural stops and session conciseness — and exports high-quality traces as JSONL for offline fine-tuning.
 
-The OpenRouter provider accepts a `DistillSink` for online knowledge distillation data collection: every completed non-tool response is passed as a (prompt, model, response, timestamp) record to the sink, which appends it as JSONL.
+The OpenRouter provider accepts a `DistillSink` for online knowledge distillation data collection: every completed non-tool response is passed as a (prompt, model, response, timestamp) record to the sink, which appends it as JSONL. Configure the output path with `"distill_file"` in settings.json.
 
 ### Summary
 
@@ -433,13 +436,13 @@ The agent has 8 tools for interacting with the filesystem and shell.
 ```json
 { "path": "src/main.go", "offset": 50, "limit": 100 }
 ```
-Returns file contents with line numbers. Detects images by extension and returns base64.
+Returns file contents with line numbers. Detects images by extension (jpg, jpeg, png, gif, webp) and returns base64. Default limit: 2000 lines.
 
 ### `write`
 ```json
 { "path": "src/utils.go", "content": "package main\n..." }
 ```
-Creates parent directories as needed.
+Creates parent directories as needed. Preserves existing file permissions.
 
 ### `edit`
 ```json
@@ -451,19 +454,19 @@ Fails if `old_string` is not found or appears more than once (when `replace_all`
 ```json
 { "command": "go test ./...", "timeout": 60000 }
 ```
-Timeout in ms (default 120,000). Output capped at 100 KB. Combined stdout + stderr. Runs in the session's working directory when launched from Zed.
+Timeout in ms (default 120,000). Output is first truncated to a 2000-line head+tail window, then hard-capped at 1 MB. Combined stdout + stderr. Runs in the session's working directory when launched from Zed. Processes run in their own group; SIGTERM is sent on timeout with a 5 s grace period before SIGKILL.
 
 ### `grep`
 ```json
 { "pattern": "func.*Handler", "path": ".", "context": 3 }
 ```
-Skips `.git/`, `node_modules/`, `target/`. Max 100 matches.
+Skips `.git/`, `node_modules/`, `target/`. Max 100 matches. Supports `case_sensitive` and `recursive` flags.
 
 ### `find`
 ```json
 { "path": ".", "pattern": "*.go", "type": "f", "max_depth": 3 }
 ```
-`type`: `f` (file), `d` (dir), `l` (symlink). Max 1000 results.
+`type`: `f` (file), `d` (dir), `l` (symlink). Max 1000 results, sorted by modification time (newest first).
 
 ### `ls`
 ```json
@@ -628,11 +631,13 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
   "system_prompt": "",
   "session_dir": "~/.pi/agent/sessions",
   "extensions_dir": "~/.pi/extensions",
-  "sqlite": true
+  "sqlite": true,
+  "semantic_cache": false,
+  "distill_file": ""
 }
 ```
 
-`openrouter_site_url` and `openrouter_app_name` are optional and appear on your OpenRouter dashboard.
+`openrouter_site_url` and `openrouter_app_name` are optional and appear on your OpenRouter dashboard. `semantic_cache` enables Jaccard-similarity response caching. `distill_file` sets a JSONL path for knowledge-distillation output.
 
 ### Environment variables
 
@@ -742,7 +747,7 @@ internal/
 
 **Live model list.** `FetchModels()` calls `GET /api/v1/models` on startup. No hardcoded model IDs anywhere. New models on OpenRouter appear in Zed's model picker automatically.
 
-**New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model, thinking level, and mode per conversation; Zed's UI controls drive all three. The `input/complete` method wires Zed's editor input to pi's autocomplete provider (slash commands, `@file` references, filesystem paths).
+**New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model, thinking level, and mode per conversation; Zed's UI controls drive all three. The `input/complete` method wires Zed's editor input to pi's autocomplete provider (slash commands, `@file` references, filesystem paths). The `session/load` method restores an existing session by ID, returning the same config options as `session/new`.
 
 **AgentCx — single plumbing type.** `AgentCx` carries the three cross-cutting concerns of the agent loop together: lifecycle context (cancellation/deadlines), token budget (total and per-turn), and the runtime monitor. It is constructed at the CLI or RPC entry point and passed unchanged into `Run`, `executeTools`, and every subsystem boundary — no separate context/budget/monitor parameters anywhere in the call chain.
 
@@ -784,7 +789,7 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 | | |
 |---|---|
 | Go source files | 53 |
-| Lines of code | ~13,600 |
+| Lines of code | ~14,400 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |
