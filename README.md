@@ -11,6 +11,10 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 - **Full agentic loop** — LLM → tools → LLM cycles inside Zed's chat panel
 - **Agent modes** — act (default), plan, plan_act, interactive, pipe, handoff
 - **Session memory** — multi-turn conversation history maintained per Zed session
+- **Project snapshot** — working directory, language, git branch, and project instructions injected at session start so the model knows the context immediately
+- **Input autocomplete** — slash commands, `@file` tokens, and filesystem paths resolved as you type in Zed
+- **Retry with backoff** — automatic retry on 429 / 5xx / network timeout (3 attempts, 500 ms base, 30 s cap)
+- **Background compaction** — context compaction runs asynchronously so it never blocks a response turn
 - **Runtime intelligence** — 17 math-driven subsystems covering observability, safety, planning, and agent protocol (see [Runtime Intelligence](#runtime-intelligence))
 - **JavaScript + native extensions** — load custom tools from `~/.pi/extensions/` (QuickJS-WASI via wazero or subprocess JSON protocol)
 - **Capability-based extension sandboxing** — JS extensions declare required permissions; sensitive env vars are blocked
@@ -101,18 +105,32 @@ Pi registers as a native agent server. Zed invokes `pi acp` as a subprocess and 
 
 - **Model picker** — all 500+ OpenRouter models, populated from the live API on startup
 - **Thinking level** — Off / Minimal / Low / Medium / High / Max selector for extended reasoning (works with Claude 3.7+, Claude 4, DeepSeek R1, QwQ, and any `:thinking`-suffixed model)
+- **Mode picker** — act / plan / plan_act / interactive / pipe / handoff
+- **Input autocomplete** — slash commands (`/model`, `/mode`, `/clear`, …), `@file` references, and filesystem paths as you type
 - **Full agentic loop** — pi runs tools (read, write, bash, …) across multiple turns before returning
 
 ### Session flow
 
 When Zed sends `session/prompt`, pi:
-1. Looks up the session's current model and thinking level
-2. Loads conversation history for the session
-3. Runs the full agentic loop — LLM calls tools, feeds results back, repeats
-4. Streams text chunks (`agent_message_chunk`) and thinking chunks (`agent_thought_chunk`) to Zed via `session/update` notifications
-5. Saves updated history for the next turn
+1. Looks up the session's current model, thinking level, and mode
+2. Prepends a **project snapshot** — working directory, detected language(s), git branch, top-level file listing, and any instructions from `.pi/instructions.md` or `AGENTS.md`
+3. Loads conversation history for the session
+4. Expands `@file` tokens in the prompt inline
+5. Runs the full agentic loop — LLM calls tools, feeds results back, repeats
+6. Streams text chunks (`agent_message_chunk`) and thinking chunks (`agent_thought_chunk`) to Zed via `session/update` notifications
+7. Saves updated history for the next turn
 
-Changing the model or thinking level in Zed's panel triggers `session/set_config_option` or `session/set_model`, which pi applies to all subsequent prompts in that session.
+Changing the model, thinking level, or mode in Zed's panel triggers `session/set_config_option` or `session/set_model`, which pi applies to all subsequent prompts in that session.
+
+### Project instructions
+
+Pi checks for a project instructions file at startup in this priority order:
+
+1. `.pi/instructions.md`
+2. `AGENTS.md`
+3. `agents.md`
+
+The first file found (up to 4 000 bytes) is injected into the system prompt prefix for every session in that directory.
 
 ### Debug logging
 
@@ -123,11 +141,15 @@ PI_DEBUG=1 pi acp    # writes verbose logs to ~/.pi/agent/acp.log
 ### Protocol summary
 
 ```
-Zed → pi:  initialize, session/new, session/prompt, session/cancel,
-           session/set_config_option, session/set_model, session/close
+Zed → pi:  initialize, session/new, session/load, session/prompt, session/cancel,
+           session/set_config_option, session/set_model, session/close,
+           input/complete
+
 pi → Zed:  initialize result (agentInfo), session/new result (configOptions + models),
-           session/update notifications (agent_message_chunk, agent_thought_chunk),
-           session/prompt result (stopReason, usage)
+           session/update notifications (agent_message_chunk, agent_thought_chunk,
+             tool_use, tool_result),
+           session/prompt result (stopReason, usage),
+           input/complete result (suggestions + replace range)
 
 Internal:  runtime/report  →  RuntimeReport JSON (regime, anomaly, OPE, attribution, …)
 ```
@@ -231,7 +253,12 @@ Median regret across all three estimators is used for the veto decision; a singl
 
 #### Token-budget guardrail
 
-`Agent.TokenBudget` enforces a hard ceiling on cumulative `InputTokens` per session run. `Options.TurnTokenBudget` adds an independent per-turn ceiling. When either limit is exceeded the agent emits `EventKindError` and returns immediately — preventing runaway cost in long Zed sessions.
+`AgentCx` enforces hard ceilings on token consumption per run:
+
+- `totalBudget` — cumulative `InputTokens` ceiling for the entire run
+- `turnBudget` — per-turn `InputTokens` ceiling checked both before (estimated) and after (measured) each LLM call
+
+When either limit is exceeded the agent emits `EventKindError` and returns immediately — preventing runaway cost in long Zed sessions.
 
 ### Planning & Optimization
 
@@ -277,6 +304,8 @@ A lookup returns a cached response when the best-match similarity exceeds the th
 
 Context compaction uses TF-IDF term overlap with the system prompt as an MI proxy to rank messages by informativeness. `findCutPointMI` keeps the highest-MI messages up to the token budget rather than simply dropping the oldest ones, then aligns the cut to a clean assistant→user turn boundary. This preserves high-information error traces and failed tool calls that a recency-based cut would discard precisely when they are most needed.
 
+Compaction can run **synchronously** (blocking the current turn) or **asynchronously** via `BackgroundCompactor` — the result is applied at the start of the next turn, so no foreground latency is incurred.
+
 #### Trace distillation
 
 `session.Distill` reads all sessions from SQLite, scores each by a quality heuristic — penalising tool errors, rewarding natural stops and session conciseness — and exports high-quality traces as JSONL for offline fine-tuning.
@@ -297,7 +326,7 @@ The OpenRouter provider accepts a `DistillSink` for online knowledge distillatio
 | PAC-Bayes safety bound | `runtime/safety.go` | Safety |
 | Circuit breaker (per stage) | `runtime/circuitbreaker.go` | Safety |
 | IPS/WIS/DR OPE + regret gate | `runtime/ope.go` | Safety |
-| Token-budget guardrail | `agent/agent.go` | Safety |
+| Token-budget guardrail | `agent/cx.go` | Safety |
 | Thompson sampling / Bayesian bandit | `runtime/voi.go` | Planning |
 | MCTS probe planning | `runtime/mcts.go` | Planning |
 | OCO controller + rollback | `runtime/controller.go` | Planning |
@@ -374,6 +403,14 @@ pi config set system_prompt "You are an expert Go developer"
 pi doctor    # Checks config, session dir, and OPENROUTER_API_KEY
 ```
 
+#### `pi update` — Self-update
+
+```bash
+pi update    # Clones latest source from GitHub, rebuilds, and atomically replaces the binary
+```
+
+Requires `go` 1.24+ and `git` on `$PATH`. The running binary is replaced atomically; no manual download needed.
+
 #### `pi acp` — Zed ACP server
 
 ```bash
@@ -414,7 +451,7 @@ Fails if `old_string` is not found or appears more than once (when `replace_all`
 ```json
 { "command": "go test ./...", "timeout": 60000 }
 ```
-Timeout in ms (default 120,000). Output capped at 100 KB. Combined stdout + stderr.
+Timeout in ms (default 120,000). Output capped at 100 KB. Combined stdout + stderr. Runs in the session's working directory when launched from Zed.
 
 ### `grep`
 ```json
@@ -447,7 +484,7 @@ Returns entries with type and size. Max 500 entries.
 
 ## Agent modes
 
-The `Mode` field in `agent.Options` selects the execution strategy for a run. The ACP server exposes this via session configuration.
+The `Mode` field in `agent.Options` selects the execution strategy for a run. The ACP server exposes this via the mode config option.
 
 | Mode | Behaviour |
 |---|---|
@@ -507,6 +544,21 @@ Extensions can optionally define `before_tool(name, params)` and `after_tool(nam
 Also available: `require('path')` and `require('os')` shims, `console.log/warn/error`, and a `process` shim.
 
 Pi applies safe auto-repairs for common JS mistakes (wrong-case API names, missing `await`, unavailable imports) before loading. Forbidden patterns (`eval`, `new Function`, `process.binding`, `dlopen`) cause the extension to be rejected.
+
+### Extension shapes
+
+Each extension is classified by its primary behavioral shape, which informs how the harness lifecycle (load → verify → invoke → shutdown) is applied:
+
+| Shape | Description |
+|---|---|
+| `tool` | Generic tool invocation (default) |
+| `command` | Slash-command or CLI dispatch |
+| `provider` | Data or model provider |
+| `event_hook` | Lifecycle event subscriber |
+| `ui_component` | UI rendering or interaction |
+| `configuration` | Settings / config read-write |
+| `multi` | Declares multiple shapes |
+| `general` | Uncategorized / catch-all |
 
 ### Capability manifest (`.json` sibling for JS extensions)
 
@@ -602,6 +654,8 @@ Sessions live in `~/.pi/agent/sessions/` as `.jsonl` files (one JSON object per 
 
 When conversation history grows large, pi automatically compacts older messages. The compaction algorithm scores each message by TF-IDF term overlap with the system prompt (as an MI proxy) and keeps the highest-information messages up to the token budget — preserving error traces and failed tool calls that a recency-only cut would drop.
 
+In the ACP server, compaction runs on a background goroutine so it never adds latency to the foreground response turn.
+
 ### Trace distillation
 
 ```bash
@@ -618,7 +672,7 @@ Quality score: 1.0 for clean sessions ending with a natural stop; penalised for 
 ```
 cmd/pi/main.go
 internal/
-├── cli/root.go              Cobra command tree (run, session, auth, models, config, doctor, acp, version)
+├── cli/root.go              Cobra command tree (run, session, auth, models, config, doctor, update, acp, version)
 ├── config/config.go         Settings (file + env)
 ├── model/
 │   ├── message.go           Message / ContentBlock / Usage types
@@ -630,10 +684,19 @@ internal/
 │       ├── openrouter.go    OpenRouter streaming + semantic cache + distill sink
 │       └── models.go        Live model list from /api/v1/models
 ├── agent/
-│   ├── agent.go             Core agentic loop + agent modes + token-budget guardrail
+│   ├── agent.go             Core agentic loop + agent modes
+│   ├── cx.go                AgentCx — capability context (lifecycle + budget + telemetry)
+│   ├── retry.go             Exponential-backoff retry for 429 / 5xx / network timeout
 │   ├── session_agent.go     Session-aware wrapper (feeds runtime.Monitor)
-│   └── compaction.go        MI-based context compaction
-├── acp/acp.go               Zed ACP server (JSON-RPC 2.0 over stdio)
+│   └── compaction.go        MI-based context compaction (sync + background)
+├── acp/
+│   ├── acp.go               Zed ACP server (JSON-RPC 2.0 over stdio)
+│   └── snapshot.go          Project snapshot (cwd, language, git branch, instructions)
+├── autocomplete/
+│   └── autocomplete.go      Completion provider (slash commands, @file, paths)
+├── conformance/
+│   ├── compare.go           Semantic JSON comparison (unordered sets, float epsilon)
+│   └── flake.go             Flake detection for non-deterministic test outputs
 ├── runtime/
 │   ├── metrics.go           Shared types (Observation, PolicyTrace, RuntimeReport)
 │   ├── detector.go          CUSUM + BOCPD latency + output drift detection
@@ -651,7 +714,7 @@ internal/
 │   ├── controller.go        OCO controller — routing weights, batch budget, backoff
 │   └── monitor.go           Top-level Monitor wiring all subsystems
 ├── session/
-│   ├── session.go           Session types and JSONL persistence
+│   ├── session.go           Session types and JSONL persistence (version 3)
 │   ├── sqlite.go            SQLite session index
 │   ├── index.go             Session listing helpers
 │   ├── metrics.go           Session-level usage metrics
@@ -659,6 +722,7 @@ internal/
 ├── tools/tools.go           8 built-in tools
 ├── extensions/
 │   ├── manager.go           Extension discovery and lifecycle
+│   ├── harness.go           Extension harness — typed shapes + lifecycle steps
 │   ├── js.go                JavaScript extensions (QuickJS-WASI via wazero, pi.* host APIs)
 │   ├── native.go            Native subprocess extensions (JSON protocol)
 │   ├── ext_tool.go          Tool wrappers + ext meta-dispatcher
@@ -678,7 +742,13 @@ internal/
 
 **Live model list.** `FetchModels()` calls `GET /api/v1/models` on startup. No hardcoded model IDs anywhere. New models on OpenRouter appear in Zed's model picker automatically.
 
-**New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model and thinking level per conversation; Zed's UI controls drive both via `session/set_config_option` and `session/set_model`.
+**New ACP protocol.** Pi implements Zed's `agent_servers` ACP (not the older `language_models` protocol). Session state tracks the active model, thinking level, and mode per conversation; Zed's UI controls drive all three. The `input/complete` method wires Zed's editor input to pi's autocomplete provider (slash commands, `@file` references, filesystem paths).
+
+**AgentCx — single plumbing type.** `AgentCx` carries the three cross-cutting concerns of the agent loop together: lifecycle context (cancellation/deadlines), token budget (total and per-turn), and the runtime monitor. It is constructed at the CLI or RPC entry point and passed unchanged into `Run`, `executeTools`, and every subsystem boundary — no separate context/budget/monitor parameters anywhere in the call chain.
+
+**Retry with backoff.** `streamWithRetry` wraps every `provider.Stream` call. Retriable conditions: HTTP 429, 500, 502, 503, 504, and `net.Error` timeouts. Base delay 500 ms, doubles up to 30 s, 3 attempts by default. Cancelled immediately on context done.
+
+**Project snapshot.** When Zed opens a session, `projectSnapshot(cwd)` reads the filesystem directly (no subprocesses) to build a compact context block: working directory, detected language(s) from manifest files (`go.mod`, `Cargo.toml`, `package.json`, …), git branch from `.git/HEAD`, and top-level directory listing. Any `.pi/instructions.md` or `AGENTS.md` in the project root is appended verbatim (up to 4 KB). This block is prepended to every system prompt so the model has immediate project context without a discovery turn.
 
 **OpenRouter-native.** Every request goes through OpenRouter's OpenAI-compatible `/v1/chat/completions` endpoint. Pi passes OpenRouter's full provider preferences API through: `provider.order` and `allow_fallbacks` for routing, `data_collection: "deny"` for privacy, `quantization` for quantization level selection, and fallback model lists (route="fallback"). The `HTTP-Referer` and `X-Title` headers are set from `openrouter_site_url` / `openrouter_app_name` in config.
 
@@ -686,7 +756,7 @@ internal/
 
 **Minimal dependencies.** 5 direct deps: `cobra` (CLI), `uuid` (session IDs), `sqlite` (session index), `wazero` (WASM runtime), `wazero-quickjs` (QuickJS-WASI for JS extensions). The entire runtime intelligence package uses only stdlib (`math`, `sort`, `sync`, `container/list`).
 
-**Parallel tool execution.** All tool calls from a single assistant turn run in their own goroutine — no blanket concurrency cap. I/O-bound tools (`read`, `write`, `edit`, `grep`, `find`, `ls`, `hashline_edit`) park the goroutine in the OS and cost nothing while blocked. `bash` is the only tool that spawns real OS processes and could saturate CPU, so a semaphore (default 4) throttles only bash calls. Results land in original order via a pre-allocated slice indexed by position. The `onEvent` callback is serialized with a mutex since it writes to stdout or the ACP wire. Both the `Agent` (`pi run`) and `SessionAgent` (ACP/Zed) paths share this design.
+**Parallel tool execution.** All tool calls from a single assistant turn run in their own goroutine. I/O-bound tools (`read`, `write`, `edit`, `grep`, `find`, `ls`, `hashline_edit`) park the goroutine in the OS and cost nothing while blocked. `bash` is the only tool that spawns real OS processes and could saturate CPU, so a semaphore (default 4) throttles only bash calls. Results land in original order via a pre-allocated slice indexed by position. The `onEvent` callback is serialized with a mutex since it writes to stdout or the ACP wire.
 
 **QuickJS-WASI sandbox.** JavaScript extensions run in an isolated WebAssembly instance compiled once per process and cached. Each tool invocation creates a fresh QuickJS instance communicating with Go via a synchronous JSON-over-pipes RPC protocol — stdout carries `HC:{json}` hostcall requests; stdin carries responses. Stdout is reserved for the RPC protocol; `console.*` output goes to stderr.
 
@@ -713,8 +783,8 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 
 | | |
 |---|---|
-| Go source files | 46 |
-| Lines of code | ~9,500 |
+| Go source files | 53 |
+| Lines of code | ~13,600 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |
