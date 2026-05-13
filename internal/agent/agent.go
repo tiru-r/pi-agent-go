@@ -45,8 +45,9 @@ type Options struct {
 	MaxTurns int
 	// Tools lists which tool names are enabled. nil = all built-in tools.
 	Tools []string
-	// TurnTokenBudget caps InputTokens consumed in a single turn (0 = unlimited).
-	TurnTokenBudget int
+	// TurnContextBudget caps context size (InputTokens) in a single turn (0 = unlimited).
+	// Checked pre-turn via estimate and post-turn via measured value.
+	TurnContextBudget int
 	// Mode selects the execution strategy (default: AgentModeAct).
 	Mode AgentMode
 }
@@ -119,6 +120,10 @@ type Agent struct {
 
 	// TokenBudget caps total cumulative InputTokens for a Run (0 = unlimited).
 	TokenBudget int
+
+	// RetryAttempts is the number of times to retry a failed provider.Stream call
+	// for retriable errors (429, 5xx, timeouts). 0 defaults to defaultRetryAttempts (3).
+	RetryAttempts int
 }
 
 // New constructs an Agent backed by the given provider.
@@ -195,7 +200,7 @@ func (a *Agent) Run(
 	// lastMeasuredTokens holds the InputTokens value from the previous API
 	// response. When non-zero it is used instead of the heuristic estimator.
 	var lastMeasuredTokens int
-	var cumulativeInputTokens int
+	var cumulativeUsage model.Usage
 	toolDefsTokens := EstimateToolDefsTokens(toolDefs)
 
 	for turn := 0; turn < maxTurns; turn++ {
@@ -223,6 +228,20 @@ func (a *Agent) Run(
 			}
 		}
 
+		// Pre-turn: enforce context budget before spending a round-trip.
+		if opts.TurnContextBudget > 0 {
+			est := lastMeasuredTokens
+			if est <= 0 {
+				est = estimateTokens(msgs) + toolDefsTokens
+			}
+			if est > opts.TurnContextBudget {
+				budgetErr := fmt.Errorf("agent: context budget exceeded before turn %d (%d/%d tokens estimated)",
+					turn+1, est, opts.TurnContextBudget)
+				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
+				return msgs, budgetErr
+			}
+		}
+
 		req := &provider.Request{
 			Model:         a.model,
 			Messages:      msgs,
@@ -233,7 +252,7 @@ func (a *Agent) Run(
 		}
 
 		t0 := time.Now()
-		eventCh, err := a.prov.Stream(ctx, req)
+		eventCh, err := streamWithRetry(ctx, a.prov, req, a.RetryAttempts)
 		if err != nil {
 			if a.Monitor != nil {
 				a.Monitor.Observe(runtime.Observation{
@@ -264,21 +283,23 @@ func (a *Agent) Run(
 			return msgs, err
 		}
 
-		// Update measured token count for the next compaction check.
+		// Update measured token count and cumulative usage for budget tracking.
 		if resp.Usage.InputTokens > 0 {
 			lastMeasuredTokens = resp.Usage.InputTokens
-			cumulativeInputTokens += resp.Usage.InputTokens
+			cumulativeUsage = cumulativeUsage.Add(resp.Usage)
 
 			// Enforce cumulative token budget.
-			if a.TokenBudget > 0 && cumulativeInputTokens > a.TokenBudget {
-				budgetErr := fmt.Errorf("agent: token budget exceeded (%d/%d input tokens consumed)", cumulativeInputTokens, a.TokenBudget)
+			if a.TokenBudget > 0 && cumulativeUsage.InputTokens > a.TokenBudget {
+				budgetErr := fmt.Errorf("agent: token budget exceeded (%d/%d input tokens consumed)",
+					cumulativeUsage.InputTokens, a.TokenBudget)
 				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
 				return msgs, budgetErr
 			}
 
-			// Enforce per-turn token budget.
-			if opts.TurnTokenBudget > 0 && resp.Usage.InputTokens > opts.TurnTokenBudget {
-				budgetErr := fmt.Errorf("agent: per-turn token budget exceeded (%d/%d input tokens in turn %d)", resp.Usage.InputTokens, opts.TurnTokenBudget, turn+1)
+			// Post-turn: verify context budget with accurate measured tokens.
+			if opts.TurnContextBudget > 0 && resp.Usage.InputTokens > opts.TurnContextBudget {
+				budgetErr := fmt.Errorf("agent: context budget exceeded in turn %d (%d/%d input tokens)",
+					turn+1, resp.Usage.InputTokens, opts.TurnContextBudget)
 				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
 				return msgs, budgetErr
 			}
@@ -291,7 +312,7 @@ func (a *Agent) Run(
 		if resp.StopReason != model.StopReasonToolUse {
 			onEvent(AgentEvent{
 				Kind:       EventKindDone,
-				Usage:      resp.Usage,
+				Usage:      cumulativeUsage,
 				StopReason: resp.StopReason,
 			})
 			return msgs, nil
@@ -319,6 +340,8 @@ func (a *Agent) Run(
 		}
 	}
 
+	// Emit final usage before the error so callers can account for consumed tokens.
+	onEvent(AgentEvent{Kind: EventKindDone, Usage: cumulativeUsage})
 	err := fmt.Errorf("agent: max turns (%d) reached without completion", maxTurns)
 	onEvent(AgentEvent{Kind: EventKindError, Err: err})
 	return msgs, err
@@ -341,13 +364,14 @@ func drainStream(
 		stop        model.StopReason
 	)
 
+loop:
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case ev, ok := <-ch:
 			if !ok {
-				goto done
+				break loop
 			}
 			switch ev.Type {
 			case provider.EventError:
@@ -399,7 +423,6 @@ func drainStream(
 			}
 		}
 	}
-done:
 	// Append tool blocks sorted by their stream index so ordering is stable
 	// even if EventToolCallDone events arrive out of sequence.
 	sort.Ints(toolOrder)

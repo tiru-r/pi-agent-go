@@ -258,7 +258,33 @@ func splitByMI(msgs []model.Message, keepBudget int, system string) (toSummarise
 	if len(toSummarise) == 0 {
 		return nil, msgs
 	}
+
+	// Non-contiguous selection can produce invalid role sequences (e.g. two
+	// consecutive user messages). Fall back to contiguous recency cut when that
+	// happens — correctness beats relevance scoring.
+	if !isRoleAlternationValid(kept) {
+		cut := findCutPoint(msgs, keepBudget)
+		if cut == 0 {
+			return nil, msgs
+		}
+		return msgs[:cut], msgs[cut:]
+	}
+
 	return toSummarise, kept
+}
+
+// isRoleAlternationValid reports whether msgs would form a valid role-alternating
+// sequence after a leading user message (the compaction summary). Each message
+// role must differ from the previous one.
+func isRoleAlternationValid(msgs []model.Message) bool {
+	prev := model.RoleUser // summary message precedes the kept slice
+	for _, msg := range msgs {
+		if msg.Role == prev {
+			return false
+		}
+		prev = msg.Role
+	}
+	return true
 }
 
 // isToolPair reports whether prev is an assistant message containing tool_use
@@ -506,8 +532,8 @@ func (c *Compactor) summarise(ctx context.Context, msgs []model.Message, system 
 }
 
 // extractFilePaths scans tool_use blocks in msgs and returns sorted slices of
-// read and modified file paths, recognised via the standard "file_path"
-// parameter of the Read, Write, and Edit tools.
+// read and modified file paths, recognised via the standard "path" parameter
+// of the Read, Write, Edit, and hashline_edit tools.
 func extractFilePaths(msgs []model.Message) (read, modified []string) {
 	readSet := make(map[string]bool)
 	modSet := make(map[string]bool)
@@ -521,14 +547,14 @@ func extractFilePaths(msgs []model.Message) (read, modified []string) {
 			if json.Unmarshal(block.Input, &params) != nil {
 				continue
 			}
-			path, _ := params["file_path"].(string)
+			path, _ := params["path"].(string)
 			if path == "" {
 				continue
 			}
 			switch strings.ToLower(block.Name) {
 			case "read":
 				readSet[path] = true
-			case "write", "edit":
+			case "write", "edit", "hashline_edit":
 				modSet[path] = true
 			}
 		}

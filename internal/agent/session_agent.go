@@ -40,6 +40,10 @@ type SessionAgent struct {
 	// Hooks is optional; wire an extensions.Manager to broadcast tool lifecycle
 	// events to JS extensions that define before_tool / after_tool.
 	Hooks HookRunner
+
+	// RetryAttempts is the number of times to retry a failed provider.Stream call
+	// for retriable errors (429, 5xx, timeouts). 0 defaults to defaultRetryAttempts (3).
+	RetryAttempts int
 }
 
 // SessionRunOptions configures a single SessionAgent.Run call.
@@ -159,7 +163,7 @@ func (a *SessionAgent) Run(
 		}
 
 		t0 := time.Now()
-		events, err := a.Provider.Stream(ctx, req)
+		events, err := streamWithRetry(ctx, a.Provider, req, a.RetryAttempts)
 		if err != nil {
 			if a.Monitor != nil {
 				a.Monitor.Observe(runtime.Observation{
@@ -214,7 +218,10 @@ func (a *SessionAgent) Run(
 			return nil
 		}
 
-		results := a.runTools(ctx, toolUses)
+		// Capture before goroutines start so runTool doesn't call Session.Messages()
+		// (which acquires a mutex and rebuilds the list) from every tool goroutine.
+		msgCount := len(msgs)
+		results := a.runTools(ctx, toolUses, msgCount)
 
 		// Build and persist the tool_result message.
 		toolResultMsg := model.Message{
@@ -229,14 +236,19 @@ func (a *SessionAgent) Run(
 	return fmt.Errorf("session_agent: max iterations (%d) exceeded", maxIter)
 }
 
-// bashSem caps concurrent bash tool calls to avoid OS process saturation.
+// bashSem is shared across all SessionAgent and Agent instances in the process.
+// The cap of maxBashWorkers applies system-wide, intentionally preventing
+// multi-session workloads from saturating OS process and CPU limits.
 // I/O-bound tools (read, write, grep, find, ls, edit, hashline_edit) run
 // without a cap — Go parks blocked goroutines for free.
+// Adjust maxBashWorkers at program startup if a different cap is needed.
 var bashSem = make(chan struct{}, maxBashWorkers)
 
 // runTools executes all tool uses concurrently and returns result
-// ContentBlocks in the same order as uses.
-func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) []model.ContentBlock {
+// ContentBlocks in the same order as uses. msgCount is the message count
+// captured before the goroutines start; it is passed to runTool so it can
+// record monitoring observations without rebuilding the session message list.
+func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock, msgCount int) []model.ContentBlock {
 	// Build a name→tool map once so each goroutine does an O(1) lookup.
 	toolMap := make(map[string]tools.Tool, len(a.Tools))
 	for _, t := range a.Tools {
@@ -263,7 +275,7 @@ func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) 
 					return
 				}
 			}
-			results[i] = a.runTool(ctx, block, toolMap)
+			results[i] = a.runTool(ctx, block, toolMap, msgCount)
 		}(i, use)
 	}
 	wg.Wait()
@@ -272,7 +284,9 @@ func (a *SessionAgent) runTools(ctx context.Context, uses []model.ContentBlock) 
 
 // runTool executes a single tool call and returns a tool_result ContentBlock.
 // toolMap is the pre-built name→tool index from the caller's a.Tools slice.
-func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock, toolMap map[string]tools.Tool) model.ContentBlock {
+// msgCount is the message count at the start of the tool-execution batch; it is
+// used for monitoring weight without acquiring the session mutex mid-goroutine.
+func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock, toolMap map[string]tools.Tool, msgCount int) model.ContentBlock {
 	result := model.ContentBlock{
 		Type:      model.ContentTypeToolResult,
 		ToolUseID: block.ID,
@@ -312,7 +326,7 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock, to
 				Time:    t0tool,
 				Stage:   "tool:" + block.Name,
 				Latency: toolLatency,
-				Weight:  float64(len(a.Session.Messages())),
+				Weight:  float64(msgCount),
 				Success: false,
 			})
 		}
@@ -332,7 +346,7 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock, to
 			Time:    t0tool,
 			Stage:   "tool:" + block.Name,
 			Latency: toolLatency,
-			Weight:  float64(len(a.Session.Messages())),
+			Weight:  float64(msgCount),
 			Success: !res.IsError,
 		})
 	}
@@ -354,15 +368,17 @@ func (a *SessionAgent) runTool(ctx context.Context, block model.ContentBlock, to
 
 // teeEvents fans an event channel to the optional onEvent callback and
 // returns a new channel that can be drained by provider.Collect.
+// The collector channel is fed first (non-blocking while buffer has space) so
+// provider.Collect can process events without waiting for the UI callback.
 func teeEvents(in <-chan provider.Event, onEvent func(provider.Event)) <-chan provider.Event {
 	out := make(chan provider.Event, 64)
 	go func() {
 		defer close(out)
 		for ev := range in {
+			out <- ev
 			if onEvent != nil {
 				onEvent(ev)
 			}
-			out <- ev
 		}
 	}()
 	return out
