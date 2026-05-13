@@ -58,7 +58,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,16p' "$0" | sed 's/^# \?//'
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -70,11 +70,11 @@ done
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
 
-log()  { [ "$QUIET" -eq 1 ] && return; echo -e "$*"; }
-ok()   { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;32m✓\033[0m $*"; }
-warn() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[1;33m⚠\033[0m $*"; }
+log()  { [ "$QUIET" -eq 1 ] && return; echo -e "$*" >&2; }
+ok()   { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;32m✓\033[0m $*" >&2; }
+warn() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[1;33m⚠\033[0m $*" >&2; }
 err()  { echo -e "\033[0;31m✗\033[0m $*" >&2; }
-info() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;34m→\033[0m $*"; }
+info() { [ "$QUIET" -eq 1 ] && return; echo -e "\033[0;34m→\033[0m $*" >&2; }
 
 prompt_confirm() {
   local msg="$1"

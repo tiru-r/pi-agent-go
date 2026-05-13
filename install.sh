@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,16p' "$0" | sed 's/^# \?//'
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -96,7 +96,7 @@ check_go() {
   fi
 
   local ver
-  ver=$(go version | grep -oP 'go\K[0-9]+\.[0-9]+' | head -1)
+  ver=$(go version | grep -oE 'go[0-9]+\.[0-9]+' | head -1 | sed 's/^go//')
   local major minor
   major=$(echo "$ver" | cut -d. -f1)
   minor=$(echo "$ver" | cut -d. -f2)
