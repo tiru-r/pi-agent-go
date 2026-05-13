@@ -140,41 +140,74 @@ func TestSplitByMI_EmptySystem_FallsBackToRecency(t *testing.T) {
 }
 
 func TestSplitByMI_NonContiguous_HighScoringMessagePreserved(t *testing.T) {
-	// msg0 and msg4 reference "kubernetes deployment" from system prompt → high MI
-	// msg1, msg2, msg3 are off-topic chit-chat → low MI
+	// The two high-MI messages are an assistant→user pair so the kept sequence
+	// is valid after the summary (user): summary(user)|assistant|user.
+	// msg0 and msg3–5 are low-MI filler that should be summarised.
 	system := "kubernetes deployment pipeline container orchestration"
 	msgs := []model.Message{
-		userMsg("kubernetes deployment configuration"),                // high MI
-		assistMsg("sure thing"),                                       // low MI
-		userMsg("what is your favourite colour"),                      // low MI
-		assistMsg("blue"),                                             // low MI
-		userMsg("back to kubernetes container orchestration please"), // high MI
-		assistMsg("of course"),                                        // low MI
+		userMsg("hello"),                                                          // 0: low MI
+		assistMsg("kubernetes deployment pipeline configuration ready"),           // 1: HIGH MI
+		userMsg("kubernetes container orchestration setup confirmed"),             // 2: HIGH MI
+		assistMsg("what is your favourite colour"),                                // 3: low MI
+		userMsg("blue"),                                                           // 4: low MI
+		assistMsg("ok"),                                                           // 5: low MI
 	}
 
-	// Budget sized to keep the two high-MI messages but not all six.
-	highMITokens := estimateMsgTokens(msgs[0]) + estimateMsgTokens(msgs[4])
-	budget := highMITokens + 1
+	// Exact budget for the two high-MI messages — no surplus to pull in filler.
+	budget := estimateMsgTokens(msgs[1]) + estimateMsgTokens(msgs[2])
 
 	toSum, kept := splitByMI(msgs, budget, system)
 
 	if toSum == nil {
 		t.Fatal("expected some messages to be summarised")
 	}
-	// msgs[0] and msgs[4] must be in kept.
+	// msgs[1] and msgs[2] must be in kept.
 	keptSet := make(map[string]bool)
 	for _, m := range kept {
 		keptSet[m.Content[0].Text] = true
 	}
-	if !keptSet["kubernetes deployment configuration"] {
-		t.Error("msg0 (high MI) should be preserved, but was summarised")
+	if !keptSet["kubernetes deployment pipeline configuration ready"] {
+		t.Error("msg1 (high MI assistant) should be preserved, but was summarised")
 	}
-	if !keptSet["back to kubernetes container orchestration please"] {
-		t.Error("msg4 (high MI) should be preserved, but was summarised")
+	if !keptSet["kubernetes container orchestration setup confirmed"] {
+		t.Error("msg2 (high MI user) should be preserved, but was summarised")
 	}
 	// Total must still equal len(msgs).
 	if len(toSum)+len(kept) != len(msgs) {
 		t.Fatalf("partition lost messages: toSum=%d kept=%d total=%d", len(toSum), len(kept), len(msgs))
+	}
+}
+
+func TestSplitByMI_FallsBackWhenInternalAlternationInvalid(t *testing.T) {
+	// Both high-MI messages are user messages; TF-IDF selection would produce
+	// [user, user] within kept — internally invalid. The function must detect
+	// this and fall back to findCutPoint so kept has no consecutive same-role pairs.
+	system := "kubernetes deployment"
+	msgs := []model.Message{
+		userMsg("kubernetes deployment start"),    // 0: HIGH MI — user
+		assistMsg("acknowledged"),                 // 1: low MI
+		userMsg("kubernetes deployment continue"), // 2: HIGH MI — user
+		assistMsg("got it"),                       // 3: low MI
+		userMsg("something else entirely"),        // 4: low MI
+		assistMsg("sure"),                         // 5: low MI
+	}
+	// Budget that selects msg0+msg2 (both user) — triggers the fallback.
+	budget := estimateMsgTokens(msgs[0]) + estimateMsgTokens(msgs[2])
+
+	toSum, kept := splitByMI(msgs, budget, system)
+
+	if toSum == nil {
+		t.Fatal("expected some messages to be summarised")
+	}
+	if len(toSum)+len(kept) != len(msgs) {
+		t.Fatalf("partition lost messages: toSum=%d kept=%d total=%d", len(toSum), len(kept), len(msgs))
+	}
+	// Kept must have no two consecutive same-role messages.
+	for i := 1; i < len(kept); i++ {
+		if kept[i].Role == kept[i-1].Role {
+			t.Errorf("kept[%d] and kept[%d] both have role %s — invalid conversation structure",
+				i-1, i, kept[i].Role)
+		}
 	}
 }
 
@@ -422,7 +455,7 @@ func TestBackgroundCompactor_TriggerAndTake(t *testing.T) {
 		MaxTokens:        100,
 		KeepRecentTokens: 1,
 	}
-	bg := &BackgroundCompactor{C: comp}
+	bg := NewBackgroundCompactor(context.Background(), comp)
 
 	msgs := []model.Message{
 		userMsg(strings.Repeat("a", 200)),
@@ -459,7 +492,7 @@ func TestBackgroundCompactor_ConcurrentTrigger_IsNoOp(t *testing.T) {
 		MaxTokens:        10,
 		KeepRecentTokens: 1,
 	}
-	bg := &BackgroundCompactor{C: comp}
+	bg := NewBackgroundCompactor(context.Background(), comp)
 
 	msgs := []model.Message{
 		userMsg(strings.Repeat("x", 200)),
@@ -494,7 +527,7 @@ func TestBackgroundCompactor_ConcurrentTrigger_IsNoOp(t *testing.T) {
 func TestBackgroundCompactor_Take_ClearsResult(t *testing.T) {
 	prov := &mockProvider{text: "x"}
 	comp := &Compactor{Provider: prov, MaxTokens: 10, KeepRecentTokens: 1}
-	bg := &BackgroundCompactor{C: comp}
+	bg := NewBackgroundCompactor(context.Background(), comp)
 
 	msgs := []model.Message{
 		userMsg(strings.Repeat("a", 200)),

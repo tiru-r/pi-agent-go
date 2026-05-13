@@ -320,8 +320,10 @@ type Server struct {
 	completer *autocomplete.Provider
 }
 
-// New builds a Server.
-func New(cfg *config.Config) (*Server, error) {
+// New builds a Server. ctx is the server's lifetime context: it is passed
+// to initialisation calls (extension loading, model prefetch) so they are
+// bounded by the server's lifetime rather than context.Background().
+func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	p, err := factory.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("acp: init provider: %w", err)
@@ -339,10 +341,10 @@ func New(cfg *config.Config) (*Server, error) {
 		monitor:     runtime.NewMonitor(),
 	}
 	// Initialize extension manager. Failure is non-fatal.
-	extMgr, err := extensions.New(context.Background(), cfg.ExtensionsDir)
+	extMgr, err := extensions.New(ctx, cfg.ExtensionsDir)
 	if err != nil {
 		slog.Warn("acp: extensions init failed", "err", err)
-		extMgr, err = extensions.New(context.Background(), "") // empty = no extensions
+		extMgr, err = extensions.New(ctx, "") // empty = no extensions
 		if err != nil {
 			slog.Warn("acp: extensions fallback also failed", "err", err)
 		}
@@ -365,13 +367,13 @@ func New(cfg *config.Config) (*Server, error) {
 			}
 		}
 	}
-	go s.prefetchModels()
+	go s.prefetchModels(ctx)
 	return s, nil
 }
 
-func (s *Server) prefetchModels() {
+func (s *Server) prefetchModels(ctx context.Context) {
 	defer close(s.modelsReady)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	infos, err := openrouter.FetchModels(ctx, s.cfg.OpenRouterAPIKey)
 	if err != nil {
@@ -432,14 +434,14 @@ func (s *Server) Serve(ctx context.Context) error {
 		case "session/prompt":
 			go s.handleSessionPrompt(ctx, &req)
 		case "session/load":
-			go s.handleSessionLoad(&req)
+			go s.handleSessionLoad(ctx, &req)
 		default:
 			s.dispatch(ctx, &req)
 		}
 	}
 }
 
-func (s *Server) dispatch(_ context.Context, req *request) {
+func (s *Server) dispatch(ctx context.Context, req *request) {
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
@@ -454,9 +456,9 @@ func (s *Server) dispatch(_ context.Context, req *request) {
 	case "session/close":
 		s.handleSessionClose(req)
 	case "runtime/report":
-		s.handleRuntimeReport(req)
+		s.handleRuntimeReport(ctx, req)
 	case "input/complete":
-		s.handleInputComplete(req)
+		s.handleInputComplete(ctx, req)
 	default:
 		if req.ID != nil {
 			s.sendError(rawID(req.ID), -32601, "method not found: "+req.Method)
@@ -466,7 +468,7 @@ func (s *Server) dispatch(_ context.Context, req *request) {
 
 // ── Method handlers ───────────────────────────────────────────────────────────
 
-func (s *Server) handleRuntimeReport(req *request) {
+func (s *Server) handleRuntimeReport(_ context.Context, req *request) {
 	report := s.monitor.Report()
 	s.sendResult(rawID(req.ID), report)
 }
@@ -786,16 +788,19 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	}
 
 	ag := agent.New(s.provider, modelID, system, maxTokens)
-	ag.Monitor = runtime.NewMonitor()
 	ag.Hooks = s.extMgr
 	ag.Compactor = s.makeCompactor(modelID)
+
+	// Construct the capability context at the RPC boundary: lifecycle (cctx),
+	// no token budget (0/0), and a fresh per-run monitor for runtime intelligence.
+	cx := agent.NewAgentCx(cctx, 0, 0, runtime.NewMonitor())
 
 	var finalStop model.StopReason = model.StopReasonEndTurn
 	var finalUsage model.Usage
 
 	slog.Debug("session/prompt", "session", p.SessionID, "model", modelID, "thinking", thinkLevel, "mode", agentMode)
 
-	updatedMsgs, err := ag.Run(cctx, prompt, history, agent.Options{
+	updatedMsgs, err := ag.Run(cx, prompt, history, agent.Options{
 		ThinkingLevel: thinkLevel,
 		Mode:          agentMode,
 	}, func(ev agent.AgentEvent) {
@@ -879,7 +884,7 @@ func (s *Server) sendSessionUpdate(sessionID, updateType, text string) {
 
 // handleSessionLoad loads a prior session from disk, registers it, replays
 // assistant history as session/update notifications, then returns the result.
-func (s *Server) handleSessionLoad(req *request) {
+func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 	if req.Params == nil {
 		s.sendError(rawID(req.ID), -32602, "params required")
 		return
@@ -934,6 +939,9 @@ func (s *Server) handleSessionLoad(req *request) {
 
 	// Replay assistant messages so Zed can reconstruct the conversation thread.
 	for _, msg := range msgs {
+		if ctx.Err() != nil {
+			return // server is shutting down; stop sending
+		}
 		if msg.Role != model.RoleAssistant {
 			continue
 		}
@@ -1183,7 +1191,7 @@ type acpRange struct {
 	End   int `json:"end"`
 }
 
-func (s *Server) handleInputComplete(req *request) {
+func (s *Server) handleInputComplete(_ context.Context, req *request) {
 	if req.Params == nil {
 		s.sendError(rawID(req.ID), -32602, "params required")
 		return

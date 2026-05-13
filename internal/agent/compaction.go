@@ -273,16 +273,15 @@ func splitByMI(msgs []model.Message, keepBudget int, system string) (toSummarise
 	return toSummarise, kept
 }
 
-// isRoleAlternationValid reports whether msgs would form a valid role-alternating
-// sequence after a leading user message (the compaction summary). Each message
-// role must differ from the previous one.
+// isRoleAlternationValid reports whether msgs contains no two consecutive
+// messages with the same role. This checks only within the kept slice itself;
+// the inherent summary(user)→kept[0](user) boundary that findCutPoint also
+// produces is a separate pre-existing design characteristic, not checked here.
 func isRoleAlternationValid(msgs []model.Message) bool {
-	prev := model.RoleUser // summary message precedes the kept slice
-	for _, msg := range msgs {
-		if msg.Role == prev {
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].Role == msgs[i-1].Role {
 			return false
 		}
-		prev = msg.Role
 	}
 	return true
 }
@@ -331,12 +330,24 @@ func EstimateToolDefsTokens(defs []model.ToolDefinition) int {
 // at a time; concurrent Trigger calls while one is in-flight are silently
 // ignored. The completed result is stored and retrieved with Take on the next
 // agent turn.
+//
+// Use NewBackgroundCompactor to construct — it binds a parent context so
+// background goroutines cannot outlive the server or session that owns them.
 type BackgroundCompactor struct {
-	C *Compactor // must not be nil
+	C   *Compactor     // must not be nil
+	ctx context.Context // parent context; set by NewBackgroundCompactor
 
 	mu      sync.Mutex
 	running bool
 	pending *BGResult
+}
+
+// NewBackgroundCompactor creates a BackgroundCompactor whose goroutines derive
+// their context from parent. Pass the server or session lifetime context so
+// compaction goroutines are bounded by the owner's lifetime rather than
+// context.Background().
+func NewBackgroundCompactor(parent context.Context, c *Compactor) *BackgroundCompactor {
+	return &BackgroundCompactor{C: c, ctx: parent}
 }
 
 // BGResult holds the output of a completed background Compact call plus the
@@ -369,7 +380,11 @@ func (b *BackgroundCompactor) Trigger(msgs []model.Message, system, headID strin
 	copy(cp, msgs)
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		parent := b.ctx
+		if parent == nil {
+			parent = context.Background() // safe fallback for zero-value construction
+		}
+		ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 		defer cancel()
 
 		compacted, summary, err := b.C.Compact(ctx, cp, system)

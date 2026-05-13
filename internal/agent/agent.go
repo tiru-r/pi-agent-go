@@ -45,9 +45,6 @@ type Options struct {
 	MaxTurns int
 	// Tools lists which tool names are enabled. nil = all built-in tools.
 	Tools []string
-	// TurnContextBudget caps context size (InputTokens) in a single turn (0 = unlimited).
-	// Checked pre-turn via estimate and post-turn via measured value.
-	TurnContextBudget int
 	// Mode selects the execution strategy (default: AgentModeAct).
 	Mode AgentMode
 }
@@ -96,14 +93,16 @@ type HookRunner interface {
 }
 
 // Agent drives the LLM ↔ tool loop.
+//
+// Static configuration (model, prompts, tools) lives here.
+// Runtime capabilities (lifecycle, budget, telemetry) travel in the AgentCx
+// passed to Run — construct the AgentCx at the RPC/CLI entry point and pass
+// it unchanged into every subsystem boundary.
 type Agent struct {
 	prov   provider.Provider
 	model  string
 	system string
 	maxTok int
-
-	// Monitor is optional; attach one to enable runtime intelligence.
-	Monitor *runtime.Monitor
 
 	// Hooks is optional; wire an extensions.Manager to broadcast tool lifecycle
 	// events to JS extensions that define before_tool / after_tool.
@@ -117,9 +116,6 @@ type Agent struct {
 	// does not block the foreground turn. The result is applied at the start of
 	// the next turn. Requires Compactor to also be set.
 	BGCompactor *BackgroundCompactor
-
-	// TokenBudget caps total cumulative InputTokens for a Run (0 = unlimited).
-	TokenBudget int
 
 	// RetryAttempts is the number of times to retry a failed provider.Stream call
 	// for retriable errors (429, 5xx, timeouts). 0 defaults to defaultRetryAttempts (3).
@@ -137,11 +133,13 @@ func New(prov provider.Provider, modelName, system string, maxTokens int) *Agent
 }
 
 // Run executes the agent loop for the given input, appending to history.
+// cx carries the lifecycle context, token budget, and runtime monitor for
+// this run — construct it at the entry point and pass it unchanged here.
 // Events are dispatched to onEvent synchronously as they arrive.
 // history is the prior conversation; the new user message is prepended automatically.
 // Returns the updated message history (including the new turn).
 func (a *Agent) Run(
-	ctx context.Context,
+	cx *AgentCx,
 	input string,
 	history []model.Message,
 	opts Options,
@@ -178,11 +176,9 @@ func (a *Agent) Run(
 	var toolDefs []model.ToolDefinition
 	switch opts.Mode {
 	case AgentModePlan:
-		// No tools — forces end_turn after the plan text.
 		maxTurns = 1
 		systemPrompt = modePrefix("You are in PLAN MODE. Do not use any tools. Output a detailed numbered plan of exactly what you would do to complete this task.", systemPrompt)
 	case AgentModePipe:
-		// No tools — single-turn pass-through.
 		maxTurns = 1
 	case AgentModePlanAct:
 		toolDefs = resolveTools(opts.Tools)
@@ -193,20 +189,19 @@ func (a *Agent) Run(
 	case AgentModeHandoff:
 		toolDefs = resolveTools(opts.Tools)
 		systemPrompt = modeSuffix(systemPrompt, "When your task is complete, output a HANDOFF section with a concise state summary so another agent can continue from where you left off.")
-	default: // AgentModeAct and unset ("")
+	default:
 		toolDefs = resolveTools(opts.Tools)
 	}
 
 	// lastMeasuredTokens holds the InputTokens value from the previous API
 	// response. When non-zero it is used instead of the heuristic estimator.
 	var lastMeasuredTokens int
-	var cumulativeUsage model.Usage
 	toolDefsTokens := EstimateToolDefsTokens(toolDefs)
 
 	for turn := 0; turn < maxTurns; turn++ {
 		select {
-		case <-ctx.Done():
-			return msgs, ctx.Err()
+		case <-cx.Done():
+			return msgs, cx.Err()
 		default:
 		}
 
@@ -222,24 +217,20 @@ func (a *Agent) Run(
 		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens, toolDefsTokens) {
 			if a.BGCompactor != nil {
 				a.BGCompactor.Trigger(msgs, systemPrompt, "")
-			} else if compacted, _, compactErr := a.Compactor.Compact(ctx, msgs, systemPrompt); compactErr == nil {
+			} else if compacted, _, compactErr := a.Compactor.Compact(cx.Context(), msgs, systemPrompt); compactErr == nil {
 				msgs = compacted
 				lastMeasuredTokens = estimateTokens(compacted)
 			}
 		}
 
-		// Pre-turn: enforce context budget before spending a round-trip.
-		if opts.TurnContextBudget > 0 {
-			est := lastMeasuredTokens
-			if est <= 0 {
-				est = estimateTokens(msgs) + toolDefsTokens
-			}
-			if est > opts.TurnContextBudget {
-				budgetErr := fmt.Errorf("agent: context budget exceeded before turn %d (%d/%d tokens estimated)",
-					turn+1, est, opts.TurnContextBudget)
-				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
-				return msgs, budgetErr
-			}
+		// Pre-turn: check context budget via estimate before spending a round-trip.
+		est := lastMeasuredTokens
+		if est <= 0 {
+			est = estimateTokens(msgs) + toolDefsTokens
+		}
+		if err := cx.CheckPreTurn(turn, est); err != nil {
+			onEvent(AgentEvent{Kind: EventKindError, Err: err})
+			return msgs, err
 		}
 
 		req := &provider.Request{
@@ -252,10 +243,10 @@ func (a *Agent) Run(
 		}
 
 		t0 := time.Now()
-		eventCh, err := streamWithRetry(ctx, a.prov, req, a.RetryAttempts)
+		eventCh, err := streamWithRetry(cx.Context(), a.prov, req, a.RetryAttempts)
 		if err != nil {
-			if a.Monitor != nil {
-				a.Monitor.Observe(runtime.Observation{
+			if cx.Monitor != nil {
+				cx.Monitor.Observe(runtime.Observation{
 					Time:    t0,
 					Stage:   "llm",
 					Latency: time.Since(t0),
@@ -269,9 +260,9 @@ func (a *Agent) Run(
 
 		// Drain the stream, collecting a complete response message while
 		// forwarding incremental events to the caller.
-		resp, err := drainStream(ctx, eventCh, onEvent)
-		if a.Monitor != nil {
-			a.Monitor.Observe(runtime.Observation{
+		resp, err := drainStream(cx.Context(), eventCh, onEvent)
+		if cx.Monitor != nil {
+			cx.Monitor.Observe(runtime.Observation{
 				Time:    t0,
 				Stage:   "llm",
 				Latency: time.Since(t0),
@@ -283,25 +274,12 @@ func (a *Agent) Run(
 			return msgs, err
 		}
 
-		// Update measured token count and cumulative usage for budget tracking.
+		// Post-turn: record usage and verify both budget limits with accurate counts.
 		if resp.Usage.InputTokens > 0 {
 			lastMeasuredTokens = resp.Usage.InputTokens
-			cumulativeUsage = cumulativeUsage.Add(resp.Usage)
-
-			// Enforce cumulative token budget.
-			if a.TokenBudget > 0 && cumulativeUsage.InputTokens > a.TokenBudget {
-				budgetErr := fmt.Errorf("agent: token budget exceeded (%d/%d input tokens consumed)",
-					cumulativeUsage.InputTokens, a.TokenBudget)
-				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
-				return msgs, budgetErr
-			}
-
-			// Post-turn: verify context budget with accurate measured tokens.
-			if opts.TurnContextBudget > 0 && resp.Usage.InputTokens > opts.TurnContextBudget {
-				budgetErr := fmt.Errorf("agent: context budget exceeded in turn %d (%d/%d input tokens)",
-					turn+1, resp.Usage.InputTokens, opts.TurnContextBudget)
-				onEvent(AgentEvent{Kind: EventKindError, Err: budgetErr})
-				return msgs, budgetErr
+			if err := cx.RecordTurn(turn, resp.Usage); err != nil {
+				onEvent(AgentEvent{Kind: EventKindError, Err: err})
+				return msgs, err
 			}
 		}
 
@@ -312,14 +290,14 @@ func (a *Agent) Run(
 		if resp.StopReason != model.StopReasonToolUse {
 			onEvent(AgentEvent{
 				Kind:       EventKindDone,
-				Usage:      cumulativeUsage,
+				Usage:      cx.Usage(),
 				StopReason: resp.StopReason,
 			})
 			return msgs, nil
 		}
 
 		// Halt before running tools if the runtime monitor signals a safety veto.
-		if a.Monitor != nil && a.Monitor.ShouldVeto() {
+		if cx.Monitor != nil && cx.Monitor.ShouldVeto() {
 			err := fmt.Errorf("agent: runtime safety veto — error rate exceeded threshold, halting tool execution")
 			onEvent(AgentEvent{Kind: EventKindError, Err: err})
 			return msgs, err
@@ -328,10 +306,7 @@ func (a *Agent) Run(
 		// Execute tool calls and collect results.
 		// safeEmit is passed so goroutines inside executeTools can emit events
 		// without the caller needing to handle concurrent access.
-		toolResults, err := executeTools(ctx, resp.Message.Content, safeEmit, a.Monitor, a.Hooks, len(msgs))
-		if err != nil {
-			return msgs, err
-		}
+		toolResults := executeTools(cx, resp.Message.Content, safeEmit, a.Hooks, len(msgs))
 		if len(toolResults) > 0 {
 			msgs = append(msgs, model.Message{
 				Role:    model.RoleUser,
@@ -341,7 +316,7 @@ func (a *Agent) Run(
 	}
 
 	// Emit final usage before the error so callers can account for consumed tokens.
-	onEvent(AgentEvent{Kind: EventKindDone, Usage: cumulativeUsage})
+	onEvent(AgentEvent{Kind: EventKindDone, Usage: cx.Usage()})
 	err := fmt.Errorf("agent: max turns (%d) reached without completion", maxTurns)
 	onEvent(AgentEvent{Kind: EventKindError, Err: err})
 	return msgs, err
@@ -438,14 +413,18 @@ loop:
 
 // executeTools runs all tool_use blocks from the assistant message in parallel
 // (up to maxToolConcurrency goroutines) and returns results in original order.
+// cx is the run's capability context — lifecycle cancellation and monitor are
+// read from it; the context is extracted via cx.Context() for tool.Execute calls.
+// Tool-level errors are embedded in the returned ContentBlocks (IsError=true);
+// this function itself only errors if the calling convention is violated, which
+// cannot happen, so the return is a plain slice.
 func executeTools(
-	ctx context.Context,
+	cx *AgentCx,
 	blocks []model.ContentBlock,
 	onEvent func(AgentEvent),
-	mon *runtime.Monitor,
 	hooks HookRunner,
 	msgCount int,
-) ([]model.ContentBlock, error) {
+) []model.ContentBlock {
 	// Collect tool-use blocks preserving original order.
 	type call struct{ block model.ContentBlock }
 	var calls []call
@@ -455,7 +434,7 @@ func executeTools(
 		}
 	}
 	if len(calls) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	results := make([]model.ContentBlock, len(calls))
@@ -473,18 +452,18 @@ func executeTools(
 				select {
 				case bashSem <- struct{}{}:
 					defer func() { <-bashSem }()
-				case <-ctx.Done():
+				case <-cx.Done():
 					result := model.ContentBlock{
 						Type:      model.ContentTypeToolResult,
 						ToolUseID: block.ID,
-						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: ctx.Err().Error()}},
+						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: cx.Err().Error()}},
 						IsError:   true,
 					}
 					onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 					results[i] = result
 					return
 				}
-			} else if err := ctx.Err(); err != nil {
+			} else if err := cx.Err(); err != nil {
 				result := model.ContentBlock{
 					Type:      model.ContentTypeToolResult,
 					ToolUseID: block.ID,
@@ -504,8 +483,8 @@ func executeTools(
 					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: fmt.Sprintf("unknown tool: %s", block.Name)}},
 					IsError:   true,
 				}
-				if mon != nil {
-					mon.Observe(runtime.Observation{
+				if cx.Monitor != nil {
+					cx.Monitor.Observe(runtime.Observation{
 						Time:    time.Now(),
 						Stage:   "tool:" + block.Name,
 						Weight:  float64(msgCount),
@@ -523,7 +502,7 @@ func executeTools(
 			}
 
 			if hooks != nil {
-				hooks.RunBeforeTool(ctx, block.Name, params)
+				hooks.RunBeforeTool(cx.Context(), block.Name, params)
 			}
 
 			onEvent(AgentEvent{
@@ -534,7 +513,7 @@ func executeTools(
 			})
 
 			t0 := time.Now()
-			toolResult, err := t.Execute(ctx, params)
+			toolResult, err := t.Execute(cx.Context(), params)
 			latency := time.Since(t0)
 
 			var resultContent []model.ContentBlock
@@ -554,11 +533,11 @@ func executeTools(
 						sb.WriteString(rc.Text)
 					}
 				}
-				hooks.RunAfterTool(ctx, block.Name, sb.String(), isError)
+				hooks.RunAfterTool(cx.Context(), block.Name, sb.String(), isError)
 			}
 
-			if mon != nil {
-				mon.Observe(runtime.Observation{
+			if cx.Monitor != nil {
+				cx.Monitor.Observe(runtime.Observation{
 					Time:    t0,
 					Stage:   "tool:" + block.Name,
 					Latency: latency,
@@ -579,7 +558,7 @@ func executeTools(
 	}
 
 	wg.Wait()
-	return results, nil
+	return results
 }
 
 // resolveTools returns the tool definitions for the given name list.

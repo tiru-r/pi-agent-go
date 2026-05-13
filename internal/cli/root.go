@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -159,15 +161,17 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 			historyLen := len(history)
 
 			ag := agent.New(prov, cfg.Model, cfg.SystemPrompt, cfg.MaxTokens)
-			ag.Monitor = runtime.NewMonitor()
 			if extMgr != nil {
 				ag.Hooks = extMgr
 			}
+			// Construct the capability context at the CLI entry point: the command's
+			// context carries cancellation; no budget limits for interactive use.
+			cx := agent.NewAgentCx(ctx, 0, 0, runtime.NewMonitor())
 			opts := agent.Options{
 				System:        cfg.SystemPrompt,
 				ThinkingLevel: model.ThinkingLevel(cfg.ThinkingLevel),
 			}
-			updatedMsgs, runErr := ag.Run(ctx, prompt, history, opts,
+			updatedMsgs, runErr := ag.Run(cx, prompt, history, opts,
 				func(ev agent.AgentEvent) {
 					switch ev.Kind {
 					case agent.EventKindText:
@@ -633,14 +637,20 @@ func runACPServer(gf *globalFlags) error {
 	if err != nil {
 		return err
 	}
+	// Bind the server's lifetime to OS signals so SIGINT/SIGTERM cause clean
+	// shutdown: extensions stop loading, model prefetch is cancelled, in-flight
+	// prompts are cancelled via the ctx propagated into handleSessionPrompt.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Extensions are loaded inside acp.New — registering them here too would
 	// double-register every extension tool into the global registry.
-	srv, err := acp.New(cfg)
+	srv, err := acp.New(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("acp: %w", err)
 	}
 	defer srv.Close()
-	return srv.Serve(context.Background())
+	return srv.Serve(ctx)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
