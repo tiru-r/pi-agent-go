@@ -7,6 +7,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
@@ -16,9 +18,9 @@ const (
 	charsPerToken              = 4
 	imageTokenEstimate         = 1200
 	defaultMaxCompactionTokens = 100_000
-	defaultReserveRatio     = 8  // percent of ContextWindow reserved for output
-	defaultKeepRecentRatio  = 10 // percent of ContextWindow kept as recent context
-	defaultKeepRecentTokens = 10_000
+	defaultReserveRatio        = 8  // percent of ContextWindow reserved for output
+	defaultKeepRecentRatio     = 10 // percent of ContextWindow kept as recent context
+	defaultKeepRecentTokens    = 10_000
 )
 
 // Compactor decides when and how to compact (summarise) a conversation's
@@ -64,51 +66,52 @@ func (c *Compactor) keepBudget() int {
 	return defaultKeepRecentTokens
 }
 
-// ShouldCompact returns true when the token count exceeds the threshold.
-// measuredTokens should be the InputTokens value from the last API response
-// Usage field; pass 0 to fall back to the chars÷4 heuristic.
-func (c *Compactor) ShouldCompact(msgs []model.Message, measuredTokens int) bool {
+// ShouldCompact returns true when the estimated token count exceeds the
+// threshold. measuredTokens should be the InputTokens value from the last API
+// response; pass 0 to fall back to the chars÷4 heuristic. toolDefsTokens is
+// added to the heuristic estimate so callers can account for tool-definition
+// overhead not present in the message content (see EstimateToolDefsTokens).
+func (c *Compactor) ShouldCompact(msgs []model.Message, measuredTokens, toolDefsTokens int) bool {
 	tokens := measuredTokens
 	if tokens <= 0 {
-		tokens = estimateTokens(msgs)
+		tokens = estimateTokens(msgs) + toolDefsTokens
 	}
 	return tokens > c.threshold()
 }
 
-// Compact summarises the older portion of msgs and returns a shortened list.
+// Compact summarises the less-relevant portion of msgs and returns a shortened
+// list. When system is non-empty, messages are scored by TF-IDF similarity to
+// the system prompt; the lowest-scoring messages are summarised and the
+// highest-scoring ones are preserved verbatim in their original order (non-
+// contiguous selection). Adjacent tool-use/tool-result pairs are kept or
+// discarded together to avoid broken conversation structure. When system is
+// empty, a contiguous recency-based cut is used (see findCutPoint).
 //
-// The cut point is determined by walking backward from the end of the
-// conversation, accumulating token estimates until the keepBudget is consumed.
-// It is then aligned to a clean turn boundary: after an assistant message and
-// before a genuine user prompt (never inside a tool-use/tool-result pair).
-//
-// If no backward boundary exists, the algorithm walks forward to the next
-// clean boundary. If still none is found, it forces a cut at position 1 so
-// compaction always fires rather than silently skipping when the context is full.
-//
-// The returned list is:
-//
-//	[{role:user, "[Previous conversation summary]\n\n<summary>"}, ...keptMsgs]
-//
-// The second return value is the summary text; the caller may persist it as
-// a session compaction entry.
+// The returned list is [{role:user, "[Previous conversation summary]\n\n<summary>"}, ...keptMsgs].
+// The second return value is the summary text for session persistence.
 func (c *Compactor) Compact(ctx context.Context, msgs []model.Message, system string) ([]model.Message, string, error) {
-	cut := findCutPointMI(msgs, c.keepBudget(), system)
-	if cut == 0 {
-		return msgs, "", nil
+	var toSummarise, kept []model.Message
+
+	if system != "" {
+		toSummarise, kept = splitByMI(msgs, c.keepBudget(), system)
+	} else {
+		cut := findCutPoint(msgs, c.keepBudget())
+		if cut == 0 {
+			return msgs, "", nil
+		}
+		toSummarise, kept = msgs[:cut], msgs[cut:]
 	}
 
-	toSummarise := msgs[:cut]
-	kept := msgs[cut:]
+	if len(toSummarise) == 0 {
+		return msgs, "", nil
+	}
 
 	summary, err := c.summarise(ctx, toSummarise, system)
 	if err != nil {
 		return nil, "", fmt.Errorf("compactor: summarise: %w", err)
 	}
 
-	summaryMsg := model.NewTextMessage(model.RoleUser,
-		"[Previous conversation summary]\n\n"+summary)
-
+	summaryMsg := model.NewTextMessage(model.RoleUser, "[Previous conversation summary]\n\n"+summary)
 	compacted := make([]model.Message, 0, 1+len(kept))
 	compacted = append(compacted, summaryMsg)
 	compacted = append(compacted, kept...)
@@ -117,21 +120,14 @@ func (c *Compactor) Compact(ctx context.Context, msgs []model.Message, system st
 
 // findCutPoint returns the index of the first message to keep (msgs[:cut] is
 // summarised). It walks backward from the end of msgs, accumulating token
-// estimates, until keepBudget tokens are covered — establishing how many
-// recent messages to preserve.
-//
-// The tentative cut is then aligned to a clean turn boundary (assistant → real
-// user) by:
-//  1. Walking backward from the target (preferred).
-//  2. Walking forward if no backward boundary exists (includes prefix context
-//     from the split turn rather than skipping compaction entirely).
-//  3. Forcing a cut at position 1 as a last resort.
-//
+// estimates until keepBudget tokens are covered. The tentative cut is then
+// aligned to a clean turn boundary (after an assistant message and before a
+// genuine user prompt) by walking backward first, then forward, then forcing
+// a cut at position 1 as a last resort.
 // Returns 0 if compaction cannot meaningfully reduce the history.
 func findCutPoint(msgs []model.Message, keepBudget int) int {
-	// Walk from the end, accumulate tokens until keepBudget is covered.
 	accumulated := 0
-	target := len(msgs) // lowered when budget is reached
+	target := len(msgs)
 
 	for i := len(msgs) - 1; i >= 0; i-- {
 		accumulated += estimateMsgTokens(msgs[i])
@@ -141,8 +137,6 @@ func findCutPoint(msgs []model.Message, keepBudget int) int {
 		}
 	}
 
-	// Either everything fits within the budget or a single message fills it
-	// all the way to index 0 — nothing useful to summarise.
 	if target == len(msgs) || target == 0 {
 		return 0
 	}
@@ -161,36 +155,42 @@ func findCutPoint(msgs []model.Message, keepBudget int) int {
 		}
 	}
 
-	// Last resort: force cut at 1 to avoid a silent no-op when the context is full.
+	// Last resort: force cut at 1 to avoid a silent no-op when context is full.
 	if len(msgs) > 1 {
 		return 1
 	}
 	return 0
 }
 
-// findCutPointMI scores each message by TF-IDF term overlap with the system
-// prompt as a mutual-information proxy and keeps messages with highest scores
-// up to keepBudget tokens. Clean turn boundaries are respected the same way as
-// findCutPoint.  Falls back to findCutPoint when system is empty.
-func findCutPointMI(msgs []model.Message, keepBudget int, system string) int {
-	if system == "" {
-		return findCutPoint(msgs, keepBudget)
+// splitByMI scores each message by TF-IDF similarity to the system prompt and
+// partitions msgs into (toSummarise, kept), preserving original order. The kept
+// set contains the highest-scoring messages up to keepBudget tokens; the rest
+// go to toSummarise. Adjacent tool-use/tool-result pairs are kept or discarded
+// together so the resulting conversation has valid structure.
+//
+// Returns (nil, msgs) when nothing needs summarising.
+func splitByMI(msgs []model.Message, keepBudget int, system string) (toSummarise, kept []model.Message) {
+	if len(msgs) == 0 || system == "" {
+		return nil, msgs
 	}
 
-	// Build TF-IDF reference from system prompt.
 	refTerms := tokeniseText(system)
 	if len(refTerms) == 0 {
-		return findCutPoint(msgs, keepBudget)
+		cut := findCutPoint(msgs, keepBudget)
+		if cut == 0 {
+			return nil, msgs
+		}
+		return msgs[:cut], msgs[cut:]
 	}
+
 	refTF := termFreq(refTerms)
 	n := len(msgs)
 
-	// Compute DF (document frequency) across all messages.
+	// Compute document frequency across all messages.
 	df := make(map[string]int, len(refTF))
 	for _, msg := range msgs {
-		text := msgText(msg)
 		seen := make(map[string]bool)
-		for _, t := range tokeniseText(text) {
+		for _, t := range tokeniseText(msgText(msg)) {
 			if !seen[t] {
 				df[t]++
 				seen[t] = true
@@ -198,13 +198,11 @@ func findCutPointMI(msgs []model.Message, keepBudget int, system string) int {
 		}
 	}
 
-	// Score each message: sum of TF-IDF weight * (1 if term in ref, else 0).
+	// Score each message: sum of TF-IDF weights for terms shared with system prompt.
 	scores := make([]float64, n)
 	for i, msg := range msgs {
-		text := msgText(msg)
-		terms := tokeniseText(text)
-		tf := termFreq(terms)
-		score := 0.0
+		tf := termFreq(tokeniseText(msgText(msg)))
+		var score float64
 		for term, msgTF := range tf {
 			if _, inRef := refTF[term]; inRef {
 				idf := math.Log(float64(n+1)/float64(df[term]+1)) + 1
@@ -214,7 +212,7 @@ func findCutPointMI(msgs []model.Message, keepBudget int, system string) int {
 		scores[i] = score
 	}
 
-	// Rank messages by MI score descending, keep top-scoring up to keepBudget.
+	// Rank by score descending, greedily select top-scoring messages up to budget.
 	type scored struct {
 		idx   int
 		score float64
@@ -227,48 +225,158 @@ func findCutPointMI(msgs []model.Message, keepBudget int, system string) int {
 		return ranked[a].score > ranked[b].score
 	})
 
-	kept := make([]bool, n)
+	keptSet := make([]bool, n)
 	budget := keepBudget
 	for _, r := range ranked {
 		tok := estimateMsgTokens(msgs[r.idx])
 		if tok > budget {
 			continue
 		}
-		kept[r.idx] = true
+		keptSet[r.idx] = true
 		budget -= tok
 		if budget <= 0 {
 			break
 		}
 	}
 
-	// Find the earliest index NOT in the kept set to determine cut point.
-	// Walk backward like findCutPoint to prefer a clean boundary.
-	target := n
-	for i := range n {
-		if !kept[i] {
-			target = i
+	// Enforce tool-use/tool-result pair constraint: keep both or neither in each pair.
+	for i := 0; i+1 < n; i++ {
+		if isToolPair(msgs[i], msgs[i+1]) && (keptSet[i] != keptSet[i+1]) {
+			keptSet[i] = true
+			keptSet[i+1] = true
+		}
+	}
+
+	// Partition in original order.
+	for i, msg := range msgs {
+		if keptSet[i] {
+			kept = append(kept, msg)
+		} else {
+			toSummarise = append(toSummarise, msg)
+		}
+	}
+	if len(toSummarise) == 0 {
+		return nil, msgs
+	}
+	return toSummarise, kept
+}
+
+// isToolPair reports whether prev is an assistant message containing tool_use
+// blocks and next is a user message containing tool_result blocks — a pair that
+// must be kept together to produce valid conversation structure.
+func isToolPair(prev, next model.Message) bool {
+	if prev.Role != model.RoleAssistant || next.Role != model.RoleUser {
+		return false
+	}
+	hasTU := false
+	for _, b := range prev.Content {
+		if b.Type == model.ContentTypeToolUse {
+			hasTU = true
 			break
 		}
 	}
-	if target == n || target == 0 {
-		return 0
+	if !hasTU {
+		return false
 	}
+	for _, b := range next.Content {
+		if b.Type == model.ContentTypeToolResult {
+			return true
+		}
+	}
+	return false
+}
 
-	// Align to a clean turn boundary (same logic as findCutPoint).
-	for i := target; i > 0; i-- {
-		if msgs[i-1].Role == model.RoleAssistant && isRealUserMessage(msgs[i]) {
-			return i
+// EstimateToolDefsTokens returns a rough token estimate for a set of tool
+// definitions using the chars÷4 heuristic. Pass the result as toolDefsTokens
+// to ShouldCompact so the heuristic path accounts for tool-definition overhead
+// that is not present in the message content.
+func EstimateToolDefsTokens(defs []model.ToolDefinition) int {
+	total := 0
+	for _, d := range defs {
+		total += len(d.Name) / charsPerToken
+		total += len(d.Description) / charsPerToken
+		total += len(d.InputSchema) / charsPerToken
+	}
+	return total
+}
+
+// BackgroundCompactor wraps a Compactor, running Compact asynchronously so
+// compaction does not block the foreground agent turn. Only one compaction runs
+// at a time; concurrent Trigger calls while one is in-flight are silently
+// ignored. The completed result is stored and retrieved with Take on the next
+// agent turn.
+type BackgroundCompactor struct {
+	C *Compactor // must not be nil
+
+	mu      sync.Mutex
+	running bool
+	pending *BGResult
+}
+
+// BGResult holds the output of a completed background Compact call plus the
+// snapshot metadata needed to splice in messages added since Trigger.
+type BGResult struct {
+	Compacted []model.Message // [summaryMsg, ...keptMsgs]
+	Summary   string
+	// SnapLen is len(msgs) at Trigger time. Messages at indices ≥ SnapLen in the
+	// current history are "new" and must be appended to Compacted when applying.
+	SnapLen int
+	// HeadID is session.Session.HeadID() at Trigger time for SessionAgent; empty for Agent.
+	HeadID string
+}
+
+// Trigger starts asynchronous compaction of msgs if no compaction is already
+// running. headID must be session.Session.HeadID() for SessionAgent; pass ""
+// for the stateless Agent. msgs is deep-copied before the goroutine starts to
+// prevent data races.
+func (b *BackgroundCompactor) Trigger(msgs []model.Message, system, headID string) {
+	b.mu.Lock()
+	if b.running {
+		b.mu.Unlock()
+		return
+	}
+	b.running = true
+	b.mu.Unlock()
+
+	snapLen := len(msgs)
+	cp := make([]model.Message, len(msgs))
+	copy(cp, msgs)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+
+		compacted, summary, err := b.C.Compact(ctx, cp, system)
+
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.running = false
+		if err == nil {
+			b.pending = &BGResult{
+				Compacted: compacted,
+				Summary:   summary,
+				SnapLen:   snapLen,
+				HeadID:    headID,
+			}
 		}
-	}
-	for i := target + 1; i < n; i++ {
-		if msgs[i-1].Role == model.RoleAssistant && isRealUserMessage(msgs[i]) {
-			return i
-		}
-	}
-	if n > 1 {
-		return 1
-	}
-	return 0
+	}()
+}
+
+// Take returns the latest compaction result and clears it. Returns nil when
+// no result is ready yet.
+func (b *BackgroundCompactor) Take() *BGResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r := b.pending
+	b.pending = nil
+	return r
+}
+
+// Running reports whether a background compaction goroutine is currently active.
+func (b *BackgroundCompactor) Running() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.running
 }
 
 // tokeniseText splits text into lowercase word tokens (non-alpha chars as delimiters).
@@ -370,7 +478,6 @@ func (c *Compactor) summarise(ctx context.Context, msgs []model.Message, system 
 	reqMsgs = append(reqMsgs, msgs...)
 	reqMsgs = append(reqMsgs, model.NewTextMessage(model.RoleUser, promptSB.String()))
 
-	// Scale summary budget to ~20% of the input being summarised.
 	summaryMaxTokens := min(max(estimateTokens(msgs)/5, 2048), 8192)
 
 	req := &provider.Request{

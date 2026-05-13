@@ -108,9 +108,14 @@ type Agent struct {
 	// events to JS extensions that define before_tool / after_tool.
 	Hooks HookRunner
 
-	// Compactor is optional; when set it compacts message history before each
-	// LLM call if the estimated token count exceeds the threshold.
+	// Compactor is optional; when set it compacts message history when the
+	// estimated token count exceeds the threshold.
 	Compactor *Compactor
+
+	// BGCompactor is optional; when set, compaction runs asynchronously so it
+	// does not block the foreground turn. The result is applied at the start of
+	// the next turn. Requires Compactor to also be set.
+	BGCompactor *BackgroundCompactor
 
 	// TokenBudget caps total cumulative InputTokens for a Run (0 = unlimited).
 	TokenBudget int
@@ -191,6 +196,7 @@ func (a *Agent) Run(
 	// response. When non-zero it is used instead of the heuristic estimator.
 	var lastMeasuredTokens int
 	var cumulativeInputTokens int
+	toolDefsTokens := EstimateToolDefsTokens(toolDefs)
 
 	for turn := 0; turn < maxTurns; turn++ {
 		select {
@@ -199,11 +205,21 @@ func (a *Agent) Run(
 		default:
 		}
 
-		// Compact history before calling the LLM if it's grown too large.
-		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens) {
-			if compacted, _, compactErr := a.Compactor.Compact(ctx, msgs, systemPrompt); compactErr == nil {
+		// Apply any pending background compaction result (non-blocking).
+		if a.BGCompactor != nil {
+			if result := a.BGCompactor.Take(); result != nil {
+				newMsgs := msgs[result.SnapLen:]
+				msgs = append(result.Compacted, newMsgs...)
+				lastMeasuredTokens = estimateTokens(msgs)
+			}
+		}
+		// Compact history before calling the LLM; use background worker if available.
+		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens, toolDefsTokens) {
+			if a.BGCompactor != nil {
+				a.BGCompactor.Trigger(msgs, systemPrompt, "")
+			} else if compacted, _, compactErr := a.Compactor.Compact(ctx, msgs, systemPrompt); compactErr == nil {
 				msgs = compacted
-				lastMeasuredTokens = 0 // heuristic will re-estimate after compaction
+				lastMeasuredTokens = estimateTokens(compacted)
 			}
 		}
 
@@ -430,6 +446,7 @@ func executeTools(
 			// bash spawns real OS processes; cap concurrency to avoid saturation.
 			// All other tools are I/O-bound and run without a semaphore.
 			if block.Name == "bash" {
+				// bashSem is declared in session_agent.go; caps concurrent bash process spawning.
 				select {
 				case bashSem <- struct{}{}:
 					defer func() { <-bashSem }()

@@ -174,8 +174,8 @@ func cmpOrderedArray(path string, got, want []any, opts CompareOptions, diffs *[
 // cmpRegistrationList compares two arrays as unordered sets, keyed by idField.
 // Entries missing from either side are reported individually.
 func cmpRegistrationList(path string, got, want []any, idField string, opts CompareOptions, diffs *[]string) {
-	wantByID := indexByField(want, idField)
-	gotByID := indexByField(got, idField)
+	wantByID := indexByField(want, idField, path, diffs)
+	gotByID := indexByField(got, idField, path, diffs)
 
 	// Deterministic diff order.
 	allIDs := make(map[string]bool, len(wantByID)+len(gotByID))
@@ -206,16 +206,20 @@ func cmpRegistrationList(path string, got, want []any, idField string, opts Comp
 	}
 }
 
-func indexByField(arr []any, field string) map[string]any {
+func indexByField(arr []any, field, path string, diffs *[]string) map[string]any {
 	m := make(map[string]any, len(arr))
-	for _, item := range arr {
+	for i, item := range arr {
 		obj, ok := item.(map[string]any)
 		if !ok {
+			*diffs = append(*diffs, fmt.Sprintf("  %s[%d]: not an object, cannot index by %q", path, i, field))
 			continue
 		}
-		if id, ok := obj[field].(string); ok && id != "" {
-			m[id] = item
+		id, ok := obj[field].(string)
+		if !ok || id == "" {
+			*diffs = append(*diffs, fmt.Sprintf("  %s[%d]: missing or non-string field %q — item is unindexable and will not be compared", path, i, field))
+			continue
 		}
+		m[id] = item
 	}
 	return m
 }

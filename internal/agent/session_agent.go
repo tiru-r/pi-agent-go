@@ -30,6 +30,10 @@ type SessionAgent struct {
 	MaxIter   int // default 20, prevents infinite loops
 	Compactor *Compactor
 
+	// BGCompactor is optional; when set, compaction runs asynchronously so it
+	// does not block the foreground turn. Requires Compactor to also be set.
+	BGCompactor *BackgroundCompactor
+
 	// Monitor is optional; attach one to enable runtime intelligence.
 	Monitor *runtime.Monitor
 
@@ -99,6 +103,7 @@ func (a *SessionAgent) Run(
 	// lastMeasuredTokens holds the InputTokens value from the previous API
 	// response. When non-zero it is used instead of the heuristic estimator.
 	var lastMeasuredTokens int
+	toolDefsTokens := EstimateToolDefsTokens(toolDefs)
 
 	for iter := 0; iter < maxIter; iter++ {
 		select {
@@ -109,15 +114,38 @@ func (a *SessionAgent) Run(
 
 		msgs := a.Session.Messages()
 
-		// Compact history if it has grown past the threshold.
-		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens) {
-			if compacted, summary, compactErr := a.Compactor.Compact(ctx, msgs, opts.System); compactErr == nil {
+		// Apply any pending background compaction result. Rewinds the session to
+		// the trigger head and replays: compaction marker → kept messages → new
+		// messages added since the trigger. This keeps the JSONL tree consistent so
+		// session restarts correctly reconstruct [summary, keptMsgs, futureMsgs].
+		if a.BGCompactor != nil {
+			if result := a.BGCompactor.Take(); result != nil {
+				newMsgs := msgs[result.SnapLen:]
+				_ = a.Session.SetHead(result.HeadID)
+				_ = a.Session.Append(session.Entry{Type: session.EntryCompaction, Summary: result.Summary})
+				for _, keptMsg := range result.Compacted[1:] { // Compacted[0] is the summary placeholder
+					_ = a.Session.AppendMessage(keptMsg, nil)
+				}
+				for _, newMsg := range newMsgs {
+					_ = a.Session.AppendMessage(newMsg, nil)
+				}
+				msgs = append(result.Compacted, newMsgs...)
+				lastMeasuredTokens = estimateTokens(msgs)
+			}
+		}
+		// Compact history synchronously (or trigger background compaction) when needed.
+		if a.Compactor != nil && a.Compactor.ShouldCompact(msgs, lastMeasuredTokens, toolDefsTokens) {
+			if a.BGCompactor != nil {
+				a.BGCompactor.Trigger(msgs, opts.System, a.Session.HeadID())
+			} else if compacted, summary, compactErr := a.Compactor.Compact(ctx, msgs, opts.System); compactErr == nil {
 				msgs = compacted
-				lastMeasuredTokens = estimateTokens(compacted) // prime heuristic from compacted size
-				_ = a.Session.Append(session.Entry{
-					Type:    session.EntryCompaction,
-					Summary: summary,
-				})
+				lastMeasuredTokens = estimateTokens(compacted)
+				// Persist: append compaction marker then kept messages so session
+				// restarts reconstruct [summary, keptMsgs, futureMsgs] via buildMessages.
+				_ = a.Session.Append(session.Entry{Type: session.EntryCompaction, Summary: summary})
+				for _, keptMsg := range compacted[1:] {
+					_ = a.Session.AppendMessage(keptMsg, nil)
+				}
 			}
 		}
 
