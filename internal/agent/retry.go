@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strings"
 	"time"
 
+	"github.com/tiru-r/pi-agent-go/internal/httpclient"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
 )
 
@@ -47,16 +47,14 @@ func streamWithRetry(ctx context.Context, prov provider.Provider, req *provider.
 }
 
 // isRetriableErr reports whether err warrants a retry: HTTP rate-limits (429),
-// transient server errors (500–504), or network-level timeouts.
+// transient server errors (5xx), or network-level timeouts.
 func isRetriableErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	for _, code := range []string{"429", "500", "502", "503", "504"} {
-		if strings.Contains(s, code) {
-			return true
-		}
+	var httpErr *httpclient.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == 429 || httpErr.StatusCode >= 500
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {

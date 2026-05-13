@@ -30,6 +30,10 @@ type Config struct {
 
 	// Extensions
 	ExtensionsDir string `json:"extensions_dir,omitempty"`
+
+	// Caching / distillation
+	SemanticCache bool   `json:"semantic_cache,omitempty"` // enable Jaccard-similarity response cache
+	DistillFile   string `json:"distill_file,omitempty"`   // JSONL path for knowledge-distillation output
 }
 
 var defaultCfg = Config{
@@ -110,6 +114,12 @@ func merge(base, override *Config) {
 	}
 	if override.ExtensionsDir != "" {
 		base.ExtensionsDir = override.ExtensionsDir
+	}
+	if override.SemanticCache {
+		base.SemanticCache = true
+	}
+	if override.DistillFile != "" {
+		base.DistillFile = override.DistillFile
 	}
 }
 

@@ -155,6 +155,15 @@ func (a *SessionAgent) Run(
 			}
 		}
 
+		// Pre-turn: enforce context budget before spending the round-trip.
+		est := lastMeasuredTokens
+		if est <= 0 {
+			est = estimateTokens(msgs) + toolDefsTokens
+		}
+		if err := cx.CheckPreTurn(iter, est); err != nil {
+			return err
+		}
+
 		req := &provider.Request{
 			Model:         modelName,
 			Messages:      msgs,
@@ -195,9 +204,12 @@ func (a *SessionAgent) Run(
 			return fmt.Errorf("session_agent: collect: %w", err)
 		}
 
-		// Update measured token count for the next compaction check.
+		// Post-turn: record usage and enforce both budget limits with accurate counts.
 		if resp.Usage.InputTokens > 0 {
 			lastMeasuredTokens = resp.Usage.InputTokens
+			if err := cx.RecordTurn(iter, resp.Usage); err != nil {
+				return fmt.Errorf("session_agent: token budget: %w", err)
+			}
 		}
 
 		// Append assistant response to session.

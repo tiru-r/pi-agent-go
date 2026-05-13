@@ -63,6 +63,7 @@ var BuiltinTools []Tool
 var toolMap map[string]Tool
 
 var registerOnce sync.Once
+var toolMu sync.RWMutex
 
 func init() {
 	registerOnce.Do(func() {
@@ -85,13 +86,17 @@ func init() {
 
 // Get returns the tool with the given name, or false if not found.
 func Get(name string) (Tool, bool) {
+	toolMu.RLock()
 	t, ok := toolMap[name]
+	toolMu.RUnlock()
 	return t, ok
 }
 
 // Register adds a dynamically-loaded tool (e.g. from an extension) to the registry.
 // If a tool with the same name already exists it is replaced.
 func Register(t Tool) {
+	toolMu.Lock()
+	defer toolMu.Unlock()
 	toolMap[t.Name()] = t
 	for i, existing := range BuiltinTools {
 		if existing.Name() == t.Name() {
@@ -123,8 +128,12 @@ func CWD(ctx context.Context) string {
 
 // ToDefinitions converts all built-in tools to model.ToolDefinition slice.
 func ToDefinitions() []model.ToolDefinition {
-	defs := make([]model.ToolDefinition, 0, len(BuiltinTools))
-	for _, t := range BuiltinTools {
+	toolMu.RLock()
+	snapshot := make([]Tool, len(BuiltinTools))
+	copy(snapshot, BuiltinTools)
+	toolMu.RUnlock()
+	defs := make([]model.ToolDefinition, 0, len(snapshot))
+	for _, t := range snapshot {
 		defs = append(defs, model.ToolDefinition{
 			Name:        t.Name(),
 			Description: t.Description(),

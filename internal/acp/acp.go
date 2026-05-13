@@ -280,6 +280,9 @@ type sessionState struct {
 	mode         agent.AgentMode
 	cwd          string // project root from session/new or session/load
 	systemPrefix string // project snapshot injected at the top of every system prompt
+	// monitor persists runtime intelligence (circuit breakers, safety, OPE) across
+	// prompts within this session. A fresh monitor per-prompt loses all history.
+	monitor *runtime.Monitor
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -549,6 +552,7 @@ func (s *Server) handleSessionNew(req *request) {
 		mode:         agent.AgentModeAct,
 		cwd:          p.CWD,
 		systemPrefix: projectSnapshot(p.CWD),
+		monitor:      runtime.NewMonitor(),
 	}
 	s.sessionsMu.Lock()
 	s.sessions[id] = newState
@@ -760,6 +764,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	cwd := ss.cwd
 	systemPrefix := ss.systemPrefix
 	fileSess := ss.sess
+	mon := ss.monitor
 	history := make([]model.Message, len(ss.msgs))
 	copy(history, ss.msgs)
 	s.sessionsMu.RUnlock()
@@ -795,8 +800,9 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	ag.Compactor = s.makeCompactor(modelID)
 
 	// Construct the capability context at the RPC boundary: lifecycle (cctx),
-	// no token budget (0/0), and a fresh per-run monitor for runtime intelligence.
-	cx := agent.NewAgentCx(cctx, 0, 0, runtime.NewMonitor())
+	// no token budget (0/0), and the session's persistent monitor so runtime
+	// intelligence (circuit breakers, safety, OPE) accumulates across prompts.
+	cx := agent.NewAgentCx(cctx, 0, 0, mon)
 
 	var finalStop model.StopReason = model.StopReasonEndTurn
 	var finalUsage model.Usage
@@ -943,6 +949,7 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 		mode:         agent.AgentModeAct,
 		cwd:          p.CWD,
 		systemPrefix: projectSnapshot(p.CWD),
+		monitor:      runtime.NewMonitor(),
 	}
 	s.sessionsMu.Unlock()
 
