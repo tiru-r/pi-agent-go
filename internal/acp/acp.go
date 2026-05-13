@@ -436,12 +436,15 @@ func (s *Server) Serve(ctx context.Context) error {
 		case "session/load":
 			go s.handleSessionLoad(ctx, &req)
 		default:
-			s.dispatch(ctx, &req)
+			s.dispatch(&req)
 		}
 	}
 }
 
-func (s *Server) dispatch(ctx context.Context, req *request) {
+// dispatch handles synchronous, fast RPC methods that complete entirely in
+// memory and need no cancellation or deadline. Async methods (session/prompt,
+// session/load) are launched as goroutines directly in Serve with the server ctx.
+func (s *Server) dispatch(req *request) {
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
@@ -456,9 +459,9 @@ func (s *Server) dispatch(ctx context.Context, req *request) {
 	case "session/close":
 		s.handleSessionClose(req)
 	case "runtime/report":
-		s.handleRuntimeReport(ctx, req)
+		s.handleRuntimeReport(req)
 	case "input/complete":
-		s.handleInputComplete(ctx, req)
+		s.handleInputComplete(req)
 	default:
 		if req.ID != nil {
 			s.sendError(rawID(req.ID), -32601, "method not found: "+req.Method)
@@ -468,7 +471,7 @@ func (s *Server) dispatch(ctx context.Context, req *request) {
 
 // ── Method handlers ───────────────────────────────────────────────────────────
 
-func (s *Server) handleRuntimeReport(_ context.Context, req *request) {
+func (s *Server) handleRuntimeReport(req *request) {
 	report := s.monitor.Report()
 	s.sendResult(rawID(req.ID), report)
 }
@@ -1191,7 +1194,7 @@ type acpRange struct {
 	End   int `json:"end"`
 }
 
-func (s *Server) handleInputComplete(_ context.Context, req *request) {
+func (s *Server) handleInputComplete(req *request) {
 	if req.Params == nil {
 		s.sendError(rawID(req.ID), -32602, "params required")
 		return

@@ -162,7 +162,10 @@ var imageExtensions = map[string]string{
 	".webp": "image/webp",
 }
 
-func (r *readTool) Execute(_ context.Context, params json.RawMessage) (*Result, error) {
+func (r *readTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error()), nil
+	}
 	var p struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset"`
@@ -256,7 +259,10 @@ func (w *writeTool) Schema() json.RawMessage {
 }`)
 }
 
-func (w *writeTool) Execute(_ context.Context, params json.RawMessage) (*Result, error) {
+func (w *writeTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error()), nil
+	}
 	var p struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
@@ -303,7 +309,10 @@ func (e *editTool) Schema() json.RawMessage {
 }`)
 }
 
-func (e *editTool) Execute(_ context.Context, params json.RawMessage) (*Result, error) {
+func (e *editTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error()), nil
+	}
 	var p struct {
 		Path       string `json:"path"`
 		OldString  string `json:"old_string"`
@@ -793,7 +802,10 @@ func (l *lsTool) Schema() json.RawMessage {
 }`)
 }
 
-func (l *lsTool) Execute(_ context.Context, params json.RawMessage) (*Result, error) {
+func (l *lsTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error()), nil
+	}
 	var p struct {
 		Path string `json:"path"`
 	}
@@ -916,7 +928,10 @@ func parseLineHash(tag string) (lineNum int, hash string, err error) {
 	return lineNum, parts[1], nil
 }
 
-func (h *hashlineEditTool) Execute(_ context.Context, params json.RawMessage) (*Result, error) {
+func (h *hashlineEditTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error()), nil
+	}
 	var p struct {
 		Path  string         `json:"path"`
 		Edits []hashlineEdit `json:"edits"`
