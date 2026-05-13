@@ -354,11 +354,15 @@ func newAuthCmd() *cobra.Command {
 			Short: "Store the OpenRouter API key",
 			Args:  cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
+				key := strings.TrimSpace(args[0])
+				if key == "" {
+					return fmt.Errorf("API key cannot be empty")
+				}
 				cfg, err := config.Load()
 				if err != nil {
 					return err
 				}
-				cfg.OpenRouterAPIKey = args[0]
+				cfg.OpenRouterAPIKey = key
 				if err := cfg.Save(); err != nil {
 					return fmt.Errorf("save config: %w", err)
 				}
