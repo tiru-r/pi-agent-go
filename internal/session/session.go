@@ -66,10 +66,14 @@ type Session struct {
 
 // New creates a new session in dir with a freshly-generated UUID.
 func New(dir string) (*Session, error) {
+	return NewWithID(dir, uuid.New().String())
+}
+
+// NewWithID creates a new session in dir using the given ID.
+func NewWithID(dir, id string) (*Session, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("session: create dir: %w", err)
 	}
-	id := uuid.New().String()
 	path := filepath.Join(dir, id+".jsonl")
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)

@@ -917,8 +917,14 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 	path := filepath.Join(s.cfg.SessionDir, p.SessionID+".jsonl")
 	sess, err := session.Open(path)
 	if err != nil {
-		s.sendError(rawID(req.ID), -32001, "session not found: "+p.SessionID)
-		return
+		// File missing (e.g. Pi restarted); create a fresh session with the
+		// same ID so Zed can continue without a hard error.
+		slog.Warn("acp: session file not found, creating fresh", "session", p.SessionID, "err", err)
+		sess, err = session.NewWithID(s.cfg.SessionDir, p.SessionID)
+		if err != nil {
+			s.sendError(rawID(req.ID), -32001, "session not found: "+p.SessionID)
+			return
+		}
 	}
 
 	modelID := strings.TrimPrefix(s.cfg.Model, "openrouter/")
