@@ -611,7 +611,29 @@ func (s *Server) handleSessionSetConfigOption(req *request) {
 	modelID := sess.modelID
 	thinkLevel := sess.thinkLevel
 	mode := sess.mode
+	fileSess := sess.sess
 	s.sessionsMu.Unlock()
+
+	// Persist the config change so it survives a server restart.
+	if fileSess != nil {
+		var entry session.Entry
+		switch p.ConfigID {
+		case "model":
+			entry = session.Entry{Type: session.EntryModelChange, Model: modelID}
+		case "thinking_level":
+			entry = session.Entry{Type: session.EntryThinkingLevel, Level: string(thinkLevel)}
+		case "mode":
+			entry = session.Entry{
+				Type:     session.EntryMetadata,
+				Metadata: map[string]any{"mode": string(mode)},
+			}
+		}
+		if entry.Type != "" {
+			if err := fileSess.Append(entry); err != nil {
+				slog.Warn("acp: failed to persist config change", "configId", p.ConfigID, "session", p.SessionID, "err", err)
+			}
+		}
+	}
 
 	s.modelsMu.RLock()
 	models := s.models
@@ -640,7 +662,14 @@ func (s *Server) handleSessionSetModel(req *request) {
 	modelID := sess.modelID
 	thinkLevel := sess.thinkLevel
 	mode := sess.mode
+	fileSess := sess.sess
 	s.sessionsMu.Unlock()
+
+	if fileSess != nil {
+		if err := fileSess.Append(session.Entry{Type: session.EntryModelChange, Model: modelID}); err != nil {
+			slog.Warn("acp: failed to persist model change", "session", p.SessionID, "model", modelID, "err", err)
+		}
+	}
 
 	s.modelsMu.RLock()
 	models := s.models
@@ -794,7 +823,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	}
 	maxTokens := s.cfg.MaxTokens
 	if maxTokens == 0 {
-		maxTokens = 8096
+		maxTokens = agent.DefaultMaxTokens
 	}
 
 	ag := agent.New(s.provider, modelID, system, maxTokens)
@@ -935,10 +964,30 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 		}
 	}
 
+	// Start from config defaults, then let session entries override.
 	modelID := strings.TrimPrefix(s.cfg.Model, "openrouter/")
 	thinkLevel := model.ThinkingLevel(s.cfg.ThinkingLevel)
 	if thinkLevel == "" {
 		thinkLevel = model.ThinkingLevelOff
+	}
+	mode := agent.AgentModeAct
+
+	// Restore model/thinking/mode from persisted session entries (last value wins).
+	for _, e := range sess.Snapshot() {
+		switch e.Type {
+		case session.EntryModelChange:
+			if e.Model != "" {
+				modelID = strings.TrimPrefix(e.Model, "openrouter/")
+			}
+		case session.EntryThinkingLevel:
+			if e.Level != "" {
+				thinkLevel = model.ThinkingLevel(e.Level)
+			}
+		case session.EntryMetadata:
+			if m, ok := e.Metadata["mode"].(string); ok && m != "" {
+				mode = agent.AgentMode(m)
+			}
+		}
 	}
 
 	msgs := sess.Messages()
@@ -948,30 +997,39 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 		msgs:         msgs,
 		modelID:      modelID,
 		thinkLevel:   thinkLevel,
-		mode:         agent.AgentModeAct,
+		mode:         mode,
 		cwd:          p.CWD,
 		systemPrefix: projectSnapshot(p.CWD),
 		monitor:      runtime.NewMonitor(),
 	}
 	s.sessionsMu.Unlock()
 
-	// Replay assistant messages so Zed can reconstruct the conversation thread.
+	// Replay conversation history so Zed reconstructs the full thread including
+	// tool calls and results, not just text/thinking blocks.
 	for _, msg := range msgs {
 		if ctx.Err() != nil {
-			return // server is shutting down; stop sending
+			return
 		}
-		if msg.Role != model.RoleAssistant {
-			continue
-		}
-		for _, block := range msg.Content {
-			switch block.Type {
-			case model.ContentTypeText:
-				if block.Text != "" {
-					s.sendSessionUpdate(p.SessionID, "agent_message_chunk", block.Text)
+		switch msg.Role {
+		case model.RoleAssistant:
+			for _, block := range msg.Content {
+				switch block.Type {
+				case model.ContentTypeText:
+					if block.Text != "" {
+						s.sendSessionUpdate(p.SessionID, "agent_message_chunk", block.Text)
+					}
+				case model.ContentTypeThinking:
+					if block.Thinking != "" {
+						s.sendSessionUpdate(p.SessionID, "agent_thought_chunk", block.Thinking)
+					}
+				case model.ContentTypeToolUse:
+					s.sendToolUseUpdate(p.SessionID, block.ID, block.Name, block.Input)
 				}
-			case model.ContentTypeThinking:
-				if block.Thinking != "" {
-					s.sendSessionUpdate(p.SessionID, "agent_thought_chunk", block.Thinking)
+			}
+		case model.RoleUser:
+			for _, block := range msg.Content {
+				if block.Type == model.ContentTypeToolResult {
+					s.sendToolResultUpdate(p.SessionID, block)
 				}
 			}
 		}
@@ -983,7 +1041,7 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 
 	s.sendResult(rawID(req.ID), acpSessionLoadResult{
 		SessionID:     p.SessionID,
-		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, agent.AgentModeAct, models),
+		ConfigOptions: s.makeConfigOptions(modelID, thinkLevel, mode, models),
 	})
 }
 
@@ -1131,7 +1189,11 @@ func (s *Server) makeCompactor(modelID string) *agent.Compactor {
 
 func newSessionID() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		slog.Warn("acp: rand.Read failed, using time-based session ID", "err", err)
+		now := time.Now().UnixNano()
+		return fmt.Sprintf("%016x%016x", now, ^now)
+	}
 	return hex.EncodeToString(b)
 }
 

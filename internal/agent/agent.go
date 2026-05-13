@@ -20,6 +20,9 @@ import (
 // AgentMode controls the execution strategy for a Run.
 type AgentMode string
 
+// DefaultMaxTokens is the output token cap used when no explicit limit is configured.
+const DefaultMaxTokens = 8096
+
 const (
 	// AgentModeAct is the default: full agentic loop with all tools.
 	AgentModeAct AgentMode = "act"
@@ -233,6 +236,23 @@ func (a *Agent) Run(
 			return msgs, err
 		}
 
+		// "required" on turn 0 forces the model to act (use a tool) rather than
+		// describing what it would do. Only applies to act/handoff modes — plan_act
+		// and interactive need a free-text turn first (plan write-up, description).
+		toolChoice := ""
+		if len(toolDefs) > 0 {
+			switch opts.Mode {
+			case AgentModeAct, AgentModeHandoff, "":
+				if turn == 0 {
+					toolChoice = "required"
+				} else {
+					toolChoice = "auto"
+				}
+			default:
+				toolChoice = "auto"
+			}
+		}
+
 		req := &provider.Request{
 			Model:         a.model,
 			Messages:      msgs,
@@ -240,6 +260,7 @@ func (a *Agent) Run(
 			Tools:         toolDefs,
 			MaxTokens:     a.maxTok,
 			ThinkingLevel: thinkLevel,
+			ToolChoice:    toolChoice,
 		}
 
 		t0 := time.Now()

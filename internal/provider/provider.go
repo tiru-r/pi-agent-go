@@ -26,6 +26,9 @@ type Request struct {
 	Temperature   *float64
 	ThinkingLevel model.ThinkingLevel
 	StopSequences []string
+	// ToolChoice controls how the model uses tools: "auto" (default), "none",
+	// or "required" (model must call at least one tool this turn).
+	ToolChoice string
 	// Extra provider-specific fields passed through verbatim.
 	Extra map[string]any
 }

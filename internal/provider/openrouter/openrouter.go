@@ -72,6 +72,9 @@ type orRequest struct {
 	Stream      bool        `json:"stream"`
 	Thinking    *orThinking `json:"thinking,omitempty"`
 
+	// ToolChoice: "auto" | "none" | "required" (OpenAI-compatible).
+	ToolChoice string `json:"tool_choice,omitempty"`
+
 	// OpenRouter-specific extensions — populated from Request.Extra.
 	// See: https://openrouter.ai/docs/provider-routing
 	Provider *providerPrefs `json:"provider,omitempty"`
@@ -416,6 +419,9 @@ func (p *Provider) buildRequest(req *provider.Request) (*orRequest, error) {
 
 	if len(req.Tools) > 0 {
 		out.Tools = convertTools(req.Tools)
+		if req.ToolChoice != "" {
+			out.ToolChoice = req.ToolChoice
+		}
 	}
 
 	// Extended thinking: inject budget and force temperature=1 (Anthropic requirement).

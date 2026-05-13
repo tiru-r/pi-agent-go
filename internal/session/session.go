@@ -215,6 +215,9 @@ func (s *Session) Append(entry Entry) error {
 
 // appendEntry must be called with s.mu held.
 func (s *Session) appendEntry(entry Entry) error {
+	if s.file == nil {
+		return fmt.Errorf("session: file is closed")
+	}
 	if entry.ID == "" {
 		entry.ID = uuid.New().String()
 	}

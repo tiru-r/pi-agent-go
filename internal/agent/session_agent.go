@@ -52,6 +52,7 @@ type SessionRunOptions struct {
 	Model     string
 	MaxTokens int
 	Thinking  model.ThinkingLevel
+	Mode      AgentMode
 }
 
 // Run executes one full agent turn: sends input, streams response, executes tools,
@@ -85,7 +86,7 @@ func (a *SessionAgent) Run(
 		maxTokens = a.Config.MaxTokens
 	}
 	if maxTokens == 0 {
-		maxTokens = 8096
+		maxTokens = DefaultMaxTokens
 	}
 	thinking := opts.Thinking
 	if thinking == "" {
@@ -164,6 +165,20 @@ func (a *SessionAgent) Run(
 			return err
 		}
 
+		toolChoice := ""
+		if len(toolDefs) > 0 {
+			switch opts.Mode {
+			case AgentModeAct, AgentModeHandoff, "":
+				if iter == 0 {
+					toolChoice = "required"
+				} else {
+					toolChoice = "auto"
+				}
+			default:
+				toolChoice = "auto"
+			}
+		}
+
 		req := &provider.Request{
 			Model:         modelName,
 			Messages:      msgs,
@@ -171,6 +186,7 @@ func (a *SessionAgent) Run(
 			Tools:         toolDefs,
 			MaxTokens:     maxTokens,
 			ThinkingLevel: thinking,
+			ToolChoice:    toolChoice,
 		}
 
 		t0 := time.Now()
