@@ -438,6 +438,8 @@ func (s *Server) Serve(ctx context.Context) error {
 			go s.handleSessionPrompt(ctx, &req)
 		case "session/load":
 			go s.handleSessionLoad(ctx, &req)
+		case "session/new":
+			go s.handleSessionNew(&req)
 		default:
 			s.dispatch(&req)
 		}
@@ -446,13 +448,11 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // dispatch handles synchronous, fast RPC methods that complete entirely in
 // memory and need no cancellation or deadline. Async methods (session/prompt,
-// session/load) are launched as goroutines directly in Serve with the server ctx.
+// session/load, session/new) are launched as goroutines directly in Serve.
 func (s *Server) dispatch(req *request) {
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
-	case "session/new":
-		s.handleSessionNew(req)
 	case "session/cancel":
 		s.handleSessionCancel(req)
 	case "session/set_config_option":
@@ -513,9 +513,11 @@ func (s *Server) handleSessionNew(req *request) {
 	}
 
 	// Wait up to 5 s for the background model fetch.
+	t := time.NewTimer(5 * time.Second)
 	select {
 	case <-s.modelsReady:
-	case <-time.After(5 * time.Second):
+		t.Stop()
+	case <-t.C:
 		slog.Warn("model fetch timed out during session/new")
 	}
 

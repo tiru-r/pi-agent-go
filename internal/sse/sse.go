@@ -19,7 +19,7 @@ type Parser struct {
 }
 
 func NewParser(r io.Reader) *Parser {
-	return &Parser{r: bufio.NewReader(r)}
+	return &Parser{r: bufio.NewReaderSize(r, 64*1024)}
 }
 
 // Next reads and returns the next complete SSE event.
