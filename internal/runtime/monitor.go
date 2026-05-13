@@ -58,7 +58,7 @@ func NewMonitor() *Monitor {
 // ShouldVeto returns true when the safety subsystem signals that continued
 // tool execution poses unacceptable risk.
 func (m *Monitor) ShouldVeto() bool {
-	return m.safety.Veto(0.3) || m.ope.ShouldVeto(0.05, opeMinNeff)
+	return m.safety.Veto(0.8) || m.ope.ShouldVeto(0.05, opeMinNeff)
 }
 
 // RecordQueued adjusts the in-flight operation counter for a stage by delta

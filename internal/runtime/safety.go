@@ -21,7 +21,7 @@ func NewPACBayesSafety() *PACBayesSafety {
 	return &PACBayesSafety{
 		klQP:  0.0,
 		delta: 0.05,
-		minN:  20,
+		minN:  50,
 	}
 }
 
