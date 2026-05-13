@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/tiru-r/pi-agent-go/internal/extensions"
@@ -43,16 +44,21 @@ func validToolInfo(name string) extensions.Info {
 	}
 }
 
+var noOpts = extensions.LifecycleOptions{}
+
 // ── happy path ────────────────────────────────────────────────────────────────
 
 func TestRunLifecycle_HappyPath(t *testing.T) {
 	ext := &mockExt{info: validToolInfo("happy-tool")}
 
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	if rep.Failed {
 		t.Fatalf("expected success, got failures:\n%s", buf.String())
+	}
+	if rep.TransientFailure {
+		t.Error("TransientFailure should be false on success")
 	}
 	if len(rep.Events) != 4 {
 		t.Fatalf("expected 4 lifecycle events, got %d", len(rep.Events))
@@ -78,7 +84,7 @@ func TestRunLifecycle_LoadFailure_EmptyName(t *testing.T) {
 	ext := &mockExt{info: extensions.Info{Description: "no name"}}
 
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	if !rep.Failed {
 		t.Fatal("expected failure for empty name")
@@ -89,6 +95,9 @@ func TestRunLifecycle_LoadFailure_EmptyName(t *testing.T) {
 	}
 	if ev.Err == nil || ev.Err.Category != extensions.ErrCatLoad {
 		t.Errorf("expected %s category, got %v", extensions.ErrCatLoad, ev.Err)
+	}
+	if ev.Err != nil && ev.Err.Transient {
+		t.Error("load failure should not be transient")
 	}
 	// Remaining steps still run.
 	if len(rep.Events) != 4 {
@@ -102,7 +111,7 @@ func TestRunLifecycle_LoadFailure_EmptyDescription(t *testing.T) {
 		Schema: json.RawMessage(`{"type":"object"}`),
 	}}
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 	if !rep.Failed {
 		t.Fatal("expected failure for empty description")
 	}
@@ -116,7 +125,7 @@ func TestRunLifecycle_VerifyFail_NilSchema(t *testing.T) {
 		Description: "missing schema",
 	}}
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	if !rep.Failed {
 		t.Fatal("expected failure for nil schema on tool shape")
@@ -133,6 +142,9 @@ func TestRunLifecycle_VerifyFail_NilSchema(t *testing.T) {
 	if verifyEv.Err == nil || verifyEv.Err.Category != extensions.ErrCatRegistration {
 		t.Errorf("expected %s, got %v", extensions.ErrCatRegistration, verifyEv.Err)
 	}
+	if verifyEv.Err != nil && verifyEv.Err.Transient {
+		t.Error("registration mismatch should not be transient")
+	}
 }
 
 func TestRunLifecycle_VerifyFail_CommandMissingProp(t *testing.T) {
@@ -143,7 +155,7 @@ func TestRunLifecycle_VerifyFail_CommandMissingProp(t *testing.T) {
 		Schema:      json.RawMessage(`{"type":"object","properties":{"other":{}}}`),
 	}}
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeCommand, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeCommand, &buf, noOpts)
 	if !rep.Failed {
 		t.Fatal("expected failure for command shape with missing 'command' property")
 	}
@@ -159,7 +171,7 @@ func TestRunLifecycle_InvokeFailure(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	if !rep.Failed {
 		t.Fatal("expected failure")
@@ -176,6 +188,12 @@ func TestRunLifecycle_InvokeFailure(t *testing.T) {
 	if invokeEv.Err == nil || invokeEv.Err.Category != extensions.ErrCatInvoke {
 		t.Errorf("expected %s, got %v", extensions.ErrCatInvoke, invokeEv.Err)
 	}
+	if invokeEv.Err != nil && invokeEv.Err.Transient {
+		t.Error("generic invoke error should not be transient")
+	}
+	if rep.TransientFailure {
+		t.Error("TransientFailure should be false for deterministic invoke error")
+	}
 }
 
 func TestRunLifecycle_InvokeCapabilityDenied(t *testing.T) {
@@ -186,7 +204,7 @@ func TestRunLifecycle_InvokeCapabilityDenied(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	var invokeEv extensions.LifecycleEvent
 	for _, ev := range rep.Events {
@@ -196,6 +214,148 @@ func TestRunLifecycle_InvokeCapabilityDenied(t *testing.T) {
 	}
 	if invokeEv.Err == nil || invokeEv.Err.Category != extensions.ErrCatCapability {
 		t.Errorf("expected %s, got %v", extensions.ErrCatCapability, invokeEv.Err)
+	}
+	if invokeEv.Err != nil && invokeEv.Err.Transient {
+		t.Error("capability denial should not be transient")
+	}
+}
+
+// ── transient invoke failures ─────────────────────────────────────────────────
+
+func TestRunLifecycle_InvokeTimeout_Transient(t *testing.T) {
+	ext := &mockExt{
+		info: validToolInfo("slow-tool"),
+		execFn: func(_ context.Context, _ json.RawMessage) (string, bool, error) {
+			return "", false, context.DeadlineExceeded
+		},
+	}
+	var buf bytes.Buffer
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
+
+	if !rep.Failed {
+		t.Fatal("expected failure")
+	}
+	var invokeEv extensions.LifecycleEvent
+	for _, ev := range rep.Events {
+		if ev.Step == extensions.StepInvoke {
+			invokeEv = ev
+		}
+	}
+	if invokeEv.Err == nil || invokeEv.Err.Category != extensions.ErrCatTimeout {
+		t.Errorf("expected %s, got %v", extensions.ErrCatTimeout, invokeEv.Err)
+	}
+	if invokeEv.Err != nil && !invokeEv.Err.Transient {
+		t.Error("timeout should be transient")
+	}
+	if !rep.TransientFailure {
+		t.Error("TransientFailure should be true for timeout")
+	}
+}
+
+func TestRunLifecycle_InvokeNetworkError_Transient(t *testing.T) {
+	ext := &mockExt{
+		info: validToolInfo("net-tool"),
+		execFn: func(_ context.Context, _ json.RawMessage) (string, bool, error) {
+			return "", false, errors.New("dial tcp: connection refused")
+		},
+	}
+	var buf bytes.Buffer
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
+
+	if !rep.Failed {
+		t.Fatal("expected failure")
+	}
+	var invokeEv extensions.LifecycleEvent
+	for _, ev := range rep.Events {
+		if ev.Step == extensions.StepInvoke {
+			invokeEv = ev
+		}
+	}
+	if invokeEv.Err == nil {
+		t.Fatal("expected error on invoke event")
+	}
+	if !invokeEv.Err.Transient {
+		t.Error("network error should be transient")
+	}
+	if !rep.TransientFailure {
+		t.Error("TransientFailure should be true for network error")
+	}
+}
+
+func TestRunLifecycle_InvokeWrappedCanceled_Transient(t *testing.T) {
+	ext := &mockExt{
+		info: validToolInfo("cancel-tool"),
+		execFn: func(_ context.Context, _ json.RawMessage) (string, bool, error) {
+			return "", false, fmt.Errorf("provider failed: %w", context.Canceled)
+		},
+	}
+	var buf bytes.Buffer
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
+
+	var invokeEv extensions.LifecycleEvent
+	for _, ev := range rep.Events {
+		if ev.Step == extensions.StepInvoke {
+			invokeEv = ev
+		}
+	}
+	if invokeEv.Err == nil || invokeEv.Err.Category != extensions.ErrCatTimeout {
+		t.Errorf("expected %s, got %v", extensions.ErrCatTimeout, invokeEv.Err)
+	}
+	if !invokeEv.Err.Transient {
+		t.Error("wrapped context.Canceled should be transient")
+	}
+}
+
+// ── conformance fixture checking ──────────────────────────────────────────────
+
+func TestRunLifecycle_ConformanceMatch(t *testing.T) {
+	ext := &mockExt{
+		info: validToolInfo("fixture-tool"),
+		execFn: func(_ context.Context, _ json.RawMessage) (string, bool, error) {
+			return `{"status":"ok","count":3}`, false, nil
+		},
+	}
+	opts := extensions.LifecycleOptions{
+		InvokeWant: []byte(`{"count":3,"status":"ok"}`), // different key order — should match
+	}
+	var buf bytes.Buffer
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, opts)
+
+	if rep.Failed {
+		t.Fatalf("expected success with matching fixture, got failures:\n%s", buf.String())
+	}
+}
+
+func TestRunLifecycle_ConformanceMismatch_Deterministic(t *testing.T) {
+	ext := &mockExt{
+		info: validToolInfo("bad-fixture-tool"),
+		execFn: func(_ context.Context, _ json.RawMessage) (string, bool, error) {
+			return `{"status":"error"}`, false, nil
+		},
+	}
+	opts := extensions.LifecycleOptions{
+		InvokeWant: []byte(`{"status":"ok"}`),
+	}
+	var buf bytes.Buffer
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, opts)
+
+	if !rep.Failed {
+		t.Fatal("expected failure for conformance mismatch")
+	}
+	if rep.TransientFailure {
+		t.Error("conformance mismatch should be deterministic, not transient")
+	}
+	var invokeEv extensions.LifecycleEvent
+	for _, ev := range rep.Events {
+		if ev.Step == extensions.StepInvoke {
+			invokeEv = ev
+		}
+	}
+	if invokeEv.Err == nil || invokeEv.Err.Category != extensions.ErrCatRegistration {
+		t.Errorf("expected %s for conformance mismatch, got %v", extensions.ErrCatRegistration, invokeEv.Err)
+	}
+	if invokeEv.Err != nil && invokeEv.Err.Transient {
+		t.Error("conformance diff event should not be transient")
 	}
 }
 
@@ -207,7 +367,7 @@ func TestRunLifecycle_ShutdownError(t *testing.T) {
 		closeFn: func() error { return errors.New("close failed") },
 	}
 	var buf bytes.Buffer
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	if !rep.Failed {
 		t.Fatal("expected failure")
@@ -224,6 +384,9 @@ func TestRunLifecycle_ShutdownError(t *testing.T) {
 	if shutEv.Err == nil || shutEv.Err.Category != extensions.ErrCatShutdown {
 		t.Errorf("expected %s, got %v", extensions.ErrCatShutdown, shutEv.Err)
 	}
+	if shutEv.Err != nil && shutEv.Err.Transient {
+		t.Error("shutdown error should not be transient")
+	}
 }
 
 func TestRunLifecycle_ShutdownPanic(t *testing.T) {
@@ -233,7 +396,7 @@ func TestRunLifecycle_ShutdownPanic(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	// Must not propagate the panic.
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	if !rep.Failed {
 		t.Fatal("expected failure due to panic")
@@ -250,6 +413,9 @@ func TestRunLifecycle_ShutdownPanic(t *testing.T) {
 	if shutEv.Err == nil || shutEv.Err.Category != extensions.ErrCatPanic {
 		t.Errorf("expected %s, got %v", extensions.ErrCatPanic, shutEv.Err)
 	}
+	if shutEv.Err != nil && shutEv.Err.Transient {
+		t.Error("panic should not be transient")
+	}
 }
 
 // ── JSONL output ──────────────────────────────────────────────────────────────
@@ -257,7 +423,7 @@ func TestRunLifecycle_ShutdownPanic(t *testing.T) {
 func TestRunLifecycle_JSONLOutput(t *testing.T) {
 	ext := &mockExt{info: validToolInfo("jsonl-test")}
 	var buf bytes.Buffer
-	extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf)
+	extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
 
 	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
 	if len(lines) != 4 {
@@ -280,10 +446,42 @@ func TestRunLifecycle_JSONLOutput(t *testing.T) {
 	}
 }
 
+func TestRunLifecycle_JSONLOutput_TransientField(t *testing.T) {
+	// Verify the transient field is present in JSONL for error events.
+	ext := &mockExt{
+		info: validToolInfo("jsonl-transient"),
+		execFn: func(_ context.Context, _ json.RawMessage) (string, bool, error) {
+			return "", false, context.DeadlineExceeded
+		},
+	}
+	var buf bytes.Buffer
+	extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, &buf, noOpts)
+
+	for _, line := range bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n")) {
+		var ev struct {
+			Step  string `json:"step"`
+			Error *struct {
+				Transient bool `json:"transient"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if ev.Step == string(extensions.StepInvoke) {
+			if ev.Error == nil {
+				t.Fatal("expected error on invoke event")
+			}
+			if !ev.Error.Transient {
+				t.Error("timeout error should have transient=true in JSONL")
+			}
+		}
+	}
+}
+
 func TestRunLifecycle_NilSink(t *testing.T) {
 	ext := &mockExt{info: validToolInfo("nil-sink")}
 	// Must not panic when sink is nil.
-	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, nil)
+	rep := extensions.RunLifecycle(context.Background(), ext, extensions.ShapeTool, nil, noOpts)
 	if rep.Failed {
 		t.Fatal("expected success")
 	}
@@ -305,6 +503,30 @@ func TestExtShapeString(t *testing.T) {
 	for shape, want := range cases {
 		if got := shape.String(); got != want {
 			t.Errorf("Shape(%d).String() = %q, want %q", shape, got, want)
+		}
+	}
+}
+
+// ── ErrorCategory.Transient() ─────────────────────────────────────────────────
+
+func TestErrorCategoryTransient(t *testing.T) {
+	transient := []extensions.ErrorCategory{extensions.ErrCatTimeout}
+	deterministic := []extensions.ErrorCategory{
+		extensions.ErrCatLoad,
+		extensions.ErrCatRegistration,
+		extensions.ErrCatInvoke,
+		extensions.ErrCatShutdown,
+		extensions.ErrCatCapability,
+		extensions.ErrCatPanic,
+	}
+	for _, cat := range transient {
+		if !cat.Transient() {
+			t.Errorf("expected %s to be transient", cat)
+		}
+	}
+	for _, cat := range deterministic {
+		if cat.Transient() {
+			t.Errorf("expected %s to be deterministic", cat)
 		}
 	}
 }
@@ -337,7 +559,7 @@ func TestRunLifecycle_ProbePayloadReachesExecute(t *testing.T) {
 					return "ok", false, nil
 				},
 			}
-			extensions.RunLifecycle(context.Background(), ext, tc.shape, nil)
+			extensions.RunLifecycle(context.Background(), ext, tc.shape, nil, noOpts)
 			var m map[string]any
 			if err := json.Unmarshal(gotParams, &m); err != nil {
 				t.Fatalf("params not valid JSON: %v", err)

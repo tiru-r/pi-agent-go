@@ -3,11 +3,14 @@ package extensions
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/tiru-r/pi-agent-go/internal/conformance"
 )
 
 // ExtShape classifies the primary behavioral shape of a loaded extension.
@@ -68,10 +71,20 @@ const (
 	ErrCatPanic        ErrorCategory = "panic"
 )
 
-// LifecycleError pairs an actionable category with a human-readable message.
+// Transient reports whether this category of failure is inherently transient
+// (i.e., may resolve on retry without a code change).  Callers should also
+// check LifecycleError.Transient for pattern-matched transience on invoke
+// errors, which can be either transient or deterministic depending on cause.
+func (c ErrorCategory) Transient() bool {
+	return c == ErrCatTimeout
+}
+
+// LifecycleError pairs an actionable category with a human-readable message
+// and a transience flag so callers can decide whether to retry.
 type LifecycleError struct {
-	Category ErrorCategory `json:"category"`
-	Message  string        `json:"message"`
+	Category  ErrorCategory `json:"category"`
+	Message   string        `json:"message"`
+	Transient bool          `json:"transient"`
 }
 
 func (e *LifecycleError) Error() string {
@@ -97,6 +110,19 @@ type LifecycleReport struct {
 	Events  []LifecycleEvent
 	// Failed is true if any step produced an error event.
 	Failed bool
+	// TransientFailure is true when at least one failure is transient —
+	// the caller may retry without a code change.  When Failed is true and
+	// TransientFailure is false the failure is deterministic.
+	TransientFailure bool
+}
+
+// LifecycleOptions configures optional RunLifecycle behaviour.
+type LifecycleOptions struct {
+	// InvokeWant, if non-nil, is the expected JSON output for the probe
+	// invocation.  The output is compared via conformance.Compare; any diff
+	// is recorded as a deterministic ErrCatRegistration event.
+	InvokeWant     []byte
+	CompareOptions conformance.CompareOptions
 }
 
 // RunLifecycle exercises ext through the standard four-step lifecycle and
@@ -105,12 +131,13 @@ type LifecycleReport struct {
 // Steps:
 //  1. load                 — validates Info() field completeness
 //  2. verify_registrations — checks Info() is consistent with the declared shape
-//  3. invoke               — calls Execute with a shape-appropriate probe payload
+//  3. invoke               — calls Execute with a shape-appropriate probe payload;
+//     if opts.InvokeWant is set the output is checked via conformance.Compare
 //  4. shutdown             — calls Close(), recovering any panic
 //
 // All four steps always run regardless of earlier failures so the report
 // captures the full health picture of the extension.
-func RunLifecycle(ctx context.Context, ext Extension, shape ExtShape, sink io.Writer) LifecycleReport {
+func RunLifecycle(ctx context.Context, ext Extension, shape ExtShape, sink io.Writer, opts LifecycleOptions) LifecycleReport {
 	name := ext.Info().Name
 	if name == "" {
 		name = "<unnamed>"
@@ -124,6 +151,9 @@ func RunLifecycle(ctx context.Context, ext Extension, shape ExtShape, sink io.Wr
 		rep.Events = append(rep.Events, ev)
 		if ev.Err != nil {
 			rep.Failed = true
+			if ev.Err.Transient {
+				rep.TransientFailure = true
+			}
 		}
 		if sink != nil {
 			b, _ := json.Marshal(ev)
@@ -146,7 +176,7 @@ func RunLifecycle(ctx context.Context, ext Extension, shape ExtShape, sink io.Wr
 	}
 
 	// Step 3: Invoke — probe the primary dispatch path.
-	runInvoke(ctx, ext, shape, emit)
+	runInvoke(ctx, ext, shape, opts, emit)
 
 	// Step 4: Shutdown — clean teardown with panic recovery.
 	runShutdown(ext, emit)
@@ -158,13 +188,13 @@ func RunLifecycle(ctx context.Context, ext Extension, shape ExtShape, sink io.Wr
 // independent of shape.
 func validateInfo(info Info, shape ExtShape) *LifecycleError {
 	if info.Name == "" {
-		return &LifecycleError{ErrCatLoad, "describe() returned empty name"}
+		return &LifecycleError{ErrCatLoad, "describe() returned empty name", false}
 	}
 	if info.Description == "" {
-		return &LifecycleError{ErrCatLoad, "describe() returned empty description"}
+		return &LifecycleError{ErrCatLoad, "describe() returned empty description", false}
 	}
 	if shape == ShapeTool && (info.Schema == nil || string(info.Schema) == "null") {
-		return &LifecycleError{ErrCatRegistration, "tool shape requires a non-null schema"}
+		return &LifecycleError{ErrCatRegistration, "tool shape requires a non-null schema", false}
 	}
 	return nil
 }
@@ -174,39 +204,39 @@ func verifyRegistrations(info Info, shape ExtShape) *LifecycleError {
 	switch shape {
 	case ShapeTool:
 		if info.Schema == nil {
-			return &LifecycleError{ErrCatRegistration, "tool schema is nil"}
+			return &LifecycleError{ErrCatRegistration, "tool schema is nil", false}
 		}
 		var s map[string]any
 		if err := json.Unmarshal(info.Schema, &s); err != nil {
-			return &LifecycleError{ErrCatRegistration, "tool schema is not a valid JSON object: " + err.Error()}
+			return &LifecycleError{ErrCatRegistration, "tool schema is not a valid JSON object: " + err.Error(), false}
 		}
 		if s["type"] == nil && s["properties"] == nil {
-			return &LifecycleError{ErrCatRegistration, "tool schema missing 'type' or 'properties'"}
+			return &LifecycleError{ErrCatRegistration, "tool schema missing 'type' or 'properties'", false}
 		}
 
 	case ShapeCommand:
 		if err := checkSchemaProp(info.Schema, "command"); err != nil {
-			return &LifecycleError{ErrCatRegistration, "command shape: " + err.Error()}
+			return &LifecycleError{ErrCatRegistration, "command shape: " + err.Error(), false}
 		}
 
 	case ShapeEventHook:
 		if err := checkSchemaProp(info.Schema, "event"); err != nil {
-			return &LifecycleError{ErrCatRegistration, "event_hook shape: " + err.Error()}
+			return &LifecycleError{ErrCatRegistration, "event_hook shape: " + err.Error(), false}
 		}
 
 	case ShapeConfiguration:
 		if err := checkSchemaProp(info.Schema, "key"); err != nil {
-			return &LifecycleError{ErrCatRegistration, "configuration shape: " + err.Error()}
+			return &LifecycleError{ErrCatRegistration, "configuration shape: " + err.Error(), false}
 		}
 
 	case ShapeUIComponent:
 		if err := checkSchemaProp(info.Schema, "action"); err != nil {
-			return &LifecycleError{ErrCatRegistration, "ui_component shape: " + err.Error()}
+			return &LifecycleError{ErrCatRegistration, "ui_component shape: " + err.Error(), false}
 		}
 
 	case ShapeProvider:
 		if err := checkSchemaProp(info.Schema, "action"); err != nil {
-			return &LifecycleError{ErrCatRegistration, "provider shape: " + err.Error()}
+			return &LifecycleError{ErrCatRegistration, "provider shape: " + err.Error(), false}
 		}
 	}
 	return nil
@@ -251,30 +281,46 @@ func probePayload(shape ExtShape) json.RawMessage {
 	}
 }
 
-// categorizeExecError maps an error message to an actionable ErrorCategory.
-func categorizeExecError(msg string) ErrorCategory {
-	switch {
-	case strings.Contains(msg, "capability") && strings.Contains(msg, "not granted"):
-		return ErrCatCapability
-	case strings.Contains(msg, "context deadline exceeded"),
-		strings.Contains(msg, "context canceled"):
+// categorizeExecError maps an error to an actionable ErrorCategory.
+// Uses errors.Is for context sentinel detection so wrapped errors are handled
+// correctly, and falls back to substring matching only for non-typed errors.
+func categorizeExecError(err error) ErrorCategory {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return ErrCatTimeout
-	default:
-		return ErrCatInvoke
 	}
+	msg := err.Error()
+	if strings.Contains(msg, "capability") && strings.Contains(msg, "not granted") {
+		return ErrCatCapability
+	}
+	return ErrCatInvoke
 }
 
-func runInvoke(ctx context.Context, ext Extension, shape ExtShape, emit func(LifecycleEvent)) {
+func runInvoke(ctx context.Context, ext Extension, shape ExtShape, opts LifecycleOptions, emit func(LifecycleEvent)) {
 	payload := probePayload(shape)
 	content, isError, err := ext.Execute(ctx, payload)
 	if err != nil {
+		cat := categorizeExecError(err)
+		transient := cat.Transient() || conformance.ClassifyError(err) == conformance.FlakeTransient
 		emit(LifecycleEvent{
 			Step: StepInvoke,
 			OK:   false,
-			Err:  &LifecycleError{categorizeExecError(err.Error()), err.Error()},
+			Err:  &LifecycleError{cat, err.Error(), transient},
 		})
 		return
 	}
+
+	// Conformance check against fixture — always deterministic on mismatch.
+	if len(opts.InvokeWant) > 0 {
+		if cErr := conformance.Compare([]byte(content), opts.InvokeWant, opts.CompareOptions); cErr != nil {
+			emit(LifecycleEvent{
+				Step: StepInvoke,
+				OK:   false,
+				Err:  &LifecycleError{ErrCatRegistration, cErr.Error(), false},
+			})
+			return
+		}
+	}
+
 	emit(LifecycleEvent{
 		Step:   StepInvoke,
 		OK:     true,
@@ -292,6 +338,7 @@ func runShutdown(ext Extension, emit func(LifecycleEvent)) {
 				Err: &LifecycleError{
 					ErrCatPanic,
 					fmt.Sprintf("panic: %v\n%s", r, stack),
+					false,
 				},
 			})
 		}
@@ -300,7 +347,7 @@ func runShutdown(ext Extension, emit func(LifecycleEvent)) {
 		emit(LifecycleEvent{
 			Step: StepShutdown,
 			OK:   false,
-			Err:  &LifecycleError{ErrCatShutdown, err.Error()},
+			Err:  &LifecycleError{ErrCatShutdown, err.Error(), false},
 		})
 		return
 	}
