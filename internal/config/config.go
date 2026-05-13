@@ -50,10 +50,14 @@ func Load() (*Config, error) {
 		var fileCfg Config
 		if err := json.Unmarshal(data, &fileCfg); err == nil {
 			merge(&cfg, &fileCfg)
-			// Only override SQLite when the key is explicitly present in the file,
-			// because bool zero value (false) is indistinguishable from "not set".
+			// Only override bool fields when the key is explicitly present in the
+			// file, because a bool zero value (false) is indistinguishable from
+			// "not set" after JSON unmarshalling.
 			if strings.Contains(string(data), `"sqlite"`) {
 				cfg.SQLite = fileCfg.SQLite
+			}
+			if strings.Contains(string(data), `"semantic_cache"`) {
+				cfg.SemanticCache = fileCfg.SemanticCache
 			}
 		}
 	}
@@ -114,9 +118,6 @@ func merge(base, override *Config) {
 	}
 	if override.ExtensionsDir != "" {
 		base.ExtensionsDir = override.ExtensionsDir
-	}
-	if override.SemanticCache {
-		base.SemanticCache = true
 	}
 	if override.DistillFile != "" {
 		base.DistillFile = override.DistillFile

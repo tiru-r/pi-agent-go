@@ -633,6 +633,11 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			if err != nil || matchCount >= maxMatches {
 				return nil
 			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "target" {
@@ -987,11 +992,16 @@ func (h *hashlineEditTool) Execute(ctx context.Context, params json.RawMessage) 
 		applied++
 	}
 
+	perm := fs.FileMode(0o644)
+	if info, statErr := os.Stat(p.Path); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+
 	joined := strings.Join(lines, "\n")
 	if hasTrailingNewline {
 		joined += "\n"
 	}
-	if err := os.WriteFile(p.Path, []byte(joined), 0o644); err != nil {
+	if err := os.WriteFile(p.Path, []byte(joined), perm); err != nil {
 		return errorResult("cannot write file: " + err.Error()), nil
 	}
 
