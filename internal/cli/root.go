@@ -171,7 +171,8 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 				System:        cfg.SystemPrompt,
 				ThinkingLevel: model.ThinkingLevel(cfg.ThinkingLevel),
 			}
-			updatedMsgs, runErr := ag.Run(cx, prompt, history, opts,
+			inputBlocks := []model.ContentBlock{{Type: model.ContentTypeText, Text: prompt}}
+			updatedMsgs, runErr := ag.Run(cx, inputBlocks, history, opts,
 				func(ev agent.AgentEvent) {
 					switch ev.Kind {
 					case agent.EventKindText:

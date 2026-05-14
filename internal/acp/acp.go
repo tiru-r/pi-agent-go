@@ -161,9 +161,9 @@ type acpContent struct {
 
 // acpPromptParams covers both the new ACP (prompt array) and the old format.
 type acpPromptParams struct {
-	SessionID string     `json:"sessionId"`
-	Prompt    flexString `json:"prompt"` // new: [{type:"text",text:…}]; old: "string"
-	MessageID string     `json:"messageId,omitempty"`
+	SessionID string        `json:"sessionId"`
+	Prompt    promptContent `json:"prompt"` // new: [{type:"text"|"image"|…}]; old: "string"
+	MessageID string        `json:"messageId,omitempty"`
 }
 
 type acpPromptResult struct {
@@ -257,29 +257,212 @@ type acpLocationUpdate struct {
 	Path          string `json:"path"`
 }
 
-// flexString unmarshals JSON that may arrive as a plain string or as an array
-// of content blocks (e.g. [{type:"text",text:"…"}]).
-type flexString string
+// ── Prompt content block parsing ──────────────────────────────────────────────
 
-func (f *flexString) UnmarshalJSON(b []byte) error {
+// acpIncomingBlock is a single block in an incoming ACP prompt array.
+// It covers text, image, and all embedded-context types Zed may send.
+type acpIncomingBlock struct {
+	Type string `json:"type"`
+	// Text-bearing fields (text, file, selection, symbol, branch_diff, thread, rules)
+	Text string `json:"text,omitempty"`
+	Path string `json:"path,omitempty"`
+	Name string `json:"name,omitempty"` // symbol name
+	// Selection range
+	Start *acpTextPosition `json:"start,omitempty"`
+	End   *acpTextPosition `json:"end,omitempty"`
+	// Image — Zed sends one of these two shapes
+	Image  *acpImageRef    `json:"image,omitempty"`
+	Source *acpImageSource `json:"source,omitempty"`
+}
+
+type acpTextPosition struct {
+	Line   int `json:"line"`
+	Column int `json:"column,omitempty"`
+}
+
+type acpImageRef struct {
+	URL string `json:"url"`
+	Alt string `json:"alt,omitempty"`
+}
+
+type acpImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+// promptContent holds a parsed ACP prompt as model content blocks.
+// It accepts both the legacy plain-string format and the new array format.
+type promptContent struct {
+	Blocks []model.ContentBlock
+}
+
+func (p *promptContent) IsEmpty() bool { return len(p.Blocks) == 0 }
+
+func (p *promptContent) UnmarshalJSON(b []byte) error {
+	// Legacy format: plain string
 	var s string
 	if err := json.Unmarshal(b, &s); err == nil {
-		*f = flexString(s)
+		if s != "" {
+			p.Blocks = []model.ContentBlock{{Type: model.ContentTypeText, Text: s}}
+		}
 		return nil
 	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(b, &blocks); err != nil {
+	// New format: typed content-block array
+	var raw []acpIncomingBlock
+	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
 	}
-	var sb strings.Builder
-	for _, blk := range blocks {
-		sb.WriteString(blk.Text)
-	}
-	*f = flexString(sb.String())
+	p.Blocks = convertIncomingBlocks(raw)
 	return nil
+}
+
+// convertIncomingBlocks maps ACP wire blocks to model content blocks.
+func convertIncomingBlocks(raw []acpIncomingBlock) []model.ContentBlock {
+	out := make([]model.ContentBlock, 0, len(raw))
+	for _, blk := range raw {
+		switch blk.Type {
+		case "text":
+			if blk.Text != "" {
+				out = append(out, model.ContentBlock{Type: model.ContentTypeText, Text: blk.Text})
+			}
+		case "image":
+			if cb, ok := convertImageBlock(blk); ok {
+				out = append(out, cb)
+			}
+		case "file":
+			if t := formatFileContext(blk); t != "" {
+				out = append(out, model.ContentBlock{Type: model.ContentTypeText, Text: t})
+			}
+		case "selection":
+			if t := formatSelectionContext(blk); t != "" {
+				out = append(out, model.ContentBlock{Type: model.ContentTypeText, Text: t})
+			}
+		case "symbol":
+			if t := formatSymbolContext(blk); t != "" {
+				out = append(out, model.ContentBlock{Type: model.ContentTypeText, Text: t})
+			}
+		case "branch_diff":
+			if blk.Text != "" {
+				out = append(out, model.ContentBlock{
+					Type: model.ContentTypeText,
+					Text: "**Branch Diff:**\n```diff\n" + blk.Text + "\n```",
+				})
+			}
+		case "thread":
+			if blk.Text != "" {
+				out = append(out, model.ContentBlock{
+					Type: model.ContentTypeText,
+					Text: "**Thread context:**\n" + blk.Text,
+				})
+			}
+		case "rules":
+			if blk.Text != "" {
+				out = append(out, model.ContentBlock{
+					Type: model.ContentTypeText,
+					Text: "**Rules:**\n" + blk.Text,
+				})
+			}
+		default:
+			// Unknown types: preserve any text content.
+			if blk.Text != "" {
+				out = append(out, model.ContentBlock{Type: model.ContentTypeText, Text: blk.Text})
+			}
+		}
+	}
+	return out
+}
+
+// convertImageBlock converts an ACP image block to a model ContentBlock.
+// Returns false if the block has no usable source.
+func convertImageBlock(blk acpIncomingBlock) (model.ContentBlock, bool) {
+	src := &model.ImageSource{}
+	switch {
+	case blk.Image != nil && blk.Image.URL != "":
+		url := blk.Image.URL
+		if rest, ok := strings.CutPrefix(url, "data:"); ok {
+			// data:<mediaType>;base64,<data>
+			mediaType, enc, ok2 := strings.Cut(rest, ";")
+			if !ok2 || !strings.HasPrefix(enc, "base64,") {
+				return model.ContentBlock{}, false
+			}
+			src.Type = "base64"
+			src.MediaType = mediaType
+			src.Data = enc[len("base64,"):]
+		} else {
+			src.Type = "url"
+			src.URL = url
+		}
+	case blk.Source != nil && blk.Source.Type != "":
+		src.Type = blk.Source.Type
+		src.MediaType = blk.Source.MediaType
+		src.Data = blk.Source.Data
+		src.URL = blk.Source.URL
+	default:
+		return model.ContentBlock{}, false
+	}
+	return model.ContentBlock{Type: model.ContentTypeImage, Source: src}, true
+}
+
+func formatFileContext(blk acpIncomingBlock) string {
+	if blk.Text == "" {
+		return ""
+	}
+	if blk.Path != "" {
+		return "**File: " + blk.Path + "**\n```\n" + blk.Text + "\n```"
+	}
+	return blk.Text
+}
+
+func formatSelectionContext(blk acpIncomingBlock) string {
+	if blk.Text == "" {
+		return ""
+	}
+	header := "**Selection"
+	if blk.Path != "" {
+		header += " from " + blk.Path
+		if blk.Start != nil {
+			header += fmt.Sprintf(" (line %d", blk.Start.Line+1)
+			if blk.End != nil && blk.End.Line != blk.Start.Line {
+				header += fmt.Sprintf("–%d", blk.End.Line+1)
+			}
+			header += ")"
+		}
+	}
+	header += ":**"
+	return header + "\n```\n" + blk.Text + "\n```"
+}
+
+func formatSymbolContext(blk acpIncomingBlock) string {
+	if blk.Text == "" {
+		return ""
+	}
+	header := "**Symbol"
+	if blk.Name != "" {
+		header += ": " + blk.Name
+	}
+	if blk.Path != "" {
+		header += " in " + blk.Path
+	}
+	header += ":**"
+	return header + "\n```\n" + blk.Text + "\n```"
+}
+
+// expandAtFilesInBlocks applies @file expansion to every text block in-place.
+func expandAtFilesInBlocks(blocks []model.ContentBlock, cwd string) ([]model.ContentBlock, []string) {
+	var allExpanded []string
+	out := make([]model.ContentBlock, len(blocks))
+	for i, blk := range blocks {
+		if blk.Type == model.ContentTypeText && blk.Text != "" {
+			expanded, files := autocomplete.ExpandAtFiles(blk.Text, cwd)
+			out[i] = model.ContentBlock{Type: model.ContentTypeText, Text: expanded}
+			allExpanded = append(allExpanded, files...)
+		} else {
+			out[i] = blk
+		}
+	}
+	return out, allExpanded
 }
 
 // ── Session state ─────────────────────────────────────────────────────────────
@@ -763,7 +946,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 		s.sendError(rawID(req.ID), -32602, "invalid params: "+err.Error())
 		return
 	}
-	if p.Prompt == "" {
+	if p.Prompt.IsEmpty() {
 		s.sendError(rawID(req.ID), -32602, "prompt is required")
 		return
 	}
@@ -813,8 +996,8 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 	copy(history, ss.msgs)
 	s.sessionsMu.RUnlock()
 
-	// Expand @file tokens relative to the project working directory.
-	prompt, expandedFiles := autocomplete.ExpandAtFiles(string(p.Prompt), cwd)
+	// Expand @file tokens in text blocks relative to the project working directory.
+	promptBlocks, expandedFiles := expandAtFilesInBlocks(p.Prompt.Blocks, cwd)
 	if len(expandedFiles) > 0 {
 		slog.Debug("session/prompt: expanded @files", "session", p.SessionID, "files", expandedFiles)
 	}
@@ -853,7 +1036,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 
 	slog.Debug("session/prompt", "session", p.SessionID, "model", modelID, "thinking", thinkLevel, "mode", agentMode)
 
-	updatedMsgs, err := ag.Run(cx, prompt, history, agent.Options{
+	updatedMsgs, err := ag.Run(cx, promptBlocks, history, agent.Options{
 		ThinkingLevel: thinkLevel,
 		Mode:          agentMode,
 	}, func(ev agent.AgentEvent) {

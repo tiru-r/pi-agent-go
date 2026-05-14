@@ -143,7 +143,7 @@ func New(prov provider.Provider, modelName, system string, maxTokens int) *Agent
 // Returns the updated message history (including the new turn).
 func (a *Agent) Run(
 	cx *AgentCx,
-	input string,
+	input []model.ContentBlock,
 	history []model.Message,
 	opts Options,
 	onEvent func(AgentEvent),
@@ -173,7 +173,7 @@ func (a *Agent) Run(
 	// Build initial message list.
 	msgs := make([]model.Message, 0, len(history)+1)
 	msgs = append(msgs, history...)
-	msgs = append(msgs, model.NewTextMessage(model.RoleUser, input))
+	msgs = append(msgs, model.Message{Role: model.RoleUser, Content: input})
 
 	// Apply mode overrides before resolving tools so Plan/Pipe skip the lookup.
 	var toolDefs []model.ToolDefinition
