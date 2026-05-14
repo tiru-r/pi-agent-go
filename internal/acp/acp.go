@@ -19,7 +19,8 @@
 //	initialize result          {protocolVersion, agentInfo:{name,version}}
 //	session/new result         {sessionId, configOptions:[model-select, thinking-select]}
 //	session/update notification {sessionId, update:{sessionUpdate:"agent_message_chunk"|"agent_thought_chunk", content:{type:"text",text:"…"}}}
-//	session/update notification {sessionId, update:{sessionUpdate:"agent_location", path:"…"}}                  (Follow pi)
+//	session/update notification {sessionId, update:{sessionUpdate:"tool_call_update", toolCallId, kind, status, title, rawInput, locations:[{path,line?}]}}
+//	session/update notification {sessionId, update:{sessionUpdate:"tool_call_update", toolCallId, status, rawOutput}}  (tool done + Follow pi)
 //	session/prompt result      {stopReason, usage?}
 //	session/set_config_option  {configOptions:[…]}
 //	error response             {code, message}
@@ -150,7 +151,7 @@ type acpUpdateParams struct {
 }
 
 type acpUpdate struct {
-	SessionUpdate string     `json:"sessionUpdate"` // "agent_message_chunk" | "agent_thought_chunk" (see acpLocationUpdate for "agent_location")
+	SessionUpdate string     `json:"sessionUpdate"` // "agent_message_chunk" | "agent_thought_chunk"
 	Content       acpContent `json:"content"`
 }
 
@@ -221,40 +222,29 @@ type acpSessionLoadResult struct {
 
 // ── Tool update types ─────────────────────────────────────────────────────────
 
-type acpToolUseNotifParams struct {
-	SessionID string           `json:"sessionId"`
-	Update    acpToolUseUpdate `json:"update"`
-}
-
-type acpToolUseUpdate struct {
-	SessionUpdate string          `json:"sessionUpdate"` // "agent_tool_use"
-	ToolUseID     string          `json:"toolUseId"`
-	Name          string          `json:"name"`
-	Input         json.RawMessage `json:"input,omitempty"`
-}
-
-type acpToolResultNotifParams struct {
-	SessionID string              `json:"sessionId"`
-	Update    acpToolResultUpdate `json:"update"`
-}
-
-type acpToolResultUpdate struct {
-	SessionUpdate string       `json:"sessionUpdate"` // "agent_tool_result"
-	ToolUseID     string       `json:"toolUseId"`
-	Content       []acpContent `json:"content"`
-	IsError       bool         `json:"isError,omitempty"`
-}
-
-// acpLocationNotifParams is the session/update notification for agent_location,
-// which powers Zed's "Follow pi" feature.
-type acpLocationNotifParams struct {
+// acpToolCallUpdateParams is the session/update notification for tool_call_update,
+// which replaces the old agent_tool_use / agent_tool_result / agent_location types
+// that Zed 1.2+ no longer accepts. It also powers the "Follow Pi" feature via Locations.
+type acpToolCallUpdateParams struct {
 	SessionID string            `json:"sessionId"`
-	Update    acpLocationUpdate `json:"update"`
+	Update    acpToolCallUpdate `json:"update"`
 }
 
-type acpLocationUpdate struct {
-	SessionUpdate string `json:"sessionUpdate"` // "agent_location"
-	Path          string `json:"path"`
+type acpToolCallUpdate struct {
+	SessionUpdate string           `json:"sessionUpdate"` // "tool_call_update"
+	ToolCallID    string           `json:"toolCallId"`
+	Kind          string           `json:"kind,omitempty"`   // execute|search|other|…
+	Status        string           `json:"status,omitempty"` // in_progress|completed|failed
+	Title         string           `json:"title,omitempty"`
+	RawInput      string           `json:"rawInput,omitempty"`
+	RawOutput     string           `json:"rawOutput,omitempty"`
+	Locations     []acpToolCallLoc `json:"locations,omitempty"`
+}
+
+// acpToolCallLoc is a file location embedded in tool_call_update for Follow Pi.
+type acpToolCallLoc struct {
+	Path string `json:"path"`
+	Line *int   `json:"line,omitempty"`
 }
 
 // ── Prompt content block parsing ──────────────────────────────────────────────
@@ -1052,12 +1042,9 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 		case agent.EventKindToolStart:
 			slog.Debug("tool queued", "name", ev.ToolName)
 		case agent.EventKindToolExec:
-			s.sendToolUseUpdate(p.SessionID, ev.ToolID, ev.ToolName, ev.ToolInput)
-			if path := extractFilePath(ev.ToolName, ev.ToolInput); path != "" {
-				s.sendLocationUpdate(p.SessionID, path)
-			}
+			s.sendToolExecUpdate(p.SessionID, ev.ToolID, ev.ToolName, ev.ToolInput)
 		case agent.EventKindToolDone:
-			s.sendToolResultUpdate(p.SessionID, ev.ToolResult)
+			s.sendToolDoneUpdate(p.SessionID, ev.ToolResult)
 		case agent.EventKindDone:
 			finalStop = ev.StopReason
 			finalUsage = ev.Usage
@@ -1222,13 +1209,13 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 						s.sendSessionUpdate(p.SessionID, "agent_thought_chunk", block.Thinking)
 					}
 				case model.ContentTypeToolUse:
-					s.sendToolUseUpdate(p.SessionID, block.ID, block.Name, block.Input)
+					s.sendToolExecUpdate(p.SessionID, block.ID, block.Name, block.Input)
 				}
 			}
 		case model.RoleUser:
 			for _, block := range msg.Content {
 				if block.Type == model.ContentTypeToolResult {
-					s.sendToolResultUpdate(p.SessionID, block)
+					s.sendToolDoneUpdate(p.SessionID, block)
 				}
 			}
 		}
@@ -1244,49 +1231,58 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 	})
 }
 
-// sendToolUseUpdate sends an agent_tool_use session/update notification.
-func (s *Server) sendToolUseUpdate(sessionID, toolID, name string, input json.RawMessage) {
-	s.sendNotification("session/update", acpToolUseNotifParams{
-		SessionID: sessionID,
-		Update: acpToolUseUpdate{
-			SessionUpdate: "agent_tool_use",
-			ToolUseID:     toolID,
-			Name:          name,
-			Input:         input,
-		},
-	})
-}
-
-// sendLocationUpdate sends an agent_location session/update notification so
-// Zed's "Follow pi" feature can scroll to the file the agent is accessing.
-func (s *Server) sendLocationUpdate(sessionID, path string) {
-	if path == "" {
-		return
+// toolCallKind maps a tool name to the ACP ToolCallKind value Zed expects.
+func toolCallKind(toolName string) string {
+	switch toolName {
+	case "bash":
+		return "execute"
+	case "grep", "find":
+		return "search"
+	default:
+		return "other"
 	}
-	s.sendNotification("session/update", acpLocationNotifParams{
+}
+
+// sendToolExecUpdate sends a tool_call_update when a tool begins executing.
+// It replaces the old agent_tool_use + agent_location pair.
+func (s *Server) sendToolExecUpdate(sessionID, toolID, name string, input json.RawMessage) {
+	upd := acpToolCallUpdate{
+		SessionUpdate: "tool_call_update",
+		ToolCallID:    toolID,
+		Kind:          toolCallKind(name),
+		Status:        "in_progress",
+		Title:         name,
+		RawInput:      string(input),
+	}
+	if path, line := extractFileLocation(name, input); path != "" {
+		upd.Locations = []acpToolCallLoc{{Path: path, Line: line}}
+	}
+	s.sendNotification("session/update", acpToolCallUpdateParams{
 		SessionID: sessionID,
-		Update:    acpLocationUpdate{SessionUpdate: "agent_location", Path: path},
+		Update:    upd,
 	})
 }
 
-// sendToolResultUpdate sends an agent_tool_result session/update notification.
-func (s *Server) sendToolResultUpdate(sessionID string, result model.ContentBlock) {
-	var contents []acpContent
+// sendToolDoneUpdate sends a tool_call_update when a tool finishes.
+// It replaces the old agent_tool_result notification.
+func (s *Server) sendToolDoneUpdate(sessionID string, result model.ContentBlock) {
+	var sb strings.Builder
 	for _, c := range result.Content {
 		if c.Type == model.ContentTypeText {
-			contents = append(contents, acpContent{Type: "text", Text: c.Text})
+			sb.WriteString(c.Text)
 		}
 	}
-	if contents == nil {
-		contents = []acpContent{}
+	status := "completed"
+	if result.IsError {
+		status = "failed"
 	}
-	s.sendNotification("session/update", acpToolResultNotifParams{
+	s.sendNotification("session/update", acpToolCallUpdateParams{
 		SessionID: sessionID,
-		Update: acpToolResultUpdate{
-			SessionUpdate: "agent_tool_result",
-			ToolUseID:     result.ToolUseID,
-			Content:       contents,
-			IsError:       result.IsError,
+		Update: acpToolCallUpdate{
+			SessionUpdate: "tool_call_update",
+			ToolCallID:    result.ToolUseID,
+			Status:        status,
+			RawOutput:     sb.String(),
 		},
 	})
 }
@@ -1521,23 +1517,30 @@ func (s *Server) handleInputComplete(req *request) {
 	s.sendResult(rawID(req.ID), result)
 }
 
-// extractFilePath parses the tool input JSON and returns the "path" field for
-// file-accessing tools (read, write, edit, hashline_edit). Returns "" for all
-// other tools so the caller can skip sending a location update.
-func extractFilePath(toolName string, input json.RawMessage) string {
+// extractFileLocation parses the tool input JSON and returns the path and
+// optional line number for file-accessing tools (read, write, edit,
+// hashline_edit). Returns ("", nil) for all other tools.
+// For the read tool the offset parameter is used as the line hint so Follow Pi
+// scrolls to the section actually being read.
+func extractFileLocation(toolName string, input json.RawMessage) (path string, line *int) {
 	switch toolName {
 	case "read", "write", "edit", "hashline_edit":
 	default:
-		return ""
+		return "", nil
 	}
 	var p struct {
-		Path string `json:"path"`
+		Path   string `json:"path"`
+		Offset int    `json:"offset"` // read tool: 1-based start line
 	}
-	if err := json.Unmarshal(input, &p); err != nil {
-		return ""
+	if err := json.Unmarshal(input, &p); err != nil || p.Path == "" {
+		return "", nil
 	}
-	return p.Path
+	if toolName == "read" && p.Offset > 0 {
+		return p.Path, &p.Offset
+	}
+	return p.Path, nil
 }
+
 
 func toACPModels(infos []model.ModelInfo) []acpModel {
 	out := make([]acpModel, 0, len(infos))
