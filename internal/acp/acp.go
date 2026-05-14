@@ -19,8 +19,8 @@
 //	initialize result          {protocolVersion, agentInfo:{name,version}}
 //	session/new result         {sessionId, configOptions:[model-select, thinking-select]}
 //	session/update notification {sessionId, update:{sessionUpdate:"agent_message_chunk"|"agent_thought_chunk", content:{type:"text",text:"…"}}}
-//	session/update notification {sessionId, update:{sessionUpdate:"tool_call_update", toolCallId, kind, status, title, rawInput, locations:[{path,line?}]}}
-//	session/update notification {sessionId, update:{sessionUpdate:"tool_call_update", toolCallId, status, rawOutput}}  (tool done + Follow pi)
+//	session/update notification {sessionId, update:{sessionUpdate:"tool_call",        toolCallId, kind, status:"in_progress", title, rawInput, locations:[{path,line?}]}}  (tool starts)
+//	session/update notification {sessionId, update:{sessionUpdate:"tool_call_update", toolCallId, status:"completed"|"failed", rawOutput}}  (tool done + Follow pi)
 //	session/prompt result      {stopReason, usage?}
 //	session/set_config_option  {configOptions:[…]}
 //	error response             {code, message}
@@ -230,18 +230,25 @@ type acpToolCallUpdateParams struct {
 	Update    acpToolCallUpdate `json:"update"`
 }
 
+// acpToolCallUpdate covers both "tool_call" (initial creation) and
+// "tool_call_update" (status/output changes). The SessionUpdate field
+// distinguishes the two per the ACP spec:
+//   - "tool_call"        → creates the entry in Zed (sent when execution starts)
+//   - "tool_call_update" → patches an existing entry (sent when execution finishes)
+//
+// rawInput and rawOutput are JSON values (not strings) per the ACP spec.
 type acpToolCallUpdate struct {
-	SessionUpdate string           `json:"sessionUpdate"` // "tool_call_update"
+	SessionUpdate string           `json:"sessionUpdate"`    // "tool_call" | "tool_call_update"
 	ToolCallID    string           `json:"toolCallId"`
-	Kind          string           `json:"kind,omitempty"`   // execute|search|other|…
+	Kind          string           `json:"kind,omitempty"`   // read|edit|execute|search|other
 	Status        string           `json:"status,omitempty"` // in_progress|completed|failed
 	Title         string           `json:"title,omitempty"`
-	RawInput      string           `json:"rawInput,omitempty"`
-	RawOutput     string           `json:"rawOutput,omitempty"`
+	RawInput      json.RawMessage  `json:"rawInput,omitempty"`  // JSON value
+	RawOutput     json.RawMessage  `json:"rawOutput,omitempty"` // JSON value
 	Locations     []acpToolCallLoc `json:"locations,omitempty"`
 }
 
-// acpToolCallLoc is a file location embedded in tool_call_update for Follow Pi.
+// acpToolCallLoc is a file location embedded in tool_call / tool_call_update for Follow Pi.
 type acpToolCallLoc struct {
 	Path string `json:"path"`
 	Line *int   `json:"line,omitempty"`
@@ -1231,9 +1238,14 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 	})
 }
 
-// toolCallKind maps a tool name to the ACP ToolCallKind value Zed expects.
+// toolCallKind maps a Pi tool name to the ACP ToolKind value.
+// Values match the ACP spec snake_case enum: read, edit, execute, search, other.
 func toolCallKind(toolName string) string {
 	switch toolName {
+	case "read", "ls":
+		return "read"
+	case "write", "edit", "hashline_edit":
+		return "edit"
 	case "bash":
 		return "execute"
 	case "grep", "find":
@@ -1243,16 +1255,19 @@ func toolCallKind(toolName string) string {
 	}
 }
 
-// sendToolExecUpdate sends a tool_call_update when a tool begins executing.
-// It replaces the old agent_tool_use + agent_location pair.
+// sendToolExecUpdate sends a "tool_call" notification when a tool begins executing.
+// Per the ACP spec, "tool_call" creates the entry in Zed; only "tool_call_update"
+// patches an existing entry. Using "tool_call" here prevents "Tool call not found"
+// errors that arise when Zed receives a "tool_call_update" for an unknown ID.
+// rawInput is passed as a JSON value (not a string) per the ACP spec.
 func (s *Server) sendToolExecUpdate(sessionID, toolID, name string, input json.RawMessage) {
 	upd := acpToolCallUpdate{
-		SessionUpdate: "tool_call_update",
+		SessionUpdate: "tool_call",
 		ToolCallID:    toolID,
 		Kind:          toolCallKind(name),
 		Status:        "in_progress",
 		Title:         name,
-		RawInput:      string(input),
+		RawInput:      input, // JSON value, not string(input)
 	}
 	if path, line := extractFileLocation(name, input); path != "" {
 		upd.Locations = []acpToolCallLoc{{Path: path, Line: line}}
@@ -1263,8 +1278,8 @@ func (s *Server) sendToolExecUpdate(sessionID, toolID, name string, input json.R
 	})
 }
 
-// sendToolDoneUpdate sends a tool_call_update when a tool finishes.
-// It replaces the old agent_tool_result notification.
+// sendToolDoneUpdate sends a "tool_call_update" notification when a tool finishes.
+// rawOutput is encoded as a JSON string value per the ACP spec (Option<Value>).
 func (s *Server) sendToolDoneUpdate(sessionID string, result model.ContentBlock) {
 	var sb strings.Builder
 	for _, c := range result.Content {
@@ -1276,13 +1291,19 @@ func (s *Server) sendToolDoneUpdate(sessionID string, result model.ContentBlock)
 	if result.IsError {
 		status = "failed"
 	}
+	var rawOutput json.RawMessage
+	if sb.Len() > 0 {
+		if b, err := json.Marshal(sb.String()); err == nil {
+			rawOutput = b
+		}
+	}
 	s.sendNotification("session/update", acpToolCallUpdateParams{
 		SessionID: sessionID,
 		Update: acpToolCallUpdate{
 			SessionUpdate: "tool_call_update",
 			ToolCallID:    result.ToolUseID,
 			Status:        status,
-			RawOutput:     sb.String(),
+			RawOutput:     rawOutput,
 		},
 	})
 }
