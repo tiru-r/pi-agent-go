@@ -307,8 +307,17 @@ func (a *Agent) Run(
 		// Add the assistant message to history.
 		msgs = append(msgs, resp.Message)
 
-		// If there are no tool calls we're done.
-		if resp.StopReason != model.StopReasonToolUse {
+		// Content is the authoritative signal for tool use — stop_reason is
+		// unreliable across models (some send "stop" with tool blocks, others
+		// send "tool_calls" with none).
+		hasToolUse := false
+		for _, b := range resp.Message.Content {
+			if b.Type == model.ContentTypeToolUse {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse {
 			onEvent(AgentEvent{
 				Kind:       EventKindDone,
 				Usage:      cx.Usage(),

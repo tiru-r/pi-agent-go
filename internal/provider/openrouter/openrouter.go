@@ -336,7 +336,9 @@ func (p *Provider) parseStream(ctx context.Context, r io.Reader, ch chan<- provi
 					ts.id = tc.ID
 				}
 				if tc.Function.Name != "" {
-					ts.name = tc.Function.Name
+					// Some OpenAI-compatible models use a legacy "functions." prefix;
+					// strip it so tool names match the registry (e.g. "functions.write" → "write").
+					ts.name = strings.TrimPrefix(tc.Function.Name, "functions.")
 				}
 				// Emit start once we have both id and name.
 				if !ts.sent && ts.id != "" && ts.name != "" {
@@ -653,7 +655,7 @@ func mapStopReason(r string) model.StopReason {
 	switch r {
 	case "stop":
 		return model.StopReasonEndTurn
-	case "tool_calls":
+	case "tool_calls", "function_call":
 		return model.StopReasonToolUse
 	case "length":
 		return model.StopReasonMaxTokens
