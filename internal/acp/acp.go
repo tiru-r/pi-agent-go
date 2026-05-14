@@ -19,6 +19,7 @@
 //	initialize result          {protocolVersion, agentInfo:{name,version}}
 //	session/new result         {sessionId, configOptions:[model-select, thinking-select]}
 //	session/update notification {sessionId, update:{sessionUpdate:"agent_message_chunk"|"agent_thought_chunk", content:{type:"text",text:"…"}}}
+//	session/update notification {sessionId, update:{sessionUpdate:"agent_location", path:"…"}}                  (Follow pi)
 //	session/prompt result      {stopReason, usage?}
 //	session/set_config_option  {configOptions:[…]}
 //	error response             {code, message}
@@ -149,7 +150,7 @@ type acpUpdateParams struct {
 }
 
 type acpUpdate struct {
-	SessionUpdate string     `json:"sessionUpdate"` // "agent_message_chunk" | "agent_thought_chunk"
+	SessionUpdate string     `json:"sessionUpdate"` // "agent_message_chunk" | "agent_thought_chunk" (see acpLocationUpdate for "agent_location")
 	Content       acpContent `json:"content"`
 }
 
@@ -242,6 +243,18 @@ type acpToolResultUpdate struct {
 	ToolUseID     string       `json:"toolUseId"`
 	Content       []acpContent `json:"content"`
 	IsError       bool         `json:"isError,omitempty"`
+}
+
+// acpLocationNotifParams is the session/update notification for agent_location,
+// which powers Zed's "Follow pi" feature.
+type acpLocationNotifParams struct {
+	SessionID string            `json:"sessionId"`
+	Update    acpLocationUpdate `json:"update"`
+}
+
+type acpLocationUpdate struct {
+	SessionUpdate string `json:"sessionUpdate"` // "agent_location"
+	Path          string `json:"path"`
 }
 
 // flexString unmarshals JSON that may arrive as a plain string or as an array
@@ -857,6 +870,9 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 			slog.Debug("tool queued", "name", ev.ToolName)
 		case agent.EventKindToolExec:
 			s.sendToolUseUpdate(p.SessionID, ev.ToolID, ev.ToolName, ev.ToolInput)
+			if path := extractFilePath(ev.ToolName, ev.ToolInput); path != "" {
+				s.sendLocationUpdate(p.SessionID, path)
+			}
 		case agent.EventKindToolDone:
 			s.sendToolResultUpdate(p.SessionID, ev.ToolResult)
 		case agent.EventKindDone:
@@ -1055,6 +1071,18 @@ func (s *Server) sendToolUseUpdate(sessionID, toolID, name string, input json.Ra
 			Name:          name,
 			Input:         input,
 		},
+	})
+}
+
+// sendLocationUpdate sends an agent_location session/update notification so
+// Zed's "Follow pi" feature can scroll to the file the agent is accessing.
+func (s *Server) sendLocationUpdate(sessionID, path string) {
+	if path == "" {
+		return
+	}
+	s.sendNotification("session/update", acpLocationNotifParams{
+		SessionID: sessionID,
+		Update:    acpLocationUpdate{SessionUpdate: "agent_location", Path: path},
 	})
 }
 
@@ -1308,6 +1336,24 @@ func (s *Server) handleInputComplete(req *request) {
 		})
 	}
 	s.sendResult(rawID(req.ID), result)
+}
+
+// extractFilePath parses the tool input JSON and returns the "path" field for
+// file-accessing tools (read, write, edit, hashline_edit). Returns "" for all
+// other tools so the caller can skip sending a location update.
+func extractFilePath(toolName string, input json.RawMessage) string {
+	switch toolName {
+	case "read", "write", "edit", "hashline_edit":
+	default:
+		return ""
+	}
+	var p struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(input, &p); err != nil {
+		return ""
+	}
+	return p.Path
 }
 
 func toACPModels(infos []model.ModelInfo) []acpModel {
