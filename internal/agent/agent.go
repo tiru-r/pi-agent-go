@@ -473,6 +473,22 @@ func executeTools(
 		go func(i int, block model.ContentBlock) {
 			defer wg.Done()
 
+			params := block.Input
+			if params == nil {
+				params = json.RawMessage("{}")
+			}
+
+			// Always emit in_progress before any outcome so Zed always sees
+			// an exec update before the matching done update. Without this,
+			// unknown-tool errors (and cancelled calls) produce a done with no
+			// prior in_progress, causing Zed to show "Tool call not found".
+			onEvent(AgentEvent{
+				Kind:      EventKindToolExec,
+				ToolID:    block.ID,
+				ToolName:  block.Name,
+				ToolInput: params,
+			})
+
 			// bash spawns real OS processes; cap concurrency to avoid saturation.
 			// All other tools are I/O-bound and run without a semaphore.
 			if block.Name == "bash" {
@@ -524,21 +540,9 @@ func executeTools(
 				return
 			}
 
-			params := block.Input
-			if params == nil {
-				params = json.RawMessage("{}")
-			}
-
 			if hooks != nil {
 				hooks.RunBeforeTool(cx.Context(), block.Name, params)
 			}
-
-			onEvent(AgentEvent{
-				Kind:      EventKindToolExec,
-				ToolID:    block.ID,
-				ToolName:  block.Name,
-				ToolInput: params,
-			})
 
 			t0 := time.Now()
 			toolResult, err := t.Execute(cx.Context(), params)
