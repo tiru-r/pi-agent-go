@@ -44,7 +44,9 @@ type Options struct {
 	System string
 	// ThinkingLevel overrides the thinking level for this run only.
 	ThinkingLevel model.ThinkingLevel
-	// MaxTurns caps the number of tool-use / response cycles (0 = unlimited).
+	// MaxTurns caps the number of tool-use / response cycles.
+	// 0 (the zero value) means no hard cap; context budget and cancellation
+	// act as the natural bounds. Set a positive value to enforce a hard limit.
 	MaxTurns int
 	// Tools lists which tool names are enabled. nil = all built-in tools.
 	Tools []string
@@ -165,10 +167,7 @@ func (a *Agent) Run(
 	if opts.ThinkingLevel != "" {
 		thinkLevel = opts.ThinkingLevel
 	}
-	maxTurns := opts.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = 20
-	}
+	maxTurns := opts.MaxTurns // 0 = unlimited
 
 	// Build initial message list.
 	msgs := make([]model.Message, 0, len(history)+1)
@@ -201,7 +200,7 @@ func (a *Agent) Run(
 	var lastMeasuredTokens int
 	toolDefsTokens := EstimateToolDefsTokens(toolDefs)
 
-	for turn := 0; turn < maxTurns; turn++ {
+	for turn := 0; maxTurns <= 0 || turn < maxTurns; turn++ {
 		select {
 		case <-cx.Done():
 			return msgs, cx.Err()
@@ -345,10 +344,9 @@ func (a *Agent) Run(
 		}
 	}
 
-	// Emit final usage before the error so callers can account for consumed tokens.
-	onEvent(AgentEvent{Kind: EventKindDone, Usage: cx.Usage()})
+	// Only reachable when a positive MaxTurns cap was set and exhausted.
 	err := fmt.Errorf("agent: max turns (%d) reached without completion", maxTurns)
-	onEvent(AgentEvent{Kind: EventKindError, Err: err})
+	onEvent(AgentEvent{Kind: EventKindError, Err: err, Usage: cx.Usage()})
 	return msgs, err
 }
 
