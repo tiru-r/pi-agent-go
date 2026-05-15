@@ -309,11 +309,6 @@ Context compaction uses TF-IDF term overlap with the system prompt as an MI prox
 
 Compaction can run **synchronously** (blocking the current turn) or **asynchronously** via `BackgroundCompactor` — the result is applied at the start of the next turn, so no foreground latency is incurred.
 
-#### Trace distillation
-
-`session.Distill` reads all sessions from SQLite, scores each by a quality heuristic — penalising tool errors, rewarding natural stops and session conciseness — and exports high-quality traces as JSONL for offline fine-tuning.
-
-The OpenRouter provider accepts a `DistillSink` for online knowledge distillation data collection: every completed non-tool response is passed as a (prompt, model, response, timestamp) record to the sink, which appends it as JSONL. Configure the output path with `"distill_file"` in settings.json.
 
 ### Summary
 
@@ -335,11 +330,10 @@ The OpenRouter provider accepts a `DistillSink` for online knowledge distillatio
 | OCO controller + rollback | `runtime/controller.go` | Planning |
 | Semantic cache | `runtime/semantic_cache.go` | Agent protocol |
 | MI-based context compaction | `agent/compaction.go` | Agent protocol |
-| Trace + knowledge distillation | `session/distill.go` | Agent protocol |
 
 All subsystems are wired through `runtime.Monitor`, attached to the ACP server, and fed from `session_agent.go`. The full report is available via the `runtime/report` internal ACP method.
 
-*Note: The 17 subsystems are implemented across 15 runtime package files (with attribution.go containing 2 subsystems) plus 3 additional subsystems in other packages (agent/cx.go, agent/compaction.go, session/distill.go).*
+*Note: The 16 subsystems are implemented across 15 runtime package files (with attribution.go containing 2 subsystems) plus 2 additional subsystems in other packages (agent/cx.go, agent/compaction.go).*
 
 ---
 
@@ -634,12 +628,11 @@ Settings file: `~/.pi/agent/settings.json` (or `$PI_CONFIG`).
   "session_dir": "~/.pi/agent/sessions",
   "extensions_dir": "~/.pi/extensions",
   "sqlite": true,
-  "semantic_cache": false,
-  "distill_file": ""
+  "semantic_cache": false
 }
 ```
 
-`openrouter_site_url` and `openrouter_app_name` are optional and appear on your OpenRouter dashboard. `semantic_cache` enables Jaccard-similarity response caching. `distill_file` sets a JSONL path for knowledge-distillation output.
+`openrouter_site_url` and `openrouter_app_name` are optional and appear on your OpenRouter dashboard. `semantic_cache` enables Jaccard-similarity response caching.
 
 ### Environment variables
 
@@ -663,14 +656,6 @@ When conversation history grows large, pi automatically compacts older messages.
 
 In the ACP server, compaction runs on a background goroutine so it never adds latency to the foreground response turn.
 
-### Trace distillation
-
-```bash
-# Export high-quality sessions as JSONL for fine-tuning (score ≥ 0.7)
-session.Distill(store, "distill-out.jsonl", 0.7)
-```
-
-Quality score: 1.0 for clean sessions ending with a natural stop; penalised for tool errors and verbose turn counts. The OpenRouter provider can optionally write every completed response to a `JSONLDistillSink` for knowledge distillation data collection.
 
 ---
 
@@ -688,7 +673,7 @@ internal/
 │   ├── provider.go          Provider interface + Request / Event types
 │   ├── factory/factory.go   Builds the OpenRouter provider from config
 │   └── openrouter/
-│       ├── openrouter.go    OpenRouter streaming + semantic cache + distill sink
+│       ├── openrouter.go    OpenRouter streaming + semantic cache
 │       └── models.go        Live model list from /api/v1/models
 ├── agent/
 │   ├── agent.go             Core agentic loop + agent modes
@@ -725,7 +710,6 @@ internal/
 │   ├── sqlite.go            SQLite session index
 │   ├── index.go             Session listing helpers
 │   ├── metrics.go           Session-level usage metrics
-│   └── distill.go           Trace distillation + JSONLDistillSink
 ├── tools/tools.go           8 built-in tools
 ├── extensions/
 │   ├── manager.go           Extension discovery and lifecycle

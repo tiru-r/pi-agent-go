@@ -22,11 +22,6 @@ import (
 
 const baseURL = "https://openrouter.ai/api/v1/chat/completions"
 
-// DistillSink receives completed (prompt, response, model) triples for
-// knowledge distillation data collection.
-type DistillSink interface {
-	Record(prompt string, response string, model string)
-}
 
 // Provider implements provider.Provider for OpenRouter.
 type Provider struct {
@@ -37,10 +32,6 @@ type Provider struct {
 	// SemanticCache is optional; when set, completed responses are cached and
 	// future requests with ≥threshold similarity are served from cache.
 	SemanticCache *runtime.SemanticCache
-
-	// DistillSink is optional; when set, completed responses are forwarded for
-	// knowledge distillation data collection.
-	DistillSink DistillSink
 }
 
 // New creates an OpenRouter provider.
@@ -218,7 +209,7 @@ func (p *Provider) Stream(ctx context.Context, req *provider.Request) (<-chan pr
 		defer close(ch)
 		defer rc.Close()
 
-		if p.SemanticCache != nil || p.DistillSink != nil {
+		if p.SemanticCache != nil {
 			// Intercept the stream to capture the full response text.
 			interceptCh := make(chan provider.Event, 64)
 			go p.parseStream(ctx, rc, interceptCh)
@@ -231,14 +222,9 @@ func (p *Provider) Stream(ctx context.Context, req *provider.Request) (<-chan pr
 				ch <- ev
 			}
 			resp := textBuf.String()
-			if resp != "" {
+			if resp != "" && len(req.Tools) == 0 {
 				key := promptKey(req)
-				if p.SemanticCache != nil && len(req.Tools) == 0 {
-					p.SemanticCache.Store(key, resp)
-				}
-				if p.DistillSink != nil {
-					p.DistillSink.Record(key, resp, req.Model)
-				}
+				p.SemanticCache.Store(key, resp)
 			}
 		} else {
 			p.parseStream(ctx, rc, ch)
