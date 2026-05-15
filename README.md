@@ -339,6 +339,8 @@ The OpenRouter provider accepts a `DistillSink` for online knowledge distillatio
 
 All subsystems are wired through `runtime.Monitor`, attached to the ACP server, and fed from `session_agent.go`. The full report is available via the `runtime/report` internal ACP method.
 
+*Note: The 17 subsystems are implemented across 15 runtime package files (with attribution.go containing 2 subsystems) plus 3 additional subsystems in other packages (agent/cx.go, agent/compaction.go, session/distill.go).*
+
 ---
 
 ## CLI reference
@@ -788,8 +790,8 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 
 | | |
 |---|---|
-| Go source files | 53 |
-| Lines of code | ~14,400 |
+| Go source files | 79 |
+| Lines of code | ~21,000 |
 | Providers | 1 (OpenRouter) |
 | Models | 500+ (live from API) |
 | Built-in tools | 8 |

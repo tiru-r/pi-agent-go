@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # pi uninstaller — removes the pi binary and optional config/session data.
+# For the Zed-native AI coding agent powered by OpenRouter.
 #
 # One-liner uninstall:
 #   curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.sh | bash
@@ -110,7 +111,10 @@ load_state() {
 is_pi_binary() {
   local path="$1"
   [ -x "$path" ] || return 1
-  "$path" version 2>/dev/null | grep -q "^pi version" || return 1
+  # Check if this is actually the pi binary by running version command
+  local version_output
+  version_output=$("$path" version 2>/dev/null || echo "")
+  echo "$version_output" | grep -q "^pi version" || return 1
 }
 
 find_binary_candidates() {
@@ -250,7 +254,7 @@ show_header() {
   [ "$QUIET" -eq 1 ] && return
   echo ""
   echo -e "\033[1;31mpi uninstaller\033[0m"
-  echo -e "\033[0;90mRemoves pi-agent artifacts\033[0m"
+  echo -e "\033[0;90mRemoves pi-agent artifacts (Zed-native AI coding agent)\033[0m"
   echo ""
 }
 
@@ -285,7 +289,8 @@ main() {
         for d in "${leftovers[@]}"; do
           echo "    ${d}"
         done
-        echo "  Run with --purge to delete them."
+        echo "  Run with --purge to delete them:"
+        echo "    curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/uninstall.sh | bash -s -- --purge"
       fi
     fi
   fi

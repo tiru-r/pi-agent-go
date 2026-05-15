@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # pi installer — builds from source and installs the pi binary.
+# A Zed-native AI coding agent powered by OpenRouter.
 #
 # One-liner install:
 #   curl -fsSL https://raw.githubusercontent.com/tiru-r/pi-agent-go/main/install.sh | bash
@@ -293,8 +294,12 @@ main() {
     echo "      }"
     echo "    }"
     echo ""
-    echo "  One-shot prompt:"
+    echo "  One-shot agent run:"
     echo "    pi run \"Explain this codebase\""
+    echo "    pi run --model deepseek/deepseek-r1 \"Solve this bug\""
+    echo ""
+    echo "  File content inline with @file tokens:"
+    echo "    pi run \"Review @src/main.go and @src/utils.go\""
     echo ""
     echo "  Extensions (optional):"
     echo "    Drop .js or .json tool definitions into ~/.pi/extensions/"
