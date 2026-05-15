@@ -781,6 +781,12 @@ GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAG" -o pi-windows-amd64.exe ./
 | Built-in tools | 8 |
 | Agent modes | 6 (act / plan / plan_act / interactive / pipe / handoff) |
 | Thinking levels | 6 (off / minimal / low / medium / high / xhigh) |
-| Runtime subsystems | 17 |
+| Runtime subsystems | 16 |
 | Direct dependencies | 5 |
 | Go version | 1.24+ |
+
+---
+
+## Acknowledgments
+
+This project was inspired by and motivated by [@Dicklesworthstone](https://github.com/Dicklesworthstone)'s excellent [pi_agent_rust](https://github.com/Dicklesworthstone/pi_agent_rust) implementation. The Rust version demonstrated the potential of building sophisticated AI agents with runtime intelligence systems, which served as the foundation for this Go implementation.
