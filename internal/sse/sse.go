@@ -15,11 +15,40 @@ type Event struct {
 
 // Parser reads SSE events from a stream.
 type Parser struct {
-	r *bufio.Reader
+	s *bufio.Scanner
 }
 
 func NewParser(r io.Reader) *Parser {
-	return &Parser{r: bufio.NewReaderSize(r, 64*1024)}
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 64*1024), 1024*1024)
+	s.Split(scanSSELines)
+	return &Parser{s: s}
+}
+
+// scanSSELines is a bufio.SplitFunc that honours all three line endings
+// defined by the SSE spec: CRLF, LF, and bare CR.
+func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for i := 0; i < len(data); i++ {
+		switch data[i] {
+		case '\r':
+			if i+1 < len(data) {
+				if data[i+1] == '\n' {
+					return i + 2, data[:i], nil // CRLF
+				}
+				return i + 1, data[:i], nil // bare CR
+			}
+			if atEOF {
+				return i + 1, data[:i], nil // bare CR at end of stream
+			}
+			return 0, nil, nil // need one more byte to decide
+		case '\n':
+			return i + 1, data[:i], nil // LF
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil // unterminated final line
+	}
+	return 0, nil, nil
 }
 
 // Next reads and returns the next complete SSE event.
@@ -29,30 +58,29 @@ func (p *Parser) Next() (*Event, error) {
 	var dataLines []string
 
 	for {
-		line, err := p.r.ReadString('\n')
-		line = strings.TrimRight(line, "\r\n")
-
-		if err != nil && err != io.EOF {
-			return nil, err
+		scanned := p.s.Scan()
+		if !scanned {
+			if err := p.s.Err(); err != nil {
+				return nil, err
+			}
+			if len(dataLines) > 0 {
+				ev.Data = strings.Join(dataLines, "\n")
+				return ev, nil
+			}
+			return nil, io.EOF
 		}
 
+		line := p.s.Text()
+
 		if line == "" {
-			// Empty line signals end of event.
 			if len(dataLines) > 0 || ev.Type != "" {
 				ev.Data = strings.Join(dataLines, "\n")
 				return ev, nil
 			}
-			if err == io.EOF {
-				return nil, io.EOF
-			}
 			continue
 		}
 
-		// Comment line — skip.
 		if strings.HasPrefix(line, ":") {
-			if err == io.EOF {
-				return nil, io.EOF
-			}
 			continue
 		}
 
@@ -66,14 +94,6 @@ func (p *Parser) Next() (*Event, error) {
 			dataLines = append(dataLines, value)
 		case "id":
 			ev.ID = value
-		}
-
-		if err == io.EOF {
-			if len(dataLines) > 0 {
-				ev.Data = strings.Join(dataLines, "\n")
-				return ev, nil
-			}
-			return nil, io.EOF
 		}
 	}
 }
