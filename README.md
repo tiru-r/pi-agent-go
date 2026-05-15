@@ -15,7 +15,7 @@ A Zed-native AI coding agent powered by [OpenRouter](https://openrouter.ai). Pi 
 - **Input autocomplete** — slash commands, `@file` tokens, and filesystem paths resolved as you type in Zed
 - **Retry with backoff** — automatic retry on 429 / 5xx / network timeout (3 attempts, 500 ms base, 30 s cap)
 - **Background compaction** — context compaction runs asynchronously so it never blocks a response turn
-- **Runtime intelligence** — 17 math-driven subsystems covering observability, safety, planning, and agent protocol (see [Runtime Intelligence](#runtime-intelligence))
+- **Runtime intelligence** — 16 math-driven subsystems covering observability, safety, planning, and agent protocol (see [Runtime Intelligence](#runtime-intelligence))
 - **JavaScript + native extensions** — load custom tools from `~/.pi/extensions/` (QuickJS-WASI via wazero or subprocess JSON protocol)
 - **Capability-based extension sandboxing** — JS extensions declare required permissions; sensitive env vars are blocked
 - **One API key** — `OPENROUTER_API_KEY` is all you need
@@ -161,7 +161,7 @@ Internal:  runtime/report  →  RuntimeReport JSON (regime, anomaly, OPE, attrib
 
 ## Runtime Intelligence
 
-Pi's `internal/runtime` package implements 17 math-driven subsystems that run continuously alongside every agent session. They are grouped into four concern areas: observability, safety, planning, and agent protocol.
+Pi's `internal/runtime` package implements 16 math-driven subsystems that run continuously alongside every agent session. They are grouped into four concern areas: observability, safety, planning, and agent protocol.
 
 ### Observability
 
