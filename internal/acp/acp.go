@@ -407,7 +407,7 @@ func formatFileContext(blk acpIncomingBlock) string {
 		return ""
 	}
 	if blk.Path != "" {
-		return "**File: " + blk.Path + "**\n```\n" + blk.Text + "\n```"
+		return "**File: " + blk.Path + "**\n```" + langFromPath(blk.Path) + "\n" + blk.Text + "\n```"
 	}
 	return blk.Text
 }
@@ -428,7 +428,7 @@ func formatSelectionContext(blk acpIncomingBlock) string {
 		}
 	}
 	header += ":**"
-	return header + "\n```\n" + blk.Text + "\n```"
+	return header + "\n```" + langFromPath(blk.Path) + "\n" + blk.Text + "\n```"
 }
 
 func formatSymbolContext(blk acpIncomingBlock) string {
@@ -443,7 +443,100 @@ func formatSymbolContext(blk acpIncomingBlock) string {
 		header += " in " + blk.Path
 	}
 	header += ":**"
-	return header + "\n```\n" + blk.Text + "\n```"
+	return header + "\n```" + langFromPath(blk.Path) + "\n" + blk.Text + "\n```"
+}
+
+func langFromPath(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".go":
+		return "go"
+	case ".py":
+		return "python"
+	case ".js", ".mjs", ".cjs":
+		return "javascript"
+	case ".ts", ".mts", ".cts":
+		return "typescript"
+	case ".tsx":
+		return "tsx"
+	case ".jsx":
+		return "jsx"
+	case ".rs":
+		return "rust"
+	case ".c":
+		return "c"
+	case ".cpp", ".cc", ".cxx", ".c++":
+		return "cpp"
+	case ".h", ".hpp", ".hxx":
+		return "cpp"
+	case ".java":
+		return "java"
+	case ".rb":
+		return "ruby"
+	case ".sh", ".bash":
+		return "bash"
+	case ".zsh":
+		return "zsh"
+	case ".fish":
+		return "fish"
+	case ".md", ".mdx":
+		return "markdown"
+	case ".json":
+		return "json"
+	case ".yaml", ".yml":
+		return "yaml"
+	case ".toml":
+		return "toml"
+	case ".html", ".htm":
+		return "html"
+	case ".css":
+		return "css"
+	case ".scss":
+		return "scss"
+	case ".sql":
+		return "sql"
+	case ".proto":
+		return "protobuf"
+	case ".swift":
+		return "swift"
+	case ".kt", ".kts":
+		return "kotlin"
+	case ".lua":
+		return "lua"
+	case ".ex", ".exs":
+		return "elixir"
+	case ".zig":
+		return "zig"
+	case ".nix":
+		return "nix"
+	case ".tf", ".hcl":
+		return "hcl"
+	case ".xml":
+		return "xml"
+	case ".dart":
+		return "dart"
+	case ".php":
+		return "php"
+	case ".cs":
+		return "csharp"
+	case ".scala":
+		return "scala"
+	case ".hs":
+		return "haskell"
+	case ".ml", ".mli":
+		return "ocaml"
+	case ".elm":
+		return "elm"
+	case ".svelte":
+		return "svelte"
+	case ".vue":
+		return "vue"
+	case ".r":
+		return "r"
+	case ".diff", ".patch":
+		return "diff"
+	default:
+		return ""
+	}
 }
 
 // expandAtFilesInBlocks applies @file expansion to every text block in-place.

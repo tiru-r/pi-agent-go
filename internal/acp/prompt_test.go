@@ -124,7 +124,7 @@ func TestPromptContent_FileBlock(t *testing.T) {
 		t.Fatalf("unexpected blocks: %+v", p.Blocks)
 	}
 	text := p.Blocks[0].Text
-	if text != "**File: src/main.go**\n```\npackage main\n```" {
+	if text != "**File: src/main.go**\n```go\npackage main\n```" {
 		t.Errorf("unexpected text: %q", text)
 	}
 }
@@ -139,7 +139,7 @@ func TestPromptContent_SelectionBlock(t *testing.T) {
 		t.Fatalf("unexpected blocks: %+v", p.Blocks)
 	}
 	text := p.Blocks[0].Text
-	if text != "**Selection from main.go (line 5):**\n```\nx := 1\n```" {
+	if text != "**Selection from main.go (line 5):**\n```go\nx := 1\n```" {
 		t.Errorf("unexpected text: %q", text)
 	}
 }
@@ -151,7 +151,7 @@ func TestPromptContent_SelectionMultiLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := p.Blocks[0].Text
-	if text != "**Selection from a.go (line 3–6):**\n```\ncode\n```" {
+	if text != "**Selection from a.go (line 3–6):**\n```go\ncode\n```" {
 		t.Errorf("unexpected text: %q", text)
 	}
 }
@@ -163,7 +163,7 @@ func TestPromptContent_SymbolBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := p.Blocks[0].Text
-	if text != "**Symbol: Agent in agent.go:**\n```\ntype Agent struct{}\n```" {
+	if text != "**Symbol: Agent in agent.go:**\n```go\ntype Agent struct{}\n```" {
 		t.Errorf("unexpected text: %q", text)
 	}
 }
