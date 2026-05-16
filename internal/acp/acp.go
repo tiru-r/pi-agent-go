@@ -607,6 +607,11 @@ type Server struct {
 
 	// completer handles input/complete requests.
 	completer *autocomplete.Provider
+
+	// pendingToolLocs maps toolID → file locations extracted at exec time so
+	// sendToolDoneUpdate can include them in the tool_call_update notification,
+	// which is what triggers Zed's "Follow Pi" navigation.
+	pendingToolLocs sync.Map
 }
 
 // New builds a Server. ctx is the server's lifetime context: it is passed
@@ -1363,7 +1368,9 @@ func (s *Server) sendToolExecUpdate(sessionID, toolID, name string, input json.R
 		RawInput:      input, // JSON value, not string(input)
 	}
 	if path, line := extractFileLocation(name, input); path != "" {
-		upd.Locations = []acpToolCallLoc{{Path: path, Line: line}}
+		locs := []acpToolCallLoc{{Path: path, Line: line}}
+		upd.Locations = locs
+		s.pendingToolLocs.Store(toolID, locs)
 	}
 	s.sendNotification("session/update", acpToolCallUpdateParams{
 		SessionID: sessionID,
@@ -1390,14 +1397,18 @@ func (s *Server) sendToolDoneUpdate(sessionID string, result model.ContentBlock)
 			rawOutput = b
 		}
 	}
+	upd := acpToolCallUpdate{
+		SessionUpdate: "tool_call_update",
+		ToolCallID:    result.ToolUseID,
+		Status:        status,
+		RawOutput:     rawOutput,
+	}
+	if v, ok := s.pendingToolLocs.LoadAndDelete(result.ToolUseID); ok {
+		upd.Locations = v.([]acpToolCallLoc)
+	}
 	s.sendNotification("session/update", acpToolCallUpdateParams{
 		SessionID: sessionID,
-		Update: acpToolCallUpdate{
-			SessionUpdate: "tool_call_update",
-			ToolCallID:    result.ToolUseID,
-			Status:        status,
-			RawOutput:     rawOutput,
-		},
+		Update:    upd,
 	})
 }
 
