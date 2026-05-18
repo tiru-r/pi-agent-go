@@ -590,11 +590,15 @@ type Server struct {
 	sessionsMu sync.RWMutex
 	sessions   map[string]*sessionState
 
-	// models is populated in the background on startup by fetching OpenRouter's
-	// /api/v1/models endpoint. modelsReady is closed when the fetch completes.
+	// models / modelIndex / acpIndex are populated in the background on startup.
+	// models is the trimmed ACP-wire format; modelIndex retains full metadata
+	// (including pricing) for O(1) profile lookups; acpIndex is an O(1) view
+	// of models keyed by ID for compactor lookups.
 	modelsReady chan struct{}
 	modelsMu    sync.RWMutex
 	models      []acpModel
+	modelIndex  map[string]model.ModelInfo // ID → full info, for O(1) profile lookups
+	acpIndex    map[string]acpModel        // ID → ACP model, for O(1) compactor lookups
 
 	// monitor provides runtime intelligence across all sessions.
 	monitor *runtime.Monitor
@@ -674,8 +678,18 @@ func (s *Server) prefetchModels(ctx context.Context) {
 		slog.Warn("model prefetch failed", "err", err)
 		return
 	}
+	acpModels := toACPModels(infos)
+	idx := make(map[string]model.ModelInfo, len(infos))
+	acpIdx := make(map[string]acpModel, len(infos))
+	for i, m := range infos {
+		idx[m.ID] = m
+		acpIdx[m.ID] = acpModels[i]
+	}
+
 	s.modelsMu.Lock()
-	s.models = toACPModels(infos)
+	s.models = acpModels
+	s.modelIndex = idx
+	s.acpIndex = acpIdx
 	s.modelsMu.Unlock()
 	slog.Debug("models loaded", "count", len(infos))
 }
@@ -1119,7 +1133,22 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 
 	ag := agent.New(s.provider, modelID, system, maxTokens)
 	ag.Hooks = s.extMgr
-	ag.Compactor = s.makeCompactor(modelID)
+	ag.Profile = s.classifyModel(modelID)
+	ag.Compactor = s.makeCompactor(modelID, ag.Profile)
+	// Wire async compaction so mid-session summarisation never blocks the
+	// current turn. The background goroutine's lifetime is bounded by cctx
+	// (the session-prompt context) and the 3-minute timeout inside Trigger.
+	// Note: the result does NOT carry across separate session/prompt calls
+	// (each creates a fresh Agent); within a single multi-turn run it works.
+	ag.BGCompactor = agent.NewBackgroundCompactor(cctx, ag.Compactor)
+	ag.ConfigTemp = s.cfg.Temperature
+	slog.Debug("profile resolved",
+		"model", modelID,
+		"tier", ag.Profile.Tier,
+		"max_output", ag.Profile.MaxOutputTokens,
+		"max_turns", ag.Profile.RecommendedMaxTurns,
+		"parallel_tools", ag.Profile.ParallelToolBudget,
+	)
 
 	// Construct the capability context at the RPC boundary: lifecycle (cctx),
 	// no token budget (0/0), and the session's persistent monitor so runtime
@@ -1496,26 +1525,41 @@ func (s *Server) getSession(id string) *sessionState {
 	return s.sessions[id]
 }
 
-// makeCompactor returns a Compactor configured for the given model.
-// It looks up the model's context window from the cached model list so the
-// threshold is ContextWindow - ReserveTokens rather than a flat guess.
-func (s *Server) makeCompactor(modelID string) *agent.Compactor {
+// classifyModel looks up the full ModelInfo for modelID from the index and
+// returns its model.Profile. Falls back to a zero-value Profile when the model
+// is not yet in the cache (e.g. before prefetch completes).
+func (s *Server) classifyModel(modelID string) model.Profile {
 	s.modelsMu.RLock()
-	models := s.models
+	m, ok := s.modelIndex[modelID]
 	s.modelsMu.RUnlock()
 
-	var contextWindow int
-	for _, m := range models {
-		if m.ID == modelID {
-			contextWindow = m.ContextWindow
-			break
+	if !ok {
+		return model.Profile{} // zero = existing one-size-fits-all behavior
+	}
+	return model.ClassifyModel(m, s.cfg.ModelProfileOverrides)
+}
+
+// makeCompactor returns a Compactor configured for the given model and profile.
+// The profile's CompactionReserveRatio is used to compute ReserveTokens when
+// the model's ContextWindow is known.
+func (s *Server) makeCompactor(modelID string, profile model.Profile) *agent.Compactor {
+	s.modelsMu.RLock()
+	m, ok := s.acpIndex[modelID]
+	s.modelsMu.RUnlock()
+
+	var ctxWindow, reserveTokens int
+	if ok {
+		ctxWindow = m.ContextWindow
+		if ctxWindow > 0 && profile.CompactionReserveRatio > 0 {
+			reserveTokens = int(float64(ctxWindow) * profile.CompactionReserveRatio)
 		}
 	}
 
 	return &agent.Compactor{
 		Provider:      s.provider,
 		Model:         modelID,
-		ContextWindow: contextWindow,
+		ContextWindow: ctxWindow,
+		ReserveTokens: reserveTokens,
 	}
 }
 

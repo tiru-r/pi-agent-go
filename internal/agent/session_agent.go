@@ -33,6 +33,14 @@ type SessionAgent struct {
 	MaxIter   int // default 20, prevents infinite loops
 	Compactor *Compactor
 
+	// Profile holds tier-derived defaults for the active model. A zero-value
+	// Profile reproduces the original one-size-fits-all harness behavior.
+	Profile model.Profile
+
+	// ConfigTemp is the user's explicit temperature setting. Overrides
+	// Profile.TemperatureDefault on non-thinking requests when non-nil.
+	ConfigTemp *float64
+
 	// BGCompactor is optional; when set, compaction runs asynchronously so it
 	// does not block the foreground turn. Requires Compactor to also be set.
 	BGCompactor *BackgroundCompactor
@@ -66,7 +74,7 @@ func (a *SessionAgent) Run(
 	opts SessionRunOptions,
 	onEvent func(provider.Event),
 ) error {
-	maxIter := a.MaxIter
+	maxIter := a.Profile.MaxTurnsOr(a.MaxIter)
 	if maxIter <= 0 {
 		maxIter = defaultMaxIter
 	}
@@ -88,23 +96,29 @@ func (a *SessionAgent) Run(
 	if maxTokens == 0 {
 		maxTokens = DefaultMaxTokens
 	}
+	maxTokens = a.Profile.ApplyMaxTokens(maxTokens, DefaultMaxTokens)
 	thinking := opts.Thinking
 	if thinking == "" {
 		thinking = model.ThinkingLevelOff
 	}
+	// Temperature, retry count are loop-invariant; derive once.
+	temp := a.Profile.TemperatureFor(thinking, a.ConfigTemp)
+	retryAttempts := a.Profile.RetryAttemptsOr(a.RetryAttempts)
 
-	// Build tool definitions from the agent's tool set (or all built-ins).
+	// Build tool definitions — skip entirely for models that don't support tools.
 	var toolDefs []model.ToolDefinition
-	if len(a.Tools) > 0 {
-		for _, t := range a.Tools {
-			toolDefs = append(toolDefs, model.ToolDefinition{
-				Name:        t.Name(),
-				Description: t.Description(),
-				InputSchema: t.Schema(),
-			})
+	if a.Profile.Tier != model.TierToolless {
+		if len(a.Tools) > 0 {
+			for _, t := range a.Tools {
+				toolDefs = append(toolDefs, model.ToolDefinition{
+					Name:        t.Name(),
+					Description: t.Description(),
+					InputSchema: t.Schema(),
+				})
+			}
+		} else {
+			toolDefs = tools.ToDefinitions()
 		}
-	} else {
-		toolDefs = tools.ToDefinitions()
 	}
 
 	// lastMeasuredTokens holds the InputTokens value from the previous API
@@ -170,7 +184,7 @@ func (a *SessionAgent) Run(
 			switch opts.Mode {
 			case AgentModeAct, AgentModeHandoff, "":
 				if iter == 0 {
-					toolChoice = "required"
+					toolChoice = a.Profile.ToolChoiceOrDefault()
 				} else {
 					toolChoice = "auto"
 				}
@@ -185,12 +199,13 @@ func (a *SessionAgent) Run(
 			System:        opts.System,
 			Tools:         toolDefs,
 			MaxTokens:     maxTokens,
+			Temperature:   temp,
 			ThinkingLevel: thinking,
 			ToolChoice:    toolChoice,
 		}
 
 		t0 := time.Now()
-		events, err := streamWithRetry(cx.Context(), a.Provider, req, a.RetryAttempts)
+		events, err := streamWithRetry(cx.Context(), a.Provider, req, retryAttempts)
 		if err != nil {
 			if cx.Monitor != nil {
 				cx.Monitor.Observe(runtime.Observation{
@@ -233,19 +248,16 @@ func (a *SessionAgent) Run(
 			return fmt.Errorf("session_agent: append assistant message: %w", err)
 		}
 
-		if resp.StopReason != model.StopReasonToolUse {
-			return nil // end_turn, max_tokens, or stop_sequence
+		// Content is the authoritative signal — stop_reason is unreliable across
+		// models (some send "stop" with tool blocks, others "tool_calls" without).
+		toolUses := resp.Message.ToolUses()
+		if len(toolUses) == 0 {
+			return nil
 		}
 
 		// Halt before running tools if the runtime monitor signals a safety veto.
 		if cx.Monitor != nil && cx.Monitor.ShouldVeto() {
 			return fmt.Errorf("session_agent: runtime safety veto — error rate exceeded threshold, halting tool execution")
-		}
-
-		// Execute all tool calls in parallel (up to maxToolConcurrency).
-		toolUses := resp.Message.ToolUses()
-		if len(toolUses) == 0 {
-			return nil
 		}
 
 		// Capture before goroutines start so runTool doesn't call Session.Messages()
@@ -285,26 +297,30 @@ func (a *SessionAgent) runTools(cx *AgentCx, uses []model.ContentBlock, msgCount
 		toolMap[t.Name()] = t
 	}
 
+	// Per-profile semaphore for non-bash tool parallelism.
+	var nonBashSem chan struct{}
+	if a.Profile.ParallelToolBudget > 0 {
+		nonBashSem = make(chan struct{}, a.Profile.ParallelToolBudget)
+	}
+
 	results := make([]model.ContentBlock, len(uses))
 	var wg sync.WaitGroup
 	for i, use := range uses {
 		wg.Add(1)
 		go func(i int, block model.ContentBlock) {
 			defer wg.Done()
+			var sem chan struct{}
 			if block.Name == "bash" {
-				select {
-				case bashSem <- struct{}{}:
-					defer func() { <-bashSem }()
-				case <-cx.Done():
-					results[i] = model.ContentBlock{
-						Type:      model.ContentTypeToolResult,
-						ToolUseID: block.ID,
-						IsError:   true,
-						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: cx.Err().Error()}},
-					}
-					return
-				}
+				sem = bashSem
+			} else {
+				sem = nonBashSem
 			}
+			release, err := acquireSem(cx, sem)
+			if err != nil {
+				results[i] = errorToolResult(block.ID, err.Error())
+				return
+			}
+			defer release()
 			results[i] = a.runTool(cx, block, toolMap, msgCount)
 		}(i, use)
 	}
@@ -341,6 +357,7 @@ func (a *SessionAgent) runTool(cx *AgentCx, block model.ContentBlock, toolMap ma
 	if params == nil {
 		params = []byte("{}")
 	}
+	params = maybeRepairToolJSON(a.Profile, params, cx.Monitor, block.Name)
 
 	if a.Hooks != nil {
 		a.Hooks.RunBeforeTool(cx.Context(), block.Name, params)

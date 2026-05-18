@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/tiru-r/pi-agent-go/internal/model"
 )
 
 // Config holds all pi-agent settings, loaded from ~/.pi/agent/settings.json
@@ -19,9 +21,9 @@ type Config struct {
 	Model string `json:"model,omitempty"`
 
 	// Behaviour
-	MaxTokens     int     `json:"max_tokens,omitempty"`
-	Temperature   float64 `json:"temperature,omitempty"`
-	SystemPrompt  string  `json:"system_prompt,omitempty"`
+	MaxTokens     int      `json:"max_tokens,omitempty"`
+	Temperature   *float64 `json:"temperature,omitempty"` // nil = unset; pointer so 0.0 is distinguishable from "not set"
+	SystemPrompt  string   `json:"system_prompt,omitempty"`
 	ThinkingLevel string  `json:"thinking_level,omitempty"` // "off"|"minimal"|"low"|"medium"|"high"|"xhigh"
 
 	// Session
@@ -33,6 +35,12 @@ type Config struct {
 
 	// Caching
 	SemanticCache bool `json:"semantic_cache,omitempty"` // enable Jaccard-similarity response cache
+
+	// ModelProfileOverrides pins specific model IDs to a fixed model.Profile,
+	// overriding the automatic tier classification. Useful when a model is
+	// misclassified (e.g. a high-priced model that behaves like a small one).
+	// Keys are full OpenRouter model IDs (e.g. "openai/gpt-oss-120b:free").
+	ModelProfileOverrides map[string]model.Profile `json:"model_profile_overrides,omitempty"`
 }
 
 var defaultCfg = Config{
@@ -79,6 +87,13 @@ func (c *Config) Save() error {
 	return os.WriteFile(path, data, 0o600)
 }
 
+// ConfigDir returns the directory that holds pi-agent configuration files.
+// It is derived from settingsPath so that PI_CONFIG (which sets the full
+// settings file path) is always the single source of truth.
+func ConfigDir() string {
+	return filepath.Dir(settingsPath())
+}
+
 func settingsPath() string {
 	if v := os.Getenv("PI_CONFIG"); v != "" {
 		return v
@@ -103,7 +118,7 @@ func merge(base, override *Config) {
 	if override.MaxTokens != 0 {
 		base.MaxTokens = override.MaxTokens
 	}
-	if override.Temperature != 0 {
+	if override.Temperature != nil {
 		base.Temperature = override.Temperature
 	}
 	if override.SystemPrompt != "" {
@@ -117,6 +132,14 @@ func merge(base, override *Config) {
 	}
 	if override.ExtensionsDir != "" {
 		base.ExtensionsDir = override.ExtensionsDir
+	}
+	if len(override.ModelProfileOverrides) > 0 {
+		if base.ModelProfileOverrides == nil {
+			base.ModelProfileOverrides = make(map[string]model.Profile, len(override.ModelProfileOverrides))
+		}
+		for k, v := range override.ModelProfileOverrides {
+			base.ModelProfileOverrides[k] = v
+		}
 	}
 }
 

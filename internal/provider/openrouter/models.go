@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -68,21 +69,22 @@ func toModelInfo(e orModelEntry) model.ModelInfo {
 
 	supportsVision := strings.Contains(e.Architecture.Modality, "image")
 
-	supportsTools := false
-	for _, p := range e.SupportedParameters {
-		if p == "tools" {
-			supportsTools = true
-			break
-		}
-	}
+	supportsTools := slices.Contains(e.SupportedParameters, "tools")
 
 	id := e.ID
-	supportsThinking := strings.Contains(id, "claude-3-7") ||
-		strings.Contains(id, "claude-opus-4") ||
-		strings.Contains(id, "claude-sonnet-4") ||
-		strings.Contains(id, "deepseek-r1") ||
-		strings.Contains(id, "qwq") ||
+	// Prefer the API field; fall back to known model family substrings for older
+	// or newly-added listings where supported_parameters isn't yet populated.
+	// Matched on family name (not version) so future model versions are covered.
+	supportsThinking := slices.Contains(e.SupportedParameters, "reasoning") ||
+		slices.Contains(e.SupportedParameters, "include_reasoning") ||
 		strings.HasSuffix(id, ":thinking")
+	if !supportsThinking {
+		supportsThinking = strings.Contains(id, "claude-3-7") ||
+			strings.Contains(id, "claude-opus-4") ||
+			strings.Contains(id, "claude-sonnet-4") ||
+			strings.Contains(id, "deepseek-r1") ||
+			strings.Contains(id, "qwq")
+	}
 
 	return model.ModelInfo{
 		ID:               e.ID,

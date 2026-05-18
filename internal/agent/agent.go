@@ -45,8 +45,9 @@ type Options struct {
 	// ThinkingLevel overrides the thinking level for this run only.
 	ThinkingLevel model.ThinkingLevel
 	// MaxTurns caps the number of tool-use / response cycles.
-	// 0 (the zero value) means no hard cap; context budget and cancellation
-	// act as the natural bounds. Set a positive value to enforce a hard limit.
+	// 0 defers to Profile.RecommendedMaxTurns (0 profile = unlimited).
+	// -1 forces unlimited regardless of the profile.
+	// Set a positive value to enforce a hard limit.
 	MaxTurns int
 	// Tools lists which tool names are enabled. nil = all built-in tools.
 	Tools []string
@@ -109,6 +110,15 @@ type Agent struct {
 	system string
 	maxTok int
 
+	// Profile holds tier-derived defaults for the active model. A zero-value
+	// Profile reproduces the original one-size-fits-all harness behavior.
+	Profile model.Profile
+
+	// ConfigTemp is the user's explicit temperature setting (from config file or
+	// env). When non-nil it overrides Profile.TemperatureDefault on all
+	// non-thinking requests. Nil means use the profile's tier-based default.
+	ConfigTemp *float64
+
 	// Hooks is optional; wire an extensions.Manager to broadcast tool lifecycle
 	// events to JS extensions that define before_tool / after_tool.
 	Hooks HookRunner
@@ -167,14 +177,20 @@ func (a *Agent) Run(
 	if opts.ThinkingLevel != "" {
 		thinkLevel = opts.ThinkingLevel
 	}
-	maxTurns := opts.MaxTurns // 0 = unlimited
+	maxTurns := a.Profile.MaxTurnsOr(opts.MaxTurns)
+	maxTok := a.Profile.ApplyMaxTokens(a.maxTok, DefaultMaxTokens)
+	// Temperature and retry count are loop-invariant; derive once.
+	temp := a.Profile.TemperatureFor(thinkLevel, a.ConfigTemp)
+	retryAttempts := a.Profile.RetryAttemptsOr(a.RetryAttempts)
 
 	// Build initial message list.
 	msgs := make([]model.Message, 0, len(history)+1)
 	msgs = append(msgs, history...)
 	msgs = append(msgs, model.Message{Role: model.RoleUser, Content: input})
 
-	// Apply mode overrides before resolving tools so Plan/Pipe skip the lookup.
+	// Apply mode overrides. TierToolless models don't support function calling —
+	// never send tool definitions regardless of mode (provider rejects them).
+	toolless := a.Profile.Tier == model.TierToolless
 	var toolDefs []model.ToolDefinition
 	switch opts.Mode {
 	case AgentModePlan:
@@ -183,16 +199,24 @@ func (a *Agent) Run(
 	case AgentModePipe:
 		maxTurns = 1
 	case AgentModePlanAct:
-		toolDefs = resolveTools(opts.Tools)
+		if !toolless {
+			toolDefs = resolveTools(opts.Tools)
+		}
 		systemPrompt = modePrefix("First write a concise numbered plan of your approach. Then execute each step using the available tools.", systemPrompt)
 	case AgentModeInteractive:
-		toolDefs = resolveTools(opts.Tools)
+		if !toolless {
+			toolDefs = resolveTools(opts.Tools)
+		}
 		systemPrompt = modePrefix("You are in INTERACTIVE MODE. Before invoking any tool, briefly describe what you are about to do and why, then proceed.", systemPrompt)
 	case AgentModeHandoff:
-		toolDefs = resolveTools(opts.Tools)
+		if !toolless {
+			toolDefs = resolveTools(opts.Tools)
+		}
 		systemPrompt = modeSuffix(systemPrompt, "When your task is complete, output a HANDOFF section with a concise state summary so another agent can continue from where you left off.")
 	default:
-		toolDefs = resolveTools(opts.Tools)
+		if !toolless {
+			toolDefs = resolveTools(opts.Tools)
+		}
 	}
 
 	// lastMeasuredTokens holds the InputTokens value from the previous API
@@ -235,15 +259,14 @@ func (a *Agent) Run(
 			return msgs, err
 		}
 
-		// "required" on turn 0 forces the model to act (use a tool) rather than
-		// describing what it would do. Only applies to act/handoff modes — plan_act
-		// and interactive need a free-text turn first (plan write-up, description).
+		// "required" on turn 0 forces the model to act immediately. Only applies
+		// to act/handoff modes; plan_act/interactive need a free-text first turn.
 		toolChoice := ""
 		if len(toolDefs) > 0 {
 			switch opts.Mode {
 			case AgentModeAct, AgentModeHandoff, "":
 				if turn == 0 {
-					toolChoice = "required"
+					toolChoice = a.Profile.ToolChoiceOrDefault()
 				} else {
 					toolChoice = "auto"
 				}
@@ -257,13 +280,14 @@ func (a *Agent) Run(
 			Messages:      msgs,
 			System:        systemPrompt,
 			Tools:         toolDefs,
-			MaxTokens:     a.maxTok,
+			MaxTokens:     maxTok,
+			Temperature:   temp,
 			ThinkingLevel: thinkLevel,
 			ToolChoice:    toolChoice,
 		}
 
 		t0 := time.Now()
-		eventCh, err := streamWithRetry(cx.Context(), a.prov, req, a.RetryAttempts)
+		eventCh, err := streamWithRetry(cx.Context(), a.prov, req, retryAttempts)
 		if err != nil {
 			if cx.Monitor != nil {
 				cx.Monitor.Observe(runtime.Observation{
@@ -335,7 +359,7 @@ func (a *Agent) Run(
 		// Execute tool calls and collect results.
 		// safeEmit is passed so goroutines inside executeTools can emit events
 		// without the caller needing to handle concurrent access.
-		toolResults := executeTools(cx, resp.Message.Content, safeEmit, a.Hooks, len(msgs))
+		toolResults := executeTools(cx, resp.Message.Content, safeEmit, a.Hooks, len(msgs), a.Profile)
 		if len(toolResults) > 0 {
 			msgs = append(msgs, model.Message{
 				Role:    model.RoleUser,
@@ -344,7 +368,7 @@ func (a *Agent) Run(
 		}
 	}
 
-	// Only reachable when a positive MaxTurns cap was set and exhausted.
+	// Reachable when MaxTurns cap (from explicit opts or profile) was exhausted.
 	err := fmt.Errorf("agent: max turns (%d) reached without completion", maxTurns)
 	onEvent(AgentEvent{Kind: EventKindError, Err: err, Usage: cx.Usage()})
 	return msgs, err
@@ -440,25 +464,22 @@ loop:
 }
 
 // executeTools runs all tool_use blocks from the assistant message in parallel
-// (up to maxToolConcurrency goroutines) and returns results in original order.
-// cx is the run's capability context — lifecycle cancellation and monitor are
-// read from it; the context is extracted via cx.Context() for tool.Execute calls.
-// Tool-level errors are embedded in the returned ContentBlocks (IsError=true);
-// this function itself only errors if the calling convention is violated, which
-// cannot happen, so the return is a plain slice.
+// and returns results in original order. Non-bash concurrency is capped by
+// profile.ParallelToolBudget (0 = unlimited). Tool-level errors are embedded in
+// the returned ContentBlocks (IsError=true).
 func executeTools(
 	cx *AgentCx,
 	blocks []model.ContentBlock,
 	onEvent func(AgentEvent),
 	hooks HookRunner,
 	msgCount int,
+	profile model.Profile,
 ) []model.ContentBlock {
 	// Collect tool-use blocks preserving original order.
-	type call struct{ block model.ContentBlock }
-	var calls []call
+	var calls []model.ContentBlock
 	for _, b := range blocks {
 		if b.Type == model.ContentTypeToolUse {
-			calls = append(calls, call{b})
+			calls = append(calls, b)
 		}
 	}
 	if len(calls) == 0 {
@@ -467,8 +488,32 @@ func executeTools(
 
 	results := make([]model.ContentBlock, len(calls))
 
+	// Per-profile semaphore for non-bash tool parallelism.
+	// 0 = unlimited; allocate a buffered channel only when a cap is configured.
+	var nonBashSem chan struct{}
+	if profile.ParallelToolBudget > 0 {
+		nonBashSem = make(chan struct{}, profile.ParallelToolBudget)
+	}
+
+	// Short-circuit: if the context is already cancelled, emit in_progress + done
+	// for every pending call so Zed never sees a done event without a prior exec
+	// event ("Tool call not found"), then return without spawning goroutines.
+	if err := cx.Err(); err != nil {
+		for i, c := range calls {
+			params := c.Input
+			if params == nil {
+				params = json.RawMessage("{}")
+			}
+			onEvent(AgentEvent{Kind: EventKindToolExec, ToolID: c.ID, ToolName: c.Name, ToolInput: params})
+			result := errorToolResult(c.ID, err.Error())
+			onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
+			results[i] = result
+		}
+		return results
+	}
+
 	var wg sync.WaitGroup
-	for i, c := range calls {
+	for i, block := range calls {
 		wg.Add(1)
 		go func(i int, block model.ContentBlock) {
 			defer wg.Done()
@@ -478,10 +523,8 @@ func executeTools(
 				params = json.RawMessage("{}")
 			}
 
-			// Always emit in_progress before any outcome so Zed always sees
-			// an exec update before the matching done update. Without this,
-			// unknown-tool errors (and cancelled calls) produce a done with no
-			// prior in_progress, causing Zed to show "Tool call not found".
+			// Always emit in_progress before any outcome so Zed sees an exec
+			// event before the matching done event (prevents "Tool call not found").
 			onEvent(AgentEvent{
 				Kind:      EventKindToolExec,
 				ToolID:    block.ID,
@@ -489,44 +532,25 @@ func executeTools(
 				ToolInput: params,
 			})
 
-			// bash spawns real OS processes; cap concurrency to avoid saturation.
-			// All other tools are I/O-bound and run without a semaphore.
+			// Acquire a concurrency slot. bash uses a global cap (real processes);
+			// other tools use the per-profile cap when set.
+			var sem chan struct{}
 			if block.Name == "bash" {
-				// bashSem is declared in session_agent.go; caps concurrent bash process spawning.
-				select {
-				case bashSem <- struct{}{}:
-					defer func() { <-bashSem }()
-				case <-cx.Done():
-					result := model.ContentBlock{
-						Type:      model.ContentTypeToolResult,
-						ToolUseID: block.ID,
-						Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: cx.Err().Error()}},
-						IsError:   true,
-					}
-					onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
-					results[i] = result
-					return
-				}
-			} else if err := cx.Err(); err != nil {
-				result := model.ContentBlock{
-					Type:      model.ContentTypeToolResult,
-					ToolUseID: block.ID,
-					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: err.Error()}},
-					IsError:   true,
-				}
+				sem = bashSem
+			} else {
+				sem = nonBashSem
+			}
+			release, err := acquireSem(cx, sem)
+			if err != nil {
+				result := errorToolResult(block.ID, err.Error())
 				onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 				results[i] = result
 				return
 			}
+			defer release()
 
 			t, ok := tools.Get(block.Name)
 			if !ok {
-				result := model.ContentBlock{
-					Type:      model.ContentTypeToolResult,
-					ToolUseID: block.ID,
-					Content:   []model.ContentBlock{{Type: model.ContentTypeText, Text: fmt.Sprintf("unknown tool: %s", block.Name)}},
-					IsError:   true,
-				}
 				if cx.Monitor != nil {
 					cx.Monitor.Observe(runtime.Observation{
 						Time:    time.Now(),
@@ -535,10 +559,13 @@ func executeTools(
 						Success: false,
 					})
 				}
+				result := errorToolResult(block.ID, fmt.Sprintf("unknown tool: %s", block.Name))
 				onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 				results[i] = result
 				return
 			}
+
+			params = maybeRepairToolJSON(profile, params, cx.Monitor, block.Name)
 
 			if hooks != nil {
 				hooks.RunBeforeTool(cx.Context(), block.Name, params)
@@ -586,7 +613,7 @@ func executeTools(
 			}
 			onEvent(AgentEvent{Kind: EventKindToolDone, ToolResult: result})
 			results[i] = result
-		}(i, c.block)
+		}(i, block)
 	}
 
 	wg.Wait()

@@ -4,15 +4,18 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -164,6 +167,26 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 			if extMgr != nil {
 				ag.Hooks = extMgr
 			}
+			// Classify the model and build a context-aware Compactor, mirroring the
+			// ACP path. cachedModels serves from disk when the cache is warm (< 1 h),
+			// otherwise fetches with an 800 ms cap and persists the result. Falls back
+			// to zero Profile / basic Compactor on any error (original behavior).
+			comp := &agent.Compactor{Provider: prov, Model: cfg.Model}
+			for _, m := range cachedModels(ctx, cfg.OpenRouterAPIKey) {
+				if m.ID == cfg.Model {
+					ag.Profile = model.ClassifyModel(m, cfg.ModelProfileOverrides)
+					if m.ContextWindow > 0 {
+						comp.ContextWindow = m.ContextWindow
+						if ag.Profile.CompactionReserveRatio > 0 {
+							comp.ReserveTokens = int(float64(m.ContextWindow) * ag.Profile.CompactionReserveRatio)
+						}
+					}
+					break
+				}
+			}
+			ag.Compactor = comp
+			ag.BGCompactor = agent.NewBackgroundCompactor(ctx, comp)
+			ag.ConfigTemp = cfg.Temperature
 			// Construct the capability context at the CLI entry point: the command's
 			// context carries cancellation; no budget limits for interactive use.
 			cx := agent.NewAgentCx(ctx, 0, 0, runtime.NewMonitor())
@@ -399,7 +422,9 @@ func newAuthCmd() *cobra.Command {
 // ── pi models ─────────────────────────────────────────────────────────────────
 
 func newModelsCmd() *cobra.Command {
-	return &cobra.Command{
+	var showProfile bool
+
+	cmd := &cobra.Command{
 		Use:   "models",
 		Short: "List available models from OpenRouter",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -413,22 +438,43 @@ func newModelsCmd() *cobra.Command {
 				return fmt.Errorf("fetch models: %w", err)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintf(w, "ID\tNAME\tMAX TOKENS\tTOOLS\tVISION\n")
+			if showProfile {
+				fmt.Fprintf(w, "ID\tNAME\tMAX TOKENS\tTOOLS\tVISION\tTIER\tMAX OUT\tMAX TURNS\tPARALLEL\n")
+			} else {
+				fmt.Fprintf(w, "ID\tNAME\tMAX TOKENS\tTOOLS\tVISION\n")
+			}
 			for _, m := range models {
-				tools := ""
+				toolsStr := ""
 				if m.SupportsTools {
-					tools = "yes"
+					toolsStr = "yes"
 				}
 				vision := ""
 				if m.SupportsVision {
 					vision = "yes"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n",
-					m.ID, m.DisplayName, m.MaxTokens, tools, vision)
+				if showProfile {
+					p := model.ClassifyModel(m, cfg.ModelProfileOverrides)
+					parallel := strconv.Itoa(p.ParallelToolBudget)
+					if p.ParallelToolBudget == 0 {
+						parallel = "∞"
+					}
+					maxTurns := strconv.Itoa(p.RecommendedMaxTurns)
+					if p.RecommendedMaxTurns == 0 {
+						maxTurns = "∞"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\n",
+						m.ID, m.DisplayName, m.MaxTokens, toolsStr, vision,
+						p.Tier, p.MaxOutputTokens, maxTurns, parallel)
+				} else {
+					fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n",
+						m.ID, m.DisplayName, m.MaxTokens, toolsStr, vision)
+				}
 			}
 			return w.Flush()
 		},
 	}
+	cmd.Flags().BoolVar(&showProfile, "profile", false, "show tier classification columns (TIER, MAX OUT, MAX TURNS, PARALLEL)")
+	return cmd
 }
 
 // ── pi doctor ─────────────────────────────────────────────────────────────────
@@ -474,8 +520,19 @@ func newConfigCmd(gf *globalFlags) *cobra.Command {
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 				fmt.Fprintf(w, "model\t%s\n", cfg.Model)
 				fmt.Fprintf(w, "max_tokens\t%d\n", cfg.MaxTokens)
+				if cfg.Temperature != nil {
+					fmt.Fprintf(w, "temperature\t%g\n", *cfg.Temperature)
+				} else {
+					fmt.Fprintf(w, "temperature\t(not set)\n")
+				}
 				fmt.Fprintf(w, "thinking_level\t%s\n", cfg.ThinkingLevel)
 				fmt.Fprintf(w, "session_dir\t%s\n", cfg.SessionDir)
+				if len(cfg.ModelProfileOverrides) > 0 {
+					for id, p := range cfg.ModelProfileOverrides {
+						fmt.Fprintf(w, "model_profile_override[%s]\ttier=%s max_out=%d max_turns=%d parallel=%d\n",
+							id, p.Tier, p.MaxOutputTokens, p.RecommendedMaxTurns, p.ParallelToolBudget)
+					}
+				}
 				return w.Flush()
 			},
 		},
@@ -496,8 +553,26 @@ func newConfigCmd(gf *globalFlags) *cobra.Command {
 					cfg.ThinkingLevel = val
 				case "system_prompt":
 					cfg.SystemPrompt = val
+				case "temperature":
+					f, err := strconv.ParseFloat(val, 64)
+					if err != nil {
+						return fmt.Errorf("temperature must be a number: %w", err)
+					}
+					cfg.Temperature = &f
 				default:
-					return fmt.Errorf("unknown config key %q", key)
+					if strings.HasPrefix(key, "model_profile_override/") {
+						modelID := strings.TrimPrefix(key, "model_profile_override/")
+						var p model.Profile
+						if err := json.Unmarshal([]byte(val), &p); err != nil {
+							return fmt.Errorf("model_profile_override: value must be a JSON Profile object: %w", err)
+						}
+						if cfg.ModelProfileOverrides == nil {
+							cfg.ModelProfileOverrides = make(map[string]model.Profile)
+						}
+						cfg.ModelProfileOverrides[modelID] = p
+					} else {
+						return fmt.Errorf("unknown config key %q", key)
+					}
 				}
 				if err := cfg.Save(); err != nil {
 					return fmt.Errorf("save config: %w", err)
@@ -679,4 +754,37 @@ func loadExtensions(ctx context.Context, cfg *config.Config) (*extensions.Manage
 		tools.Register(t)
 	}
 	return mgr, nil
+}
+
+// ── model cache ───────────────────────────────────────────────────────────────
+
+type modelCache struct {
+	FetchedAt time.Time        `json:"fetched_at"`
+	Models    []model.ModelInfo `json:"models"`
+}
+
+const modelCacheTTL = time.Hour
+
+// cachedModels returns model infos from disk when the cache is fresh (< 1 h).
+// On a miss it fetches from OpenRouter with a 300 ms cap, persists the result,
+// and returns it. Returns nil on any error so callers fall back to zero Profile.
+func cachedModels(ctx context.Context, apiKey string) []model.ModelInfo {
+	cachePath := filepath.Join(config.ConfigDir(), "model_cache.json")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		var mc modelCache
+		if json.Unmarshal(data, &mc) == nil && time.Since(mc.FetchedAt) < modelCacheTTL {
+			return mc.Models
+		}
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer cancel()
+	infos, err := openrouter.FetchModels(fetchCtx, apiKey)
+	if err != nil {
+		return nil
+	}
+	if data, err := json.Marshal(modelCache{FetchedAt: time.Now(), Models: infos}); err == nil {
+		_ = os.MkdirAll(filepath.Dir(cachePath), 0o700)
+		_ = os.WriteFile(cachePath, data, 0o600)
+	}
+	return infos
 }
