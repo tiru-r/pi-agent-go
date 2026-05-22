@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -455,6 +456,41 @@ loop:
 	sort.Ints(toolOrder)
 	for _, idx := range toolOrder {
 		blocks = append(blocks, *toolBlocks[idx])
+	}
+	// Some models (e.g. gpt-oss-120b) return multiple tool calls with the same
+	// ID, or omit IDs entirely. Two-pass fix: first assign unique fallback IDs
+	// to empty slots without colliding with existing IDs, then suffix-disambiguate
+	// any remaining duplicates.
+	existingIDs := make(map[string]struct{}, len(blocks))
+	for i := range blocks {
+		if blocks[i].Type == model.ContentTypeToolUse && blocks[i].ID != "" {
+			existingIDs[blocks[i].ID] = struct{}{}
+		}
+	}
+	fallback := 0
+	for i := range blocks {
+		if blocks[i].Type != model.ContentTypeToolUse || blocks[i].ID != "" {
+			continue
+		}
+		for {
+			candidate := "call_" + strconv.Itoa(fallback)
+			fallback++
+			if _, taken := existingIDs[candidate]; !taken {
+				blocks[i].ID = candidate
+				existingIDs[candidate] = struct{}{}
+				break
+			}
+		}
+	}
+	seenIDs := make(map[string]int, len(blocks))
+	for i := range blocks {
+		if blocks[i].Type != model.ContentTypeToolUse {
+			continue
+		}
+		seenIDs[blocks[i].ID]++
+		if seenIDs[blocks[i].ID] > 1 {
+			blocks[i].ID = blocks[i].ID + "_" + strconv.Itoa(seenIDs[blocks[i].ID])
+		}
 	}
 	return &provider.Response{
 		Message:    model.Message{Role: model.RoleAssistant, Content: blocks},
