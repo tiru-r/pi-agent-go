@@ -571,7 +571,7 @@ func executeTools(
 			// Acquire a concurrency slot. bash uses a global cap (real processes);
 			// other tools use the per-profile cap when set.
 			var sem chan struct{}
-			if block.Name == "bash" {
+			if block.Name == tools.ToolNameBash {
 				sem = bashSem
 			} else {
 				sem = nonBashSem

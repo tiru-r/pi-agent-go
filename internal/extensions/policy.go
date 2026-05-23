@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
 // extensionCallTimeout is the per-call deadline applied to every extension invocation.
@@ -38,11 +40,11 @@ const (
 // toolCapability maps a Pi tool name to the capability it requires.
 func toolCapability(toolName string) Capability {
 	switch toolName {
-	case "bash":
+	case tools.ToolNameBash:
 		return CapExec
-	case "write", "edit", "hashline_edit":
+	case tools.ToolNameWrite, tools.ToolNameEdit, tools.ToolNameHashlineEdit:
 		return CapFSWrite
-	case "read", "grep", "find", "ls":
+	case tools.ToolNameRead, tools.ToolNameGrep, tools.ToolNameFind, tools.ToolNameLS:
 		return CapFSRead
 	default:
 		return CapFSRead // conservative default
@@ -52,9 +54,10 @@ func toolCapability(toolName string) Capability {
 // toolDomain returns a stable domain label for telemetry lane keys.
 func toolDomain(toolName string) string {
 	switch toolName {
-	case "bash":
+	case tools.ToolNameBash:
 		return "exec"
-	case "write", "edit", "hashline_edit", "read", "grep", "find", "ls":
+	case tools.ToolNameWrite, tools.ToolNameEdit, tools.ToolNameHashlineEdit,
+		tools.ToolNameRead, tools.ToolNameGrep, tools.ToolNameFind, tools.ToolNameLS:
 		return "filesystem"
 	default:
 		return "other"
@@ -64,7 +67,7 @@ func toolDomain(toolName string) string {
 // isReadOnlyTool reports whether a tool performs only read operations.
 func isReadOnlyTool(toolName string) bool {
 	switch toolName {
-	case "read", "grep", "find", "ls":
+	case tools.ToolNameRead, tools.ToolNameGrep, tools.ToolNameFind, tools.ToolNameLS:
 		return true
 	}
 	return false

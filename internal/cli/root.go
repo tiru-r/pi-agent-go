@@ -163,7 +163,9 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 			}
 			historyLen := len(history)
 
-			ag := agent.New(prov, cfg.Model, cfg.SystemPrompt, cfg.MaxTokens)
+			systemPrompt := config.ExpandSystemPrompt(cfg.SystemPrompt, tools.Names())
+
+			ag := agent.New(prov, cfg.Model, systemPrompt, cfg.MaxTokens)
 			if extMgr != nil {
 				ag.Hooks = extMgr
 			}
@@ -191,7 +193,7 @@ func newRunCmd(gf *globalFlags) *cobra.Command {
 			// context carries cancellation; no budget limits for interactive use.
 			cx := agent.NewAgentCx(ctx, 0, 0, runtime.NewMonitor())
 			opts := agent.Options{
-				System:        cfg.SystemPrompt,
+				System:        systemPrompt,
 				ThinkingLevel: model.ThinkingLevel(cfg.ThinkingLevel),
 			}
 			inputBlocks := []model.ContentBlock{{Type: model.ContentTypeText, Text: prompt}}

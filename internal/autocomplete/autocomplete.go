@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/extensions"
+	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -293,7 +294,7 @@ func (p *Provider) getIndex(cwd string) []string {
 }
 
 // buildIndex walks root and returns relative paths, skipping hidden dirs and
-// common noise directories (node_modules, vendor, __pycache__).
+// noise directories defined by tools.ExcludedDirs.
 func buildIndex(root string) []string {
 	var paths []string
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -302,7 +303,7 @@ func buildIndex(root string) []string {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if name != "." && (name[0] == '.' || name == "node_modules" || name == "vendor" || name == "__pycache__") {
+			if name != "." && (name[0] == '.' || tools.ExcludedDirs[name]) {
 				return filepath.SkipDir
 			}
 			return nil

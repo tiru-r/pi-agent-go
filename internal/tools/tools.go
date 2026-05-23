@@ -1,4 +1,4 @@
-// Package tools provides the 8 built-in tool implementations for the pi agent.
+// Package tools provides the 9 built-in tool implementations for the pi agent.
 package tools
 
 import (
@@ -21,6 +21,21 @@ import (
 	"time"
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
+)
+
+// Tool name constants — single source of truth for tool names.
+// Use these in switch statements (e.g. in acp.go) rather than string literals
+// so that adding a tool only requires editing the tools package.
+const (
+	ToolNameRead         = "read"
+	ToolNameWrite        = "write"
+	ToolNameEdit         = "edit"
+	ToolNameBash         = "bash"
+	ToolNameGrep         = "grep"
+	ToolNameFind         = "find"
+	ToolNameLS           = "ls"
+	ToolNameHashlineEdit = "hashline_edit"
+	ToolNamePrintTree    = "print_tree"
 )
 
 // Tool is the interface every built-in (and extension) tool must satisfy.
@@ -76,6 +91,7 @@ func init() {
 			&findTool{},
 			&lsTool{},
 			&hashlineEditTool{},
+			&printTreeTool{},
 		}
 		toolMap = make(map[string]Tool, len(BuiltinTools))
 		for _, t := range BuiltinTools {
@@ -126,6 +142,23 @@ func CWD(ctx context.Context) string {
 	return ""
 }
 
+// resolvePath resolves path against the CWD stored in ctx.
+// Empty paths default to CWD so optional-path tools (ls, print_tree) work
+// on the workspace root when the caller omits the argument.
+func resolvePath(ctx context.Context, path string) string {
+	cwd := CWD(ctx)
+	if path == "" {
+		return cwd
+	}
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if cwd != "" {
+		return filepath.Join(cwd, path)
+	}
+	return path
+}
+
 // ToDefinitions converts all built-in tools to model.ToolDefinition slice.
 func ToDefinitions() []model.ToolDefinition {
 	toolMu.RLock()
@@ -143,13 +176,24 @@ func ToDefinitions() []model.ToolDefinition {
 	return defs
 }
 
+// Names returns the name of every registered built-in tool in registration order.
+func Names() []string {
+	toolMu.RLock()
+	out := make([]string, len(BuiltinTools))
+	for i, t := range BuiltinTools {
+		out[i] = t.Name()
+	}
+	toolMu.RUnlock()
+	return out
+}
+
 // ============================================================================
 // 1. read
 // ============================================================================
 
 type readTool struct{}
 
-func (r *readTool) Name() string        { return "read" }
+func (r *readTool) Name() string        { return ToolNameRead }
 func (r *readTool) Description() string { return "Read file contents with line numbers." }
 func (r *readTool) Schema() json.RawMessage {
 	return json.RawMessage(`{
@@ -183,9 +227,13 @@ func (r *readTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	if err := json.Unmarshal(params, &p); err != nil {
 		return errorResult("invalid parameters: " + err.Error()), nil
 	}
+	// read requires an explicit file path; unlike ls/print_tree we do NOT
+	// default to CWD (reading a directory is not meaningful). Relative paths
+	// still work because resolvePath is called below after this guard.
 	if p.Path == "" {
 		return errorResult("path is required"), nil
 	}
+	p.Path = resolvePath(ctx, p.Path)
 	if p.Limit == 0 {
 		p.Limit = 2000
 	}
@@ -255,7 +303,7 @@ func (r *readTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 type writeTool struct{}
 
-func (w *writeTool) Name() string        { return "write" }
+func (w *writeTool) Name() string        { return ToolNameWrite }
 func (w *writeTool) Description() string { return "Write or create a file with the given content." }
 func (w *writeTool) Schema() json.RawMessage {
 	return json.RawMessage(`{
@@ -282,6 +330,7 @@ func (w *writeTool) Execute(ctx context.Context, params json.RawMessage) (*Resul
 	if p.Path == "" {
 		return errorResult("path is required"), nil
 	}
+	p.Path = resolvePath(ctx, p.Path)
 	if err := os.MkdirAll(filepath.Dir(p.Path), 0o755); err != nil {
 		return errorResult("cannot create parent directories: " + err.Error()), nil
 	}
@@ -301,7 +350,7 @@ func (w *writeTool) Execute(ctx context.Context, params json.RawMessage) (*Resul
 
 type editTool struct{}
 
-func (e *editTool) Name() string { return "edit" }
+func (e *editTool) Name() string { return ToolNameEdit }
 func (e *editTool) Description() string {
 	return "Replace a string in a file. Fails if old_string not found or if it appears more than once (when replace_all is false)."
 }
@@ -334,6 +383,7 @@ func (e *editTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	if p.Path == "" {
 		return errorResult("path is required"), nil
 	}
+	p.Path = resolvePath(ctx, p.Path)
 	if p.OldString == "" {
 		return errorResult("old_string cannot be empty"), nil
 	}
@@ -383,7 +433,7 @@ const grepMaxLineLen = 500   // per-line char cap to handle minified files
 
 type bashTool struct{}
 
-func (b *bashTool) Name() string { return "bash" }
+func (b *bashTool) Name() string { return ToolNameBash }
 func (b *bashTool) Description() string {
 	return "Execute a shell command and return its output."
 }
@@ -518,7 +568,7 @@ func (b *bashTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 type grepTool struct{}
 
-func (g *grepTool) Name() string { return "grep" }
+func (g *grepTool) Name() string { return ToolNameGrep }
 func (g *grepTool) Description() string {
 	return "Search file contents using regular expressions."
 }
@@ -553,6 +603,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	if p.Path == "" {
 		return errorResult("path is required"), nil
 	}
+	p.Path = resolvePath(ctx, p.Path)
 
 	caseSensitive := true
 	if p.CaseSensitive != nil {
@@ -640,7 +691,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 			}
 			if d.IsDir() {
 				name := d.Name()
-				if name == ".git" || name == "node_modules" || name == "target" {
+				if ExcludedDirs[name] {
 					return filepath.SkipDir
 				}
 				return nil
@@ -669,7 +720,7 @@ func (g *grepTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 type findTool struct{}
 
-func (f *findTool) Name() string        { return "find" }
+func (f *findTool) Name() string        { return ToolNameFind }
 func (f *findTool) Description() string { return "Find files or directories by glob pattern." }
 func (f *findTool) Schema() json.RawMessage {
 	return json.RawMessage(`{
@@ -680,14 +731,26 @@ func (f *findTool) Schema() json.RawMessage {
     "type":      {"type": "string",  "description": "Entry type filter: 'f' for file, 'd' for directory, 'l' for symlink."},
     "max_depth": {"type": "integer", "description": "Maximum directory depth to descend (0 = unlimited)."}
   },
-  "required": ["path", "pattern"]
+  "required": ["pattern"]
 }`)
 }
 
-var excludedFindDirs = map[string]bool{
+// ExcludedDirs are skipped by find, grep, and print_tree traversals.
+// Exported so that other packages (e.g. autocomplete) can reuse the same
+// canonical list rather than maintaining their own partial copy.
+// Keep this list to unambiguous artifact/dependency directories only —
+// short generic names like "build" are intentionally omitted because they
+// are common Go package names (e.g. internal/build) and excluding them
+// would silently hide real source files.
+var ExcludedDirs = map[string]bool{
 	".git":         true,
 	"node_modules": true,
-	"target":       true,
+	"target":       true,  // Rust / Maven
+	"vendor":       true,  // Go vendor dir
+	"dist":         true,  // bundler output
+	"__pycache__":  true,  // Python bytecode
+	".next":        true,  // Next.js cache
+	".nuxt":        true,  // Nuxt.js cache
 }
 
 type findEntry struct {
@@ -705,9 +768,7 @@ func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 	if err := json.Unmarshal(params, &p); err != nil {
 		return errorResult("invalid parameters: " + err.Error()), nil
 	}
-	if p.Path == "" {
-		return errorResult("path is required"), nil
-	}
+	p.Path = resolvePath(ctx, p.Path)
 	if p.Pattern == "" {
 		return errorResult("pattern is required"), nil
 	}
@@ -734,7 +795,7 @@ func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 		default:
 		}
 
-		if d.IsDir() && excludedFindDirs[d.Name()] {
+		if d.IsDir() && ExcludedDirs[d.Name()] {
 			return filepath.SkipDir
 		}
 
@@ -804,15 +865,14 @@ func (f *findTool) Execute(ctx context.Context, params json.RawMessage) (*Result
 
 type lsTool struct{}
 
-func (l *lsTool) Name() string        { return "ls" }
+func (l *lsTool) Name() string        { return ToolNameLS }
 func (l *lsTool) Description() string { return "List directory contents with metadata." }
 func (l *lsTool) Schema() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "Absolute path to the directory to list."}
-  },
-  "required": ["path"]
+    "path": {"type": "string", "description": "Path to the directory to list (absolute or relative). Omit or use '.' for the working directory."}
+  }
 }`)
 }
 
@@ -826,9 +886,7 @@ func (l *lsTool) Execute(ctx context.Context, params json.RawMessage) (*Result, 
 	if err := json.Unmarshal(params, &p); err != nil {
 		return errorResult("invalid parameters: " + err.Error()), nil
 	}
-	if p.Path == "" {
-		return errorResult("path is required"), nil
-	}
+	p.Path = resolvePath(ctx, p.Path)
 
 	entries, err := os.ReadDir(p.Path)
 	if err != nil {
@@ -894,7 +952,7 @@ func formatSize(n int64) string {
 
 type hashlineEditTool struct{}
 
-func (h *hashlineEditTool) Name() string { return "hashline_edit" }
+func (h *hashlineEditTool) Name() string { return ToolNameHashlineEdit }
 func (h *hashlineEditTool) Description() string {
 	return "Edit file lines identified by LINE#HASH tags. Each tag is '{line_number}#{first6_sha256}'. More precise than string matching."
 }
@@ -956,6 +1014,7 @@ func (h *hashlineEditTool) Execute(ctx context.Context, params json.RawMessage) 
 	if p.Path == "" {
 		return errorResult("path is required"), nil
 	}
+	p.Path = resolvePath(ctx, p.Path)
 	if len(p.Edits) == 0 {
 		return errorResult("edits list is empty"), nil
 	}
@@ -1006,5 +1065,154 @@ func (h *hashlineEditTool) Execute(ctx context.Context, params json.RawMessage) 
 	}
 
 	return textResult(fmt.Sprintf("Applied %d edit(s) to %s", applied, p.Path)), nil
+}
+
+// ============================================================================
+// 9. print_tree
+// ============================================================================
+
+type printTreeTool struct{}
+
+func (p *printTreeTool) Name() string { return ToolNamePrintTree }
+func (p *printTreeTool) Description() string {
+	return "Print the recursive directory structure as an indented tree. Good for exploring a project layout before reading individual files."
+}
+func (p *printTreeTool) Schema() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "path":        {"type": "string",  "description": "Root directory (absolute or relative). Defaults to the working directory."},
+    "max_depth":   {"type": "integer", "description": "Maximum recursion depth (default 4, max 8)."},
+    "show_hidden": {"type": "boolean", "description": "Include entries whose names start with '.' (default false)."}
+  }
+}`)
+}
+
+func (p *printTreeTool) Execute(ctx context.Context, params json.RawMessage) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error()), nil
+	}
+	var pa struct {
+		Path       string `json:"path"`
+		MaxDepth   int    `json:"max_depth"`
+		ShowHidden bool   `json:"show_hidden"`
+	}
+	if err := json.Unmarshal(params, &pa); err != nil {
+		return errorResult("invalid parameters: " + err.Error()), nil
+	}
+
+	pa.Path = resolvePath(ctx, pa.Path)
+	if pa.Path == "" {
+		return errorResult("no working directory in context; supply an explicit path"), nil
+	}
+
+	if pa.MaxDepth <= 0 {
+		pa.MaxDepth = 4
+	}
+	if pa.MaxDepth > 8 {
+		pa.MaxDepth = 8
+	}
+
+	info, err := os.Stat(pa.Path)
+	if err != nil {
+		return errorResult("cannot stat path: " + err.Error()), nil
+	}
+	if !info.IsDir() {
+		return errorResult("path must be a directory"), nil
+	}
+
+	var sb strings.Builder
+	var fileCount, dirCount int
+
+	sb.WriteString(filepath.Base(pa.Path))
+	sb.WriteString("/\n")
+
+	// shouldShow reports whether an entry is listed in the output.
+	// Excluded dirs always return true: they appear as "… (excluded)" stubs
+	// so the user can see they exist without the walk descending into them.
+	shouldShow := func(name string) bool {
+		return ExcludedDirs[name] || pa.ShowHidden || !strings.HasPrefix(name, ".")
+	}
+
+	var walk func(dir, prefix string, depth int)
+	walk = func(dir, prefix string, depth int) {
+		// depth starts at 1 for the root's direct children; guard uses > so
+		// MaxDepth=4 renders levels 1–4 (inclusive) before stopping.
+		if depth > pa.MaxDepth || ctx.Err() != nil || sb.Len() > bashMaxBytes {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+
+		// Filter first so isLast can be computed in a single pass.
+		var visible []fs.DirEntry
+		for _, e := range entries {
+			if shouldShow(e.Name()) {
+				visible = append(visible, e)
+			}
+		}
+
+		for i, entry := range visible {
+			if ctx.Err() != nil || sb.Len() > bashMaxBytes {
+				sb.WriteString(prefix)
+				sb.WriteString("… (output truncated)\n")
+				return
+			}
+
+			name := entry.Name()
+			isLast := i == len(visible)-1
+
+			connector := "├── "
+			if isLast {
+				connector = "└── "
+			}
+
+			if entry.IsDir() {
+				dirCount++
+				sb.WriteString(prefix)
+				sb.WriteString(connector)
+				sb.WriteString(name)
+				sb.WriteString("/\n")
+
+				childSep := "│   "
+				if isLast {
+					childSep = "    "
+				}
+				childPrefix := prefix + childSep
+
+				if ExcludedDirs[name] {
+					sb.WriteString(childPrefix)
+					sb.WriteString("… (excluded)\n")
+				} else if depth < pa.MaxDepth {
+					walk(filepath.Join(dir, name), childPrefix, depth+1)
+				} else {
+					sb.WriteString(childPrefix)
+					sb.WriteString("… (more)\n")
+				}
+			} else {
+				fileCount++
+				sb.WriteString(prefix)
+				sb.WriteString(connector)
+				sb.WriteString(name)
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	walk(pa.Path, "", 1)
+	fmt.Fprintf(&sb, "\n%d %s, %d %s\n",
+		dirCount, pluralWord(dirCount, "directory", "directories"),
+		fileCount, pluralWord(fileCount, "file", "files"))
+
+	return textResult(sb.String()), nil
+}
+
+func pluralWord(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 

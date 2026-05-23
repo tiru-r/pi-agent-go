@@ -12,6 +12,7 @@ import (
 
 	"github.com/tiru-r/pi-agent-go/internal/model"
 	"github.com/tiru-r/pi-agent-go/internal/provider"
+	"github.com/tiru-r/pi-agent-go/internal/tools"
 )
 
 const (
@@ -566,10 +567,10 @@ func extractFilePaths(msgs []model.Message) (read, modified []string) {
 			if path == "" {
 				continue
 			}
-			switch strings.ToLower(block.Name) {
-			case "read":
+			switch block.Name {
+			case tools.ToolNameRead:
 				readSet[path] = true
-			case "write", "edit", "hashline_edit":
+			case tools.ToolNameWrite, tools.ToolNameEdit, tools.ToolNameHashlineEdit:
 				modSet[path] = true
 			}
 		}

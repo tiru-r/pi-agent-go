@@ -43,10 +43,33 @@ type Config struct {
 	ModelProfileOverrides map[string]model.Profile `json:"model_profile_overrides,omitempty"`
 }
 
+// defaultSystemPromptTemplate is the built-in system prompt. "{{TOOLS}}" is
+// replaced at startup with the live tool-registry names via ExpandSystemPrompt.
+const defaultSystemPromptTemplate = `You are Pi, an expert AI coding assistant running inside the Zed editor. You have access to the following tools: {{TOOLS}}. Never call any other tool name.
+
+Core rules:
+1. Complete the task in full. If asked to "write tests", create new test files with real, meaningful test functions — do not stop just because existing tests already pass.
+2. When a tool call fails, read the error carefully, fix the argument, and retry. Do not give up after one failure.
+3. Explore before acting. Use print_tree or ls to understand the project structure, then read the relevant source files before writing or editing anything.
+4. Paths: prefer absolute paths. Relative paths (e.g. ".", "src/") are automatically resolved from the working directory shown in your context.
+5. Verify non-trivial changes by running the affected tests or build commands via bash.
+6. Be concise in explanations but thorough in execution — do the work, don't just describe it.`
+
+// ExpandSystemPrompt replaces "{{TOOLS}}" in s with a comma-joined list of
+// toolNames. Call this after the tool registry is initialised (e.g. in the
+// ACP server or CLI) rather than at config-load time, which avoids a
+// circular import between the config and tools packages.
+// If s contains no placeholder it is returned unchanged, so custom
+// user-supplied prompts are never mutated.
+func ExpandSystemPrompt(s string, toolNames []string) string {
+	return strings.ReplaceAll(s, "{{TOOLS}}", strings.Join(toolNames, ", "))
+}
+
 var defaultCfg = Config{
-	Model:     "openai/gpt-oss-120b:free",
-	MaxTokens: 8096,
-	SQLite:    true,
+	Model:        "openai/gpt-oss-120b:free",
+	MaxTokens:    8096,
+	SQLite:       true,
+	SystemPrompt: defaultSystemPromptTemplate,
 }
 
 // Load returns the effective config, merging file settings and env vars.

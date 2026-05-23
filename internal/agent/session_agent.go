@@ -310,7 +310,7 @@ func (a *SessionAgent) runTools(cx *AgentCx, uses []model.ContentBlock, msgCount
 		go func(i int, block model.ContentBlock) {
 			defer wg.Done()
 			var sem chan struct{}
-			if block.Name == "bash" {
+			if block.Name == tools.ToolNameBash {
 				sem = bashSem
 			} else {
 				sem = nonBashSem

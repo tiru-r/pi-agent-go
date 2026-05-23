@@ -600,6 +600,8 @@ type Server struct {
 	modelIndex  map[string]model.ModelInfo // ID → full info, for O(1) profile lookups
 	acpIndex    map[string]acpModel        // ID → ACP model, for O(1) compactor lookups
 
+	systemPrompt string // expanded once in New, after all tools (including extensions) are registered
+
 	// monitor provides runtime intelligence across all sessions.
 	monitor *runtime.Monitor
 
@@ -652,6 +654,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	for _, t := range extensions.WrapAsTools(extMgr) {
 		tools.Register(t)
 	}
+	s.systemPrompt = config.ExpandSystemPrompt(cfg.SystemPrompt, tools.Names())
 
 	// Open SQLite session index if enabled. Failure is non-fatal.
 	if cfg.SQLite {
@@ -1118,7 +1121,7 @@ func (s *Server) handleSessionPrompt(ctx context.Context, req *request) {
 
 	historyLen := len(history)
 
-	system := s.cfg.SystemPrompt
+	system := s.systemPrompt
 	if systemPrefix != "" {
 		if system != "" {
 			system = systemPrefix + "\n" + system
@@ -1369,13 +1372,13 @@ func (s *Server) handleSessionLoad(ctx context.Context, req *request) {
 // Values match the ACP spec snake_case enum: read, edit, execute, search, other.
 func toolCallKind(toolName string) string {
 	switch toolName {
-	case "read", "ls":
+	case tools.ToolNameRead, tools.ToolNameLS, tools.ToolNamePrintTree:
 		return "read"
-	case "write", "edit", "hashline_edit":
+	case tools.ToolNameWrite, tools.ToolNameEdit, tools.ToolNameHashlineEdit:
 		return "edit"
-	case "bash":
+	case tools.ToolNameBash:
 		return "execute"
-	case "grep", "find":
+	case tools.ToolNameGrep, tools.ToolNameFind:
 		return "search"
 	default:
 		return "other"
@@ -1693,7 +1696,7 @@ func (s *Server) handleInputComplete(req *request) {
 // scrolls to the section actually being read.
 func extractFileLocation(toolName string, input json.RawMessage) (path string, line *int) {
 	switch toolName {
-	case "read", "write", "edit", "hashline_edit":
+	case tools.ToolNameRead, tools.ToolNameWrite, tools.ToolNameEdit, tools.ToolNameHashlineEdit:
 	default:
 		return "", nil
 	}
@@ -1704,7 +1707,7 @@ func extractFileLocation(toolName string, input json.RawMessage) (path string, l
 	if err := json.Unmarshal(input, &p); err != nil || p.Path == "" {
 		return "", nil
 	}
-	if toolName == "read" && p.Offset > 0 {
+	if toolName == tools.ToolNameRead && p.Offset > 0 {
 		return p.Path, &p.Offset
 	}
 	return p.Path, nil
